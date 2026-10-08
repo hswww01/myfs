@@ -1038,6 +1038,7 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		uint64_t sequence;
 		const uint8_t* cipher;
 		size_t cipher_size;
+		uint8_t* target;
 		int crypto_result;
 
 		if (!node->fs->encryption_enabled)
@@ -1049,6 +1050,10 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		memcpy(&sequence, payload, sizeof(sequence));
 		cipher = payload + sizeof(sequence);
 		cipher_size = payload_size - sizeof(sequence);
+		/* An uncompressed page decrypts straight into the caller's buffer. */
+		target = !(page->flags & MEMFS_PAGE_COMPRESSED) &&
+			cipher_size - crypto_aead_xchacha20poly1305_ietf_ABYTES == expected_plain_size ?
+			plain : stage;
 
 		memset(&aad, 0, sizeof(aad));
 		aad.node_index = memfs_node_index_number(node);
@@ -1069,7 +1074,7 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 
 			memfs_build_aes_gcm_nonce(sequence, nonce);
 			crypto_result = crypto_aead_aes256gcm_decrypt(
-				stage, &decoded_size, NULL,
+				target, &decoded_size, NULL,
 				cipher, (unsigned long long)cipher_size,
 				(const unsigned char*)&aad, sizeof(aad),
 				nonce, epoch_key);
@@ -1080,15 +1085,19 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 
 			memfs_build_xchacha_nonce(node->fs, sequence, nonce);
 			crypto_result = crypto_aead_xchacha20poly1305_ietf_decrypt(
-				stage, &decoded_size, NULL,
+				target, &decoded_size, NULL,
 				cipher, (unsigned long long)cipher_size,
 				(const unsigned char*)&aad, sizeof(aad),
 				nonce, node->fs->encryption_key);
 			sodium_memzero(nonce, sizeof(nonce));
 		}
 
-		if (crypto_result != 0 || decoded_size > sizeof(stage))
+		if (crypto_result != 0 || decoded_size > sizeof(stage)) {
+			memset(plain, 0, expected_plain_size);
 			return MEMFS_ERR_DATA;
+		}
+		if (target == plain)
+			return MEMFS_OK;
 
 		payload = stage;
 		payload_size = (size_t)decoded_size;
@@ -1100,6 +1109,8 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		size_t decoded = memfs_decompress_payload(node->fs, plain, expected_plain_size,
 												  payload, payload_size);
 
+		if (payload == stage)
+			sodium_memzero(stage, payload_size);
 		if (ZSTD_isError(decoded) || decoded != expected_plain_size)
 			return MEMFS_ERR_DATA;
 

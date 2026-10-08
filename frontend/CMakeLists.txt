@@ -19,7 +19,8 @@ endif()
 add_library(fs_frontend STATIC
 	src/fs_frontend_winfsp.c
 	src/fs_frontend_service.c
-	src/fs_frontend_gui.c)
+	src/fs_frontend_gui.c
+	src/fs_frontend_driver.c)
 target_compile_features(fs_frontend PUBLIC c_std_17)
 target_include_directories(fs_frontend
 	PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

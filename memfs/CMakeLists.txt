@@ -541,6 +541,7 @@ target_compile_definitions(memfs_driver_test
 
 target_link_libraries(memfs_driver_test
 	PRIVATE
+		fs_frontend
 		advapi32)
 target_include_directories(memfs_resource_test
 	PRIVATE
