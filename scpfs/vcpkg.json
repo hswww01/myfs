@@ -1,0 +1,10 @@
+{
+  "name": "scpfs",
+  "version-string": "0.1.0",
+  "builtin-baseline": "6d332a018c433fad20822ff4b536e4ccdc3413bd",
+  "description": "A Windows WinFsp filesystem backed by remote GNU/Linux SCP servers",
+  "dependencies": [
+    "libssh2"
+  ]
+}
+
