@@ -17,6 +17,7 @@
 #define MEMFS_SERVICE_DEFAULT_START_TIMEOUT_MS 120000u
 #define MEMFS_SERVICE_STOP_TIMEOUT_MS 90000u
 #define MEMFS_SERVICE_ARGUMENT_CAPACITY 32768u
+#define MEMFS_MAX_INITIAL_DIRECTORIES 16u
 
 typedef struct MemfsRunConfig {
     const wchar_t* mount_point;
@@ -41,6 +42,10 @@ typedef struct MemfsRunConfig {
     bool stats_enabled;
     bool stats_json;
     uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
+    /* Directories (relative to the volume root) created before mounting,
+     * e.g. a %TEMP% folder on a volume that starts empty on every start. */
+    const wchar_t* initial_directories[MEMFS_MAX_INITIAL_DIRECTORIES];
+    uint32_t initial_directory_count;
 } MemfsRunConfig;
 
 static HANDLE g_stop_event;
@@ -72,6 +77,8 @@ static void print_usage(const wchar_t* exe) {
              L"  --mount <path>          Drive letter or directory mount point.\n"
              L"  --size <bytes|auto>     Capacity 1..INT64_MAX; supports K/M/G suffix. Default: auto.\n"
              L"  --label <name>          Volume label. Default: MEMFS.\n"
+             L"  --mkdir <path>          Create a directory (relative to the volume root,\n"
+             L"                          nested allowed) before mounting; repeatable.\n"
              L"  --threads <n>           Dispatcher threads: 0=automatic, otherwise 2..64.\n"
              L"  --stop-event <name>     Optional named event for graceful console shutdown/automation.\n"
              L"  --compress              Enable per-page Zstd compression (level 1).\n"
@@ -119,6 +126,13 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             config->capacity_auto = true;
         } else if (_wcsicmp(argv[i], L"--label") == 0 && i + 1 < argc) {
             config->volume_label = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--mkdir") == 0 && i + 1 < argc) {
+            if (config->initial_directory_count >= MEMFS_MAX_INITIAL_DIRECTORIES) {
+                fwprintf(stderr, L"At most %u --mkdir options are supported.\n",
+                         MEMFS_MAX_INITIAL_DIRECTORIES);
+                return 2;
+            }
+            config->initial_directories[config->initial_directory_count++] = argv[++i];
         } else if (_wcsicmp(argv[i], L"--threads") == 0 && i + 1 < argc) {
             if (!memfs_cli_parse_u32(argv[++i], &config->thread_count) ||
                 !memfs_cli_thread_count_valid(config->thread_count)) {
@@ -499,6 +513,10 @@ static bool build_service_arguments(
         parts[count++] = L"--debug";
     if (config->stats_enabled)
         parts[count++] = config->stats_json ? L"--stats-json" : L"--stats";
+    for (index = 0; index < config->initial_directory_count; ++index) {
+        parts[count++] = L"--mkdir";
+        parts[count++] = config->initial_directories[index];
+    }
     parts[count++] = L"--log-file";
     parts[count++] = log_file;
     parts[count++] = L"--authorized-user-sid";
@@ -710,6 +728,50 @@ static void set_service_win32_failure(FSF_SERVICE_EXIT* result, DWORD error) {
     result->service_specific_error = 0;
 }
 
+/* Creates config->initial_directories in a fresh, not yet mounted store. */
+static bool create_initial_directories(Memfs* store, const MemfsRunConfig* config,
+                                       const wchar_t** failed_path) {
+    uint32_t index;
+
+    for (index = 0; index < config->initial_directory_count; ++index) {
+        const wchar_t* path = config->initial_directories[index];
+        wchar_t component[MEMFS_MAX_NAME + 1];
+        MemfsNode* parent = store->root;
+        const wchar_t* cursor = path;
+
+        *failed_path = path;
+        while (*cursor != L'\0') {
+            size_t length = 0;
+            MemfsNode* node;
+
+            while (*cursor == L'\\' || *cursor == L'/')
+                cursor++;
+            while (cursor[length] != L'\0' && cursor[length] != L'\\' && cursor[length] != L'/')
+                length++;
+            if (length == 0)
+                break;
+            if (length > MEMFS_MAX_NAME)
+                return false;
+            memcpy(component, cursor, length * sizeof(wchar_t));
+            component[length] = L'\0';
+            cursor += length;
+            node = memfs_dir_lookup(parent, component);
+            if (node == NULL) {
+                if (memfs_node_create(store, parent, component, true,
+                        FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &node) != MEMFS_OK)
+                    return false;
+                /* The namespace keeps the directory; drop the create reference. */
+                memfs_node_close(node);
+            } else if (!memfs_node_is_directory(node)) {
+                return false;
+            }
+            parent = node;
+        }
+    }
+    *failed_path = NULL;
+    return true;
+}
+
 static int run_filesystem(MemfsRunConfig* config,
                           HANDLE stop_event,
                           FSF_SERVICE* service,
@@ -782,6 +844,20 @@ static int run_filesystem(MemfsRunConfig* config,
 
     if (config->debug)
         FspFileSystemSetDebugLog(instance->file_system, (ULONG)-1);
+
+    {
+        const wchar_t* failed_path = NULL;
+        if (!create_initial_directories(instance->store, config, &failed_path)) {
+            set_service_status_failure(service_result, STATUS_OBJECT_PATH_INVALID);
+            if (service != NULL)
+                fsf_service_log(service, FSF_SERVICE_LOG_ERROR,
+                    (DWORD)STATUS_OBJECT_PATH_INVALID, L"memfs --mkdir failed.");
+            if (console_mode)
+                fwprintf(stderr, L"Cannot create directory %s\n", failed_path);
+            exit_code = 4;
+            goto exit;
+        }
+    }
 
     status = memfs_winfsp_mount(instance, config->mount_point);
     if (!NT_SUCCESS(status)) {
