@@ -126,6 +126,10 @@ struct SCPFS {
 	DWORD default_security_size;
 	WCHAR volume_label[32];
 	uint16_t volume_label_bytes;
+	/* Remote statfs sample; Explorer refuses copies onto a volume reporting 0 free. */
+	uint64_t volume_total_bytes;
+	uint64_t volume_free_bytes;
+	ULONGLONG volume_sample_tick;
 	volatile LONG cache_counter;
 	SCPFS_CACHE_DIAGNOSTICS cache_diagnostics;
 };
@@ -1715,9 +1719,19 @@ static NTSTATUS scpfs_fs_get_volume_info(FSP_FILE_SYSTEM *file_system,
 		return STATUS_INVALID_PARAMETER;
 	AcquireSRWLockExclusive(&instance->lock);
 	memset(volume_info, 0, sizeof(*volume_info));
-	/* SCP has no portable free-space query in this adapter. */
-	volume_info->TotalSize = 0;
-	volume_info->FreeSize = 0;
+	/* Volume info is queried constantly; refresh the remote sample at most
+	 * every 30 seconds and keep the last good one if a refresh fails. */
+	if (instance->volume_sample_tick == 0 ||
+		GetTickCount64() - instance->volume_sample_tick >= 30000) {
+		uint64_t total = 0, available = 0;
+		if (NT_SUCCESS(scp_backend_statfs(instance->backend, &total, &available))) {
+			instance->volume_total_bytes = total;
+			instance->volume_free_bytes = available;
+		}
+		instance->volume_sample_tick = GetTickCount64();
+	}
+	volume_info->TotalSize = instance->volume_total_bytes;
+	volume_info->FreeSize = instance->volume_free_bytes;
 	volume_info->VolumeLabelLength = instance->volume_label_bytes;
 	memcpy(volume_info->VolumeLabel, instance->volume_label,
 		instance->volume_label_bytes);
@@ -2200,8 +2214,10 @@ static NTSTATUS scpfs_fs_write(FSP_FILE_SYSTEM *file_system,
 		status = scpfs_map_win32_error(GetLastError());
 		goto done;
 	}
-	if (bytes_written != 0)
-		scpfs_cache_invalidate_all(instance);
+	/* Local cache writes do not change the remote until commit; only this
+	 * path's entries can disagree with the open handle meanwhile. */
+	if (bytes_written != 0 && instance->read_cache != NULL)
+		scp_cache_invalidate_path(instance->read_cache, handle->remote_path);
 	{
 		LARGE_INTEGER size;
 		if (!GetFileSizeEx(handle->cache_file, &size) || size.QuadPart < 0) {
@@ -2373,7 +2389,8 @@ static NTSTATUS scpfs_fs_set_file_size(FSP_FILE_SYSTEM *file_system,
 		status = scpfs_map_win32_error(GetLastError());
 		goto done;
 	}
-	scpfs_cache_invalidate_all(instance);
+	if (instance->read_cache != NULL)
+		scp_cache_invalidate_path(instance->read_cache, handle->remote_path);
 	handle->file_size = new_size;
 	handle->current.size = new_size;
 	handle->dirty = true;
@@ -2838,6 +2855,51 @@ static bool scpfs_append_path(PCWSTR left, PCWSTR right, WCHAR **out)
 	return true;
 }
 
+/*
+ * Returns an absolute "\\?\" form of path. Cache payloads live several levels
+ * below %TMP% with GUID names, so an ordinary %TMP% of ~120 characters already
+ * pushed read-*.cache past MAX_PATH and silently disabled the read cache.
+ */
+static WCHAR *scpfs_long_path(PCWSTR path)
+{
+	DWORD required, written;
+	WCHAR *full, *result;
+	size_t length, prefix_length;
+	PCWSTR prefix, tail;
+
+	if (path == NULL || path[0] == L'\0')
+		return NULL;
+	if (wcsncmp(path, L"\\\\?\\", 4) == 0)
+		return scpfs_wcsdup(path);
+	required = GetFullPathNameW(path, 0, NULL, NULL);
+	if (required == 0)
+		return NULL;
+	full = (WCHAR *)malloc((size_t)required * sizeof(WCHAR));
+	if (full == NULL)
+		return NULL;
+	written = GetFullPathNameW(path, required, full, NULL);
+	if (written == 0 || written >= required) {
+		free(full);
+		return NULL;
+	}
+	if (full[0] == L'\\' && full[1] == L'\\') {
+		prefix = L"\\\\?\\UNC\\";
+		tail = full + 2;
+	} else {
+		prefix = L"\\\\?\\";
+		tail = full;
+	}
+	prefix_length = wcslen(prefix);
+	length = prefix_length + wcslen(tail);
+	result = (WCHAR *)malloc((length + 1) * sizeof(WCHAR));
+	if (result != NULL) {
+		memcpy(result, prefix, prefix_length * sizeof(WCHAR));
+		memcpy(result + prefix_length, tail, (wcslen(tail) + 1) * sizeof(WCHAR));
+	}
+	free(full);
+	return result;
+}
+
 static NTSTATUS scpfs_prepare_cache_directory(PCWSTR requested_parent,
 	WCHAR **session_directory_out)
 {
@@ -2854,7 +2916,7 @@ static NTSTATUS scpfs_prepare_cache_directory(PCWSTR requested_parent,
 		return STATUS_INVALID_PARAMETER;
 	*session_directory_out = NULL;
 	if (requested_parent != NULL) {
-		base = scpfs_wcsdup(requested_parent);
+		base = scpfs_long_path(requested_parent);
 		if (base == NULL)
 			return STATUS_INSUFFICIENT_RESOURCES;
 		attributes = GetFileAttributesW(base);
@@ -2875,10 +2937,13 @@ static NTSTATUS scpfs_prepare_cache_directory(PCWSTR requested_parent,
 		} else {
 			temp_buffer[temp_length] = L'\0';
 		}
-		if (!scpfs_append_path(temp_buffer, SCPFS_DEFAULT_CACHE_ROOT, &scpfs_root)) {
+		base = scpfs_long_path(temp_buffer);
+		if (base == NULL || !scpfs_append_path(base, SCPFS_DEFAULT_CACHE_ROOT, &scpfs_root)) {
 			status = STATUS_INSUFFICIENT_RESOURCES;
 			goto done;
 		}
+		free(base);
+		base = NULL;
 		if (!CreateDirectoryW(scpfs_root, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
 			status = scpfs_map_win32_error(GetLastError());
 			goto done;

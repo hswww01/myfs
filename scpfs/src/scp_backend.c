@@ -59,6 +59,8 @@ struct SCPFS_BACKEND {
 struct SCPFS_WATCH_STREAM {
 	SCPFS_BACKEND *backend;
 	LIBSSH2_CHANNEL *channel;
+	/* Lazily created; signals socket readability during idle waits. */
+	WSAEVENT socket_event;
 };
 
 static INIT_ONCE g_network_once = INIT_ONCE_STATIC_INIT;
@@ -826,6 +828,15 @@ done:
 }
 
 static NTSTATUS
+scpfs_finish_command(SCPFS_BUFFER *command)
+{
+	if(!scpfs_buffer_reserve(command, 1u))
+		return STATUS_NO_MEMORY;
+	command->data[command->length] = '\0';
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 scpfs_run_command_locked(SCPFS_BACKEND *backend, const char *command,
 	size_t max_output, char **output, size_t *output_length)
 {
@@ -1049,53 +1060,31 @@ scpfs_find_type(char value)
 	}
 }
 
+#define SCPFS_STAT_FORMAT \
+	"stat --printf='%F\\0%s\\0%X\\0%x\\0%Y\\0%y\\0%a\\0%d\\0%i\\0%u\\0%g\\0%Z\\0%z\\0' -- "
+
 static NTSTATUS
-scpfs_stat_locked(SCPFS_BACKEND *backend, const char *path,
+scpfs_parse_stat_output(const char *output, size_t output_length,
 	SCPFS_REMOTE_STAT *stat_out)
 {
-	SCPFS_BUFFER command = { 0 };
-	char *output = NULL;
-	size_t output_length = 0;
 	const char *fields[13];
 	size_t lengths[13];
 	size_t field_count = 0;
 	size_t field_start = 0;
 	size_t index;
 	uint64_t value;
-	NTSTATUS status;
-	if(!stat_out)
-		return STATUS_INVALID_PARAMETER;
-	status = scpfs_validate_parent_locked(backend, path);
-	if(!NT_SUCCESS(status))
-		return status;
-	if(!scpfs_buffer_append_text(&command,
-		"stat --printf='%F\\0%s\\0%X\\0%x\\0%Y\\0%y\\0%a\\0%d\\0%i\\0%u\\0%g\\0%Z\\0%z\\0' -- ") ||
-		!scpfs_append_shell_word(&command, path) ||
-		!scpfs_buffer_reserve(&command, 1u)) {
-		status = STATUS_NO_MEMORY;
-		goto done;
-	}
-	command.data[command.length] = '\0';
-	status = scpfs_run_command_locked(backend, command.data,
-		SCPFS_MAX_STAT_OUTPUT, &output, &output_length);
-	if(!NT_SUCCESS(status))
-		goto done;
 	for(index = 0; index < output_length; index++) {
 		if(output[index] == '\0') {
-			if(field_count >= 13u) {
-				status = STATUS_DATA_ERROR;
-				goto done;
-			}
+			if(field_count >= 13u)
+				return STATUS_DATA_ERROR;
 			fields[field_count] = output + field_start;
 			lengths[field_count] = index - field_start;
 			field_count++;
 			field_start = index + 1u;
 		}
 	}
-	if(field_count != 13u || field_start != output_length) {
-		status = STATUS_DATA_ERROR;
-		goto done;
-	}
+	if(field_count != 13u || field_start != output_length)
+		return STATUS_DATA_ERROR;
 	memset(stat_out, 0, sizeof(*stat_out));
 	scpfs_parse_stat_type(fields[0], lengths[0], &stat_out->type);
 	if(!scpfs_parse_u64(fields[1], lengths[1], 10u, &stat_out->size) ||
@@ -1103,22 +1092,84 @@ scpfs_stat_locked(SCPFS_BACKEND *backend, const char *path,
 			&stat_out->atime_ns) ||
 		!scpfs_parse_stat_time(fields[4], lengths[4], fields[5], lengths[5],
 			&stat_out->mtime_ns) ||
-		!scpfs_parse_u64(fields[6], lengths[6], 8u, &value)) {
-		status = STATUS_DATA_ERROR;
-		goto done;
-	}
+		!scpfs_parse_u64(fields[6], lengths[6], 8u, &value))
+		return STATUS_DATA_ERROR;
 	stat_out->mode = (uint32_t)value;
 	if(!scpfs_parse_u64(fields[7], lengths[7], 10u, &stat_out->device) ||
 		!scpfs_parse_u64(fields[8], lengths[8], 10u, &stat_out->inode) ||
 		!scpfs_parse_u64(fields[9], lengths[9], 10u, &stat_out->uid) ||
 		!scpfs_parse_u64(fields[10], lengths[10], 10u, &stat_out->gid) ||
 		!scpfs_parse_stat_time(fields[11], lengths[11], fields[12], lengths[12],
-			&stat_out->ctime_ns)) {
-		status = STATUS_DATA_ERROR;
+			&stat_out->ctime_ns))
+		return STATUS_DATA_ERROR;
+	return STATUS_SUCCESS;
+}
+
+/*
+ * Canonical-parent verification and the stat itself run in one SSH exec
+ * ("realpath -z P && stat ..."); they used to cost two round trips each.
+ * Results map exactly as the separate validate/stat calls did.
+ */
+static NTSTATUS
+scpfs_stat_locked(SCPFS_BACKEND *backend, const char *path,
+	SCPFS_REMOTE_STAT *stat_out)
+{
+	SCPFS_BUFFER command = { 0 };
+	char *parent = NULL;
+	char *output = NULL;
+	size_t output_length = 0;
+	size_t offset = 0;
+	size_t parent_length = 0;
+	int exit_status = -1;
+	NTSTATUS status;
+	if(!stat_out)
+		return STATUS_INVALID_PARAMETER;
+	if(!scpfs_path_is_root(backend, path)) {
+		status = scpfs_parent_path(backend, path, &parent);
+		if(!NT_SUCCESS(status))
+			return status;
+		parent_length = strlen(parent);
+		if(!scpfs_buffer_append_text(&command, "realpath -e -z -- ") ||
+			!scpfs_append_shell_word(&command, parent) ||
+			!scpfs_buffer_append_text(&command, " && ")) {
+			status = STATUS_NO_MEMORY;
+			goto done;
+		}
+	}
+	if(!scpfs_buffer_append_text(&command, SCPFS_STAT_FORMAT) ||
+		!scpfs_append_shell_word(&command, path) ||
+		!scpfs_buffer_reserve(&command, 1u)) {
+		status = STATUS_NO_MEMORY;
 		goto done;
 	}
-	status = STATUS_SUCCESS;
+	command.data[command.length] = '\0';
+	status = scpfs_execute_locked(backend, command.data,
+		SCPFS_MAX_STAT_OUTPUT + parent_length + 1u, &output, &output_length,
+		&exit_status);
+	if(!NT_SUCCESS(status))
+		goto done;
+	if(parent) {
+		const char *terminator = (const char *)memchr(output, '\0', output_length);
+		if(!terminator) {
+			/* realpath failed; its diagnostic is the whole output. */
+			status = exit_status != 0 ?
+				scpfs_map_remote_error(output, output_length) : STATUS_DATA_ERROR;
+			goto done;
+		}
+		if((size_t)(terminator - output) != parent_length ||
+			memcmp(output, parent, parent_length) != 0) {
+			status = STATUS_REPARSE_POINT_ENCOUNTERED;
+			goto done;
+		}
+		offset = parent_length + 1u;
+	}
+	if(exit_status != 0) {
+		status = scpfs_map_remote_error(output + offset, output_length - offset);
+		goto done;
+	}
+	status = scpfs_parse_stat_output(output + offset, output_length - offset, stat_out);
 done:
+	free(parent);
 	free(output);
 	scpfs_buffer_free(&command);
 	return status;
@@ -2203,7 +2254,57 @@ scp_backend_watch_stream_close(SCPFS_WATCH_STREAM *stream)
 	if(stream->backend && stream->backend->mutex_initialized)
 		LeaveCriticalSection(&stream->backend->mutex);
 	scp_backend_disconnect(stream->backend);
+	if(stream->socket_event != NULL && stream->socket_event != WSA_INVALID_EVENT)
+		WSACloseEvent(stream->socket_event);
 	free(stream);
+}
+
+NTSTATUS
+scp_backend_watch_stream_wait(SCPFS_WATCH_STREAM *stream, HANDLE wake_event,
+	HANDLE stop_event, DWORD timeout_ms, bool *readable)
+{
+	HANDLE handles[3];
+	DWORD count = 0;
+	DWORD wait_result;
+	int buffered;
+	if(!stream || !stream->backend || !stream->channel || !readable ||
+		stream->backend->socket == INVALID_SOCKET)
+		return STATUS_INVALID_PARAMETER;
+	*readable = false;
+	EnterCriticalSection(&stream->backend->mutex);
+	/* Data libssh2 already decrypted never makes the socket readable again. */
+	buffered = libssh2_poll_channel_read(stream->channel, 0);
+	LeaveCriticalSection(&stream->backend->mutex);
+	if(buffered > 0) {
+		*readable = true;
+		return STATUS_SUCCESS;
+	}
+	if(stream->socket_event == NULL) {
+		stream->socket_event = WSACreateEvent();
+		if(stream->socket_event == WSA_INVALID_EVENT) {
+			stream->socket_event = NULL;
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+	}
+	/* libssh2 keeps its socket non-blocking (set at handshake) and emulates
+	 * blocking with select, so the non-blocking mode WSAEventSelect leaves
+	 * behind is exactly what it expects. FD_READ is posted at once if data
+	 * is already queued. */
+	if(WSAEventSelect(stream->backend->socket, stream->socket_event,
+		FD_READ | FD_CLOSE) != 0)
+		return STATUS_UNSUCCESSFUL;
+	handles[count++] = stream->socket_event;
+	if(wake_event)
+		handles[count++] = wake_event;
+	if(stop_event)
+		handles[count++] = stop_event;
+	wait_result = WaitForMultipleObjects(count, handles, FALSE, timeout_ms);
+	(void)WSAEventSelect(stream->backend->socket, NULL, 0);
+	(void)WSAResetEvent(stream->socket_event);
+	if(wait_result == WAIT_FAILED)
+		return STATUS_UNSUCCESSFUL;
+	*readable = wait_result == WAIT_OBJECT_0;
+	return STATUS_SUCCESS;
 }
 
 HANDLE
@@ -2237,6 +2338,55 @@ scp_backend_stat(SCPFS_BACKEND *backend, PCWSTR path,
 	LeaveCriticalSection(&backend->mutex);
 	free(remote);
 	return status;
+}
+
+NTSTATUS
+scp_backend_statfs(SCPFS_BACKEND *backend, uint64_t *total_bytes,
+	uint64_t *available_bytes)
+{
+	SCPFS_BUFFER command = { 0 };
+	char *output = NULL;
+	size_t output_length = 0;
+	const char *fields[3];
+	size_t lengths[3];
+	size_t count = 0, start = 0, index;
+	uint64_t block_size, blocks, available;
+	NTSTATUS status;
+	if(!backend || !total_bytes || !available_bytes)
+		return STATUS_INVALID_PARAMETER;
+	*total_bytes = *available_bytes = 0;
+	if(!scpfs_buffer_append_text(&command, "stat -f --printf='%S\\0%b\\0%a\\0' -- ") ||
+		!scpfs_append_shell_word(&command, backend->remote_root) ||
+		!NT_SUCCESS(scpfs_finish_command(&command))) {
+		scpfs_buffer_free(&command);
+		return STATUS_NO_MEMORY;
+	}
+	EnterCriticalSection(&backend->mutex);
+	status = scpfs_run_command_locked(backend, command.data, SCPFS_MAX_STAT_OUTPUT,
+		&output, &output_length);
+	LeaveCriticalSection(&backend->mutex);
+	scpfs_buffer_free(&command);
+	if(!NT_SUCCESS(status))
+		return status;
+	for(index = 0; index < output_length && count < 3u; index++) {
+		if(output[index] == '\0') {
+			fields[count] = output + start;
+			lengths[count++] = index - start;
+			start = index + 1u;
+		}
+	}
+	if(count != 3u || start != output_length ||
+		!scpfs_parse_u64(fields[0], lengths[0], 10u, &block_size) ||
+		!scpfs_parse_u64(fields[1], lengths[1], 10u, &blocks) ||
+		!scpfs_parse_u64(fields[2], lengths[2], 10u, &available) ||
+		block_size == 0 || blocks > UINT64_MAX / block_size || available > blocks) {
+		free(output);
+		return STATUS_DATA_ERROR;
+	}
+	free(output);
+	*total_bytes = blocks * block_size;
+	*available_bytes = available * block_size;
+	return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -2284,15 +2434,6 @@ scpfs_same_snapshot(const SCPFS_REMOTE_STAT *left,
 	return left->type == right->type && left->size == right->size &&
 		left->mtime_ns == right->mtime_ns && left->mode == right->mode &&
 		left->device == right->device && left->inode == right->inode;
-}
-
-static NTSTATUS
-scpfs_finish_command(SCPFS_BUFFER *command)
-{
-	if(!scpfs_buffer_reserve(command, 1u))
-		return STATUS_NO_MEMORY;
-	command->data[command->length] = '\0';
-	return STATUS_SUCCESS;
 }
 
 /* The SCP protocol has a final one-byte acknowledgement in both directions.
@@ -2773,8 +2914,6 @@ scp_backend_upload_atomic(SCPFS_BACKEND *backend, PCWSTR path,
 	LARGE_INTEGER local_size;
 	FILETIME local_access_time;
 	FILETIME local_write_time;
-	char *command_output = NULL;
-	size_t command_output_length = 0;
 	char mode_text[16];
 	uint32_t upload_mode;
 	uint32_t final_mode = 0;
@@ -2854,36 +2993,56 @@ scp_backend_upload_atomic(SCPFS_BACKEND *backend, PCWSTR path,
 		goto done;
 	}
 	temp_uploaded = true;
-	status = scpfs_set_times_locked(backend, temp, upload_atime_ns,
-		upload_mtime_ns, true, true);
-	if(!NT_SUCCESS(status))
-		goto done;
-	/* Preserve an existing file's exact mode. New files retain the SCP sink's
-	 * umask-filtered mode, matching ordinary remote creation semantics. */
-	if(expected_stat) {
-		(void)snprintf(mode_text, sizeof(mode_text), "%04o",
-			upload_mode & 07777u);
-		if(!scpfs_buffer_append_text(&command, "chmod ") ||
-			!scpfs_buffer_append_text(&command, mode_text) ||
+	/* Times, mode and the verifying stat of the temporary run in one exec. */
+	{
+		char atime_text[64];
+		char mtime_text[64];
+		char *output = NULL;
+		size_t output_length = 0;
+		int exit_status = -1;
+		if(!scpfs_ns_to_touch_text(upload_atime_ns, atime_text) ||
+			!scpfs_ns_to_touch_text(upload_mtime_ns, mtime_text) ||
+			!scpfs_buffer_append_text(&command, "touch -c -a -d ") ||
+			!scpfs_append_shell_word(&command, atime_text) ||
 			!scpfs_buffer_append_text(&command, " -- ") ||
+			!scpfs_append_shell_word(&command, temp) ||
+			!scpfs_buffer_append_text(&command, " && touch -c -m -d ") ||
+			!scpfs_append_shell_word(&command, mtime_text) ||
+			!scpfs_buffer_append_text(&command, " -- ") ||
+			!scpfs_append_shell_word(&command, temp)) {
+			status = STATUS_NO_MEMORY;
+			goto done;
+		}
+		/* Preserve an existing file's exact mode. New files retain the SCP
+		 * sink's umask-filtered mode, matching ordinary remote creation. */
+		if(expected_stat) {
+			(void)snprintf(mode_text, sizeof(mode_text), "%04o",
+				upload_mode & 07777u);
+			if(!scpfs_buffer_append_text(&command, " && chmod ") ||
+				!scpfs_buffer_append_text(&command, mode_text) ||
+				!scpfs_buffer_append_text(&command, " -- ") ||
+				!scpfs_append_shell_word(&command, temp)) {
+				status = STATUS_NO_MEMORY;
+				goto done;
+			}
+		}
+		if(!scpfs_buffer_append_text(&command, " && " SCPFS_STAT_FORMAT) ||
 			!scpfs_append_shell_word(&command, temp)) {
 			status = STATUS_NO_MEMORY;
 			goto done;
 		}
 		status = scpfs_finish_command(&command);
 		if(NT_SUCCESS(status))
-			status = scpfs_run_command_locked(backend, command.data,
-				SCPFS_MAX_STAT_OUTPUT, &command_output, &command_output_length);
-		free(command_output);
-		command_output = NULL;
-		command_output_length = 0;
+			status = scpfs_execute_locked(backend, command.data,
+				SCPFS_MAX_STAT_OUTPUT, &output, &output_length, &exit_status);
+		if(NT_SUCCESS(status))
+			status = exit_status != 0 ?
+				scpfs_map_remote_error(output, output_length) :
+				scpfs_parse_stat_output(output, output_length, &temp_stat);
+		free(output);
+		scpfs_buffer_free(&command);
 		if(!NT_SUCCESS(status))
 			goto done;
-		scpfs_buffer_free(&command);
-	}
-	status = scpfs_stat_locked(backend, temp, &temp_stat);
-	if(!NT_SUCCESS(status)) {
-		goto done;
 	}
 	if(temp_stat.type != SCPFS_REMOTE_FILE ||
 		temp_stat.size != (uint64_t)local_size.QuadPart ||
@@ -2897,10 +3056,8 @@ scp_backend_upload_atomic(SCPFS_BACKEND *backend, PCWSTR path,
 	}
 	final_mode = temp_stat.mode;
 	/* The fingerprint check is deliberately after the full SCP acknowledgement.
-	 * It is best-effort conflict detection, not a server-side compare-and-swap. */
-	status = scpfs_validate_parent_locked(backend, remote);
-	if(!NT_SUCCESS(status))
-		goto done;
+	 * It is best-effort conflict detection, not a server-side compare-and-swap.
+	 * scpfs_stat_locked also re-verifies the canonical parent. */
 	status = scpfs_stat_locked(backend, remote, &current);
 	if(expected_stat == NULL) {
 		if(NT_SUCCESS(status)) {
@@ -2915,33 +3072,46 @@ scp_backend_upload_atomic(SCPFS_BACKEND *backend, PCWSTR path,
 		status = STATUS_FILE_LOCK_CONFLICT;
 		goto done;
 	}
-	if(!scpfs_buffer_append_text(&command,
-		expected_stat ? "mv -T -- " : "mv -T -n -- ") ||
-		!scpfs_append_shell_word(&command, temp) ||
-		!scpfs_buffer_append_text(&command, " ") ||
-		!scpfs_append_shell_word(&command, remote)) {
-		status = STATUS_NO_MEMORY;
-		goto done;
+	/* Move, prove the temporary is gone (mv -n may silently skip), and stat
+	 * the published file in one exec. */
+	{
+		static const char temp_remains[] = "SCPFS_TEMP_REMAINS";
+		char *output = NULL;
+		size_t output_length = 0;
+		int exit_status = -1;
+		if(!scpfs_buffer_append_text(&command,
+			expected_stat ? "mv -T -- " : "mv -T -n -- ") ||
+			!scpfs_append_shell_word(&command, temp) ||
+			!scpfs_buffer_append_text(&command, " ") ||
+			!scpfs_append_shell_word(&command, remote) ||
+			!scpfs_buffer_append_text(&command, " && if test -e ") ||
+			!scpfs_append_shell_word(&command, temp) ||
+			!scpfs_buffer_append_text(&command, " || test -L ") ||
+			!scpfs_append_shell_word(&command, temp) ||
+			!scpfs_buffer_append_text(&command, "; then printf ") ||
+			!scpfs_buffer_append_text(&command, temp_remains) ||
+			!scpfs_buffer_append_text(&command, "; false; else " SCPFS_STAT_FORMAT) ||
+			!scpfs_append_shell_word(&command, remote) ||
+			!scpfs_buffer_append_text(&command, "; fi")) {
+			status = STATUS_NO_MEMORY;
+			goto done;
+		}
+		status = scpfs_finish_command(&command);
+		if(NT_SUCCESS(status))
+			status = scpfs_execute_locked(backend, command.data,
+				SCPFS_MAX_STAT_OUTPUT, &output, &output_length, &exit_status);
+		if(NT_SUCCESS(status)) {
+			if(exit_status == 0)
+				status = scpfs_parse_stat_output(output, output_length, &final_stat);
+			else if(scpfs_contains_text(output, output_length, temp_remains))
+				status = STATUS_FILE_LOCK_CONFLICT;
+			else
+				status = scpfs_map_remote_error(output, output_length);
+		}
+		free(output);
+		if(!NT_SUCCESS(status))
+			goto done;
 	}
-	status = scpfs_finish_command(&command);
-	if(!NT_SUCCESS(status))
-		goto done;
-	status = scpfs_run_command_locked(backend, command.data,
-		SCPFS_MAX_STAT_OUTPUT, &command_output, &command_output_length);
-	free(command_output);
-	command_output = NULL;
-	if(!NT_SUCCESS(status))
-		goto done;
-	status = scpfs_stat_locked(backend, temp, &temp_stat);
-	if(NT_SUCCESS(status)) {
-		status = STATUS_FILE_LOCK_CONFLICT;
-		goto done;
-	}
-	if(!scpfs_is_missing_status(status))
-		goto done;
-	status = scpfs_stat_locked(backend, remote, &final_stat);
-	if(!NT_SUCCESS(status))
-		goto done;
 	if(final_stat.type != SCPFS_REMOTE_FILE ||
 		final_stat.size != (uint64_t)local_size.QuadPart ||
 		final_stat.mode != final_mode ||

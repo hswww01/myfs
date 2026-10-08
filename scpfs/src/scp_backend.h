@@ -102,9 +102,16 @@ NTSTATUS scp_backend_watch_stream_write(SCPFS_WATCH_STREAM *stream,
 NTSTATUS scp_backend_watch_stream_read(SCPFS_WATCH_STREAM *stream,
 	void *buffer, size_t capacity, size_t *read_out);
 void scp_backend_watch_stream_close(SCPFS_WATCH_STREAM *stream);
+/* Waits until the stream has data, wake_event or stop_event is signaled, or
+ * timeout_ms elapses; *readable reports stream data. */
+NTSTATUS scp_backend_watch_stream_wait(SCPFS_WATCH_STREAM *stream,
+	HANDLE wake_event, HANDLE stop_event, DWORD timeout_ms, bool *readable);
 
 NTSTATUS scp_backend_stat(SCPFS_BACKEND *backend, PCWSTR path,
 	SCPFS_REMOTE_STAT *stat_out);
+/* Capacity and space available to the account on the remote root's file system. */
+NTSTATUS scp_backend_statfs(SCPFS_BACKEND *backend, uint64_t *total_bytes,
+	uint64_t *available_bytes);
 NTSTATUS scp_backend_list(SCPFS_BACKEND *backend, PCWSTR path,
 	SCPFS_DIR_LIST *list_out);
 void scp_backend_free_list(SCPFS_DIR_LIST *list);

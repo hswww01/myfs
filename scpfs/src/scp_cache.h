@@ -55,6 +55,8 @@ void scp_cache_put_payload(SCPFS_CACHE *cache, PCWSTR path,
 void scp_cache_evict_payload(SCPFS_CACHE *cache, PCWSTR path);
 
 void scp_cache_invalidate_metadata(SCPFS_CACHE *cache);
+/* Drops cached stat/list/payload for path and the listing of its parent. */
+void scp_cache_invalidate_path(SCPFS_CACHE *cache, PCWSTR path);
 void scp_cache_invalidate_all(SCPFS_CACHE *cache);
 void scp_cache_record_monitor_bypass(SCPFS_CACHE *cache);
 void scp_cache_record_payload_hit(SCPFS_CACHE *cache);

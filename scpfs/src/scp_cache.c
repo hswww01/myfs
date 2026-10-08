@@ -16,6 +16,8 @@ typedef enum SCPFS_CACHE_KIND {
 typedef struct SCPFS_CACHE_ENTRY {
 	struct SCPFS_CACHE_ENTRY *previous;
 	struct SCPFS_CACHE_ENTRY *next;
+	struct SCPFS_CACHE_ENTRY *bucket_next;
+	uint32_t hash;
 	SCPFS_CACHE_KIND kind;
 	WCHAR *path;
 	size_t metadata_bytes;
@@ -32,8 +34,12 @@ typedef struct SCPFS_CACHE_ENTRY {
 	} value;
 } SCPFS_CACHE_ENTRY;
 
+/* Power of two; the metadata limit keeps chains short. */
+#define SCPFS_CACHE_BUCKETS 8192u
+
 struct SCPFS_CACHE {
 	WCHAR *session_directory;
+	SCPFS_CACHE_ENTRY *buckets[SCPFS_CACHE_BUCKETS];
 	SCPFS_CACHE_ENTRY *most_recent;
 	SCPFS_CACHE_ENTRY *least_recent;
 	size_t metadata_bytes;
@@ -144,12 +150,22 @@ static bool scp_cache_list_size(const SCPFS_DIR_LIST *list, size_t *bytes_out)
 	return true;
 }
 
+static uint32_t scp_cache_hash(SCPFS_CACHE_KIND kind, PCWSTR path)
+{
+	uint32_t hash = 2166136261u ^ (uint32_t)kind;
+	for (; *path != L'\0'; ++path)
+		hash = (hash ^ (uint32_t)*path) * 16777619u;
+	return hash;
+}
+
 static SCPFS_CACHE_ENTRY *scp_cache_find(SCPFS_CACHE *cache,
 	SCPFS_CACHE_KIND kind, PCWSTR path)
 {
+	uint32_t hash = scp_cache_hash(kind, path);
 	SCPFS_CACHE_ENTRY *entry;
-	for (entry = cache->most_recent; entry != NULL; entry = entry->next) {
-		if (entry->kind == kind && wcscmp(entry->path, path) == 0)
+	for (entry = cache->buckets[hash & (SCPFS_CACHE_BUCKETS - 1u)]; entry != NULL;
+		entry = entry->bucket_next) {
+		if (entry->hash == hash && entry->kind == kind && wcscmp(entry->path, path) == 0)
 			return entry;
 	}
 	return NULL;
@@ -188,9 +204,25 @@ static void scp_cache_touch(SCPFS_CACHE *cache, SCPFS_CACHE_ENTRY *entry)
 	scp_cache_link_recent(cache, entry);
 }
 
+/* Indexes a fully initialized entry (kind and path set) and makes it most recent. */
+static void scp_cache_insert(SCPFS_CACHE *cache, SCPFS_CACHE_ENTRY *entry)
+{
+	SCPFS_CACHE_ENTRY **bucket;
+	entry->hash = scp_cache_hash(entry->kind, entry->path);
+	bucket = &cache->buckets[entry->hash & (SCPFS_CACHE_BUCKETS - 1u)];
+	entry->bucket_next = *bucket;
+	*bucket = entry;
+	scp_cache_link_recent(cache, entry);
+}
+
 static void scp_cache_remove_entry(SCPFS_CACHE *cache,
 	SCPFS_CACHE_ENTRY *entry, bool eviction)
 {
+	SCPFS_CACHE_ENTRY **link = &cache->buckets[entry->hash & (SCPFS_CACHE_BUCKETS - 1u)];
+	while (*link != NULL && *link != entry)
+		link = &(*link)->bucket_next;
+	if (*link == entry)
+		*link = entry->bucket_next;
 	scp_cache_unlink(cache, entry);
 	if (entry->kind == SCPFS_CACHE_PAYLOAD) {
 		if (cache->payload_bytes >= entry->value.payload.size)
@@ -377,7 +409,7 @@ void scp_cache_put_stat(SCPFS_CACHE *cache, PCWSTR path,
 	entry->metadata_bytes = sizeof(*entry) + path_bytes;
 	cache->metadata_bytes += entry->metadata_bytes;
 	cache->metadata_entries++;
-	scp_cache_link_recent(cache, entry);
+	scp_cache_insert(cache, entry);
 	scp_cache_trim_metadata(cache);
 }
 
@@ -439,7 +471,7 @@ void scp_cache_put_list(SCPFS_CACHE *cache, PCWSTR path,
 	entry->metadata_bytes = sizeof(*entry) + path_bytes + list_bytes;
 	cache->metadata_bytes += entry->metadata_bytes;
 	cache->metadata_entries++;
-	scp_cache_link_recent(cache, entry);
+	scp_cache_insert(cache, entry);
 	scp_cache_trim_metadata(cache);
 }
 
@@ -598,7 +630,7 @@ void scp_cache_put_payload(SCPFS_CACHE *cache, PCWSTR path,
 	cache->payload_bytes += provenance->size;
 	cache->metadata_bytes += entry->metadata_bytes;
 	cache->metadata_entries++;
-	scp_cache_link_recent(cache, entry);
+	scp_cache_insert(cache, entry);
 	scp_cache_trim_metadata(cache);
 	scp_cache_trim_payload(cache);
 }
@@ -621,6 +653,32 @@ void scp_cache_invalidate_metadata(SCPFS_CACHE *cache)
 			scp_cache_remove_entry(cache, entry, false);
 		entry = next;
 	}
+}
+
+void scp_cache_invalidate_path(SCPFS_CACHE *cache, PCWSTR path)
+{
+	PCWSTR separator;
+	WCHAR *parent;
+	size_t parent_length;
+	if (cache == NULL || path == NULL)
+		return;
+	cache->counters.invalidations++;
+	scp_cache_remove_key(cache, SCPFS_CACHE_STAT, path, false);
+	scp_cache_remove_key(cache, SCPFS_CACHE_LIST, path, false);
+	scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path, false);
+	separator = wcsrchr(path, L'\\');
+	if (separator == NULL)
+		return;
+	parent_length = separator == path ? 1u : (size_t)(separator - path);
+	parent = (WCHAR *)malloc((parent_length + 1u) * sizeof(WCHAR));
+	if (parent == NULL) {
+		scp_cache_invalidate_all(cache);
+		return;
+	}
+	memcpy(parent, path, parent_length * sizeof(WCHAR));
+	parent[parent_length] = L'\0';
+	scp_cache_remove_key(cache, SCPFS_CACHE_LIST, parent, false);
+	free(parent);
 }
 
 void scp_cache_invalidate_all(SCPFS_CACHE *cache)

@@ -489,7 +489,22 @@ scp_watch_thread(void *parameter)
 			}
 			{
 				char line[SCPFS_WATCH_MAX_LINE + 1u];
-				SCPFS_WATCH_LINE_RESULT line_result = scp_watch_read_line(
+				SCPFS_WATCH_LINE_RESULT line_result;
+				/* Sleep until monitor data, a queued request, stop or the next
+				 * heartbeat. A blocking 25 ms read here delayed every queued
+				 * ensure/barrier by up to 25 ms. */
+				if(memchr(pending, '\n', pending_length) == NULL) {
+					bool readable = false;
+					ULONGLONG now = GetTickCount64();
+					DWORD wait_ms = next_heartbeat > now ?
+						(DWORD)(next_heartbeat - now) : 0;
+					if(!NT_SUCCESS(scp_backend_watch_stream_wait(stream,
+						watch->wake_event, watch->stop_event, wait_ms, &readable)))
+						break;
+					if(!readable)
+						continue;
+				}
+				line_result = scp_watch_read_line(
 					stream, pending, &pending_length, line, sizeof(line),
 					SCPFS_WATCH_IO_TIMEOUT_MS);
 				if(line_result == SCPFS_WATCH_LINE_ERROR)
