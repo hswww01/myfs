@@ -1,0 +1,9 @@
+/build/
+/out/
+*.user
+*.suo
+__pycache__/
+vcpkg_installed/
+dist/
+*.obj
+vcpkg.json

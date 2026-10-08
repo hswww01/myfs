@@ -1,0 +1,19 @@
+# Project-local CMake and compiler outputs.
+/build/
+/dist/
+
+# Per-user IDE and CMake preset state.
+/.vs/
+/CMakeUserPresets.json
+*.suo
+*.user
+*.vcxproj.user
+
+# Integration-test Python bytecode.
+__pycache__/
+*.pyc
+
+# Native compiler intermediates produced outside the ignored build tree.
+*.obj
+*.pdb
+*.ilk

@@ -1,0 +1,29 @@
+{
+  "checked_at": "2026-10-03T15:51:09.9241924+08:00",
+  "scope": "Focused source/package identity and prior test evidence readback",
+  "release_sha256": "CDA91BC8EBA4B8EF59F4E0CF6D69DE6D6592BDAA4D182E940BB1B11EE6306CEA",
+  "release_bytes": 5397504,
+  "source_entries_verified": 31,
+  "frontend_entries_verified": 6,
+  "packaged_dll_count": 0,
+  "debug_tests": "13/13 PASS, zero skips",
+  "release_tests": "13/13 PASS, zero skips",
+  "service": {
+    "name": "Scpfs",
+    "state": "Running",
+    "start_mode": "Auto",
+    "pid": 47320,
+    "account": "LocalSystem"
+  },
+  "memfs": {
+    "state": "Stopped",
+    "pid": 0
+  },
+  "r_acceptance": "CACHE_ACCESS_R_ACCEPTANCE.json",
+  "v_acceptance": "CACHE_ACCESS_V_ACCEPTANCE.json",
+  "architecture_review": "CACHE_ACCESS_REVIEW.md",
+  "cold_atime_branch_runtime_covered": false,
+  "reboot_tested": false,
+  "passed": true,
+  "memfs_incidental_crash": "Windows 0xc0000005 at 2026-10-03 15:45:46; cause unknown, not fixed in this task"
+}

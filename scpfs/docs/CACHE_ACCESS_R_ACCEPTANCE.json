@@ -1,0 +1,208 @@
+{
+  "evidence": "D:\\work\\fs\\scp\\build\\cache-r-verify\\3feb61d1bb669fac",
+  "service": {
+    "Name": "Scpfs",
+    "State": "Running",
+    "StartMode": "Auto",
+    "ProcessId": 47320,
+    "StartName": "LocalSystem",
+    "PathName": "\"D:\\work\\fs\\scp\\dist\\scpfs-x64\\scpfs.exe\" \"--service\" \"--service-name\" \"Scpfs\" \"--mount\" \"R:\" \"--host\" \"cn.tqdream.com\" \"--user\" \"root\" \"--remote-root\" \"/\" \"--known-hosts\" \"C:\\Users\\Administrator\\.ssh\\known_hosts\" \"--identity\" \"C:\\Users\\Administrator\\.ssh\\id_ed25519\" \"--port\" \"22\" \"--timeout-ms\" \"15000\" \"--command-timeout-ms\" \"60000\" \"--authorized-user-sid\" \"S-1-5-21-1368280895-1515568252-4191255340-500\" \"--log-file\" \"C:\\ProgramData\\Scpfs\\Scpfs.log\""
+  },
+  "reads": [
+    {
+      "phase": "initial",
+      "read": 1,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 628.8,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "initial",
+      "read": 2,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 255.941,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "initial",
+      "read": 3,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 3.137,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "initial",
+      "read": 4,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 29.088,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "initial",
+      "read": 5,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.714,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "initial",
+      "read": 6,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 3.267,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 1,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 1.663,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 2,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.962,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 3,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.233,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 4,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 1.992,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 5,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 3.666,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 6,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 4.983,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 1,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.724,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 2,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 3.109,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 3,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 3.916,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 4,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.666,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 5,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 2.49,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 6,
+      "bytes": 11,
+      "content_sha256": "2697ab64a99349ddc186811c17cc891780c0497e03f2eeeedc1cd16e156b386d",
+      "milliseconds": 4.11,
+      "matching_payloads": [
+        "read-{12A9FD75-C3F1-43CE-978E-EF5568C94440}.cache"
+      ]
+    }
+  ],
+  "passed": true,
+  "executable": "D:\\work\\fs\\scp\\dist\\scpfs-x64\\scpfs.exe",
+  "sha256": "cda91bc8eba4b8ef59f4e0cf6d69de6d6592bdaa4d182e940bb1b11ee6306cea",
+  "cache_directory": "C:\\WINDOWS\\TEMP\\scpfs\\session-{2B9201F3-D967-4E0B-B53B-495BD1032D62}",
+  "cache_max_mib": 0,
+  "runtime_modules": {
+    "path": "D:\\work\\fs\\scp\\build\\cache-r-verify\\3feb61d1bb669fac\\runtime-modules.json",
+    "passed": true,
+    "module_count": 39,
+    "unexpected_count": 0,
+    "forbidden_count": 0
+  },
+  "root_entry_count": 26,
+  "etc_entry_count": 248,
+  "after_etc_warm_median_ms": 3.109
+}

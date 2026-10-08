@@ -1,0 +1,236 @@
+{
+  "root": "D:\\work\\fs\\scp\\build\\cache-live-diagnose\\389a25e065c52447",
+  "executable": "D:\\work\\fs\\scp\\build\\x64-release\\scpfs.exe",
+  "sha256": "cda91bc8eba4b8ef59f4e0cf6d69de6d6592bdaa4d182e940bb1b11ee6306cea",
+  "drive": "V:",
+  "reads": [
+    {
+      "phase": "isolated",
+      "read": 1,
+      "bytes": 11,
+      "milliseconds": 678.726,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "isolated",
+      "read": 2,
+      "bytes": 11,
+      "milliseconds": 190.259,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "isolated",
+      "read": 3,
+      "bytes": 11,
+      "milliseconds": 1.695,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "isolated",
+      "read": 4,
+      "bytes": 11,
+      "milliseconds": 317.797,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "isolated",
+      "read": 5,
+      "bytes": 11,
+      "milliseconds": 1.603,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "isolated",
+      "read": 6,
+      "bytes": 11,
+      "milliseconds": 1.634,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 1,
+      "bytes": 11,
+      "milliseconds": 1.381,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 2,
+      "bytes": 11,
+      "milliseconds": 1.58,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 3,
+      "bytes": 11,
+      "milliseconds": 1.373,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 4,
+      "bytes": 11,
+      "milliseconds": 1.561,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 5,
+      "bytes": 11,
+      "milliseconds": 1.612,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-root-list",
+      "read": 6,
+      "bytes": 11,
+      "milliseconds": 1.578,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 1,
+      "bytes": 11,
+      "milliseconds": 2.24,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 2,
+      "bytes": 11,
+      "milliseconds": 1.58,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 3,
+      "bytes": 11,
+      "milliseconds": 1.953,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 4,
+      "bytes": 11,
+      "milliseconds": 1.692,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 5,
+      "bytes": 11,
+      "milliseconds": 1.897,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "phase": "after-etc-list",
+      "read": 6,
+      "bytes": 11,
+      "milliseconds": 1.819,
+      "cache_files": [
+        {
+          "name": "read-{6A657840-22BB-470D-A90B-57393E280E5C}.cache",
+          "size": 11
+        }
+      ]
+    }
+  ],
+  "pid": 83592,
+  "module_inventory": {
+    "path": "D:\\work\\fs\\scp\\build\\cache-live-diagnose\\389a25e065c52447\\runtime-modules.json",
+    "passed": true,
+    "module_count": 39,
+    "unexpected_count": 0,
+    "forbidden_count": 0
+  },
+  "root_entry_count": 26,
+  "etc_entry_count": 248,
+  "exit_code": 0,
+  "drive_released": true
+}

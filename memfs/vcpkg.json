@@ -1,0 +1,10 @@
+{
+  "name": "memfs",
+  "version-string": "0.2.0",
+  "builtin-baseline": "6d332a018c433fad20822ff4b536e4ccdc3413bd",
+  "description": "A pure C in-memory file system for Windows using WinFsp",
+  "dependencies": [
+    "libsodium",
+    "zstd"
+  ]
+}

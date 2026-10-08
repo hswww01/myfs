@@ -1,0 +1,37 @@
+{
+  "checked_at_utc": "2026-10-03T01:23:55.883074+00:00",
+  "exe": "D:\\work\\fs\\scp\\build\\x64-release\\scpfs.exe",
+  "sha256": "439a0166b873e14c9a3b6e7afa9c27dd4918acc620b8e1a5397e66608fd0abcd",
+  "host": "cn.tqdream.com",
+  "user": "root",
+  "remote_root": "/",
+  "temporary_drive": "V:",
+  "owned_remote_directory": "/tmp/scpfs-cache-check-86a81234e69698d178fa40a4",
+  "cache_max_mib_option": "omitted; default 0/unlimited",
+  "existing_Scpfs_service": "left stopped; no service operation performed",
+  "read_ms": [
+    390.5005999840796,
+    353.61490002833307,
+    588.5071998927742,
+    185.9691001009196,
+    1.2334000784903765,
+    0.8235999848693609
+  ],
+  "external_change_visible_ms": 644.4733000826091,
+  "external_write_invalidation": true,
+  "external_rename_visible": true,
+  "os_only_runtime_modules": true,
+  "owned_remote_directory_removed": true,
+  "cache_counters": {
+    "list_miss": 0,
+    "stat_hit": 14,
+    "stat_miss": 6,
+    "payload_hit": 3,
+    "payload_miss": 2,
+    "evictions": 0,
+    "monitor_bypass": 28,
+    "list_hit": 0,
+    "invalidations": 7
+  },
+  "graceful_stop": true
+}

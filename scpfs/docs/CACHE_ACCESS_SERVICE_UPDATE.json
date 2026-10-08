@@ -1,0 +1,12 @@
+{
+  "candidate": "D:\\work\\fs\\scp\\build\\x64-release\\scpfs.exe",
+  "published": "D:\\work\\fs\\scp\\dist\\scpfs-x64\\scpfs.exe",
+  "backup": "D:\\work\\fs\\scp\\dist\\scpfs-x64\\scpfs-before-cache-access-fix-20261003-153338.exe",
+  "old_sha256": "439A0166B873E14C9A3B6E7AFA9C27DD4918ACC620B8E1A5397E66608FD0ABCD",
+  "candidate_sha256": "CDA91BC8EBA4B8EF59F4E0CF6D69DE6D6592BDAA4D182E940BB1B11EE6306CEA",
+  "stop_completed": true,
+  "image_published": true,
+  "start_completed": true,
+  "rollback_completed": false,
+  "new_pid": 47320
+}

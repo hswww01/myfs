@@ -1,0 +1,5 @@
+#pragma once
+
+#define IDR_MEMFS_WINFSP_DLL 101
+#define IDR_MEMFS_WINFSP_SYS_X64 102
+#define IDR_MEMFS_WINFSP_SYS_ARM64 103

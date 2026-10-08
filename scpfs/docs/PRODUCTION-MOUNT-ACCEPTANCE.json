@@ -1,0 +1,15 @@
+{
+  "checked_at": "2026-10-03T05:28:14+0800",
+  "exe_sha256": "F20505BE1A4250CD7F43B909FCEA271F6D07232C39CAA3A29AE309F90B385698",
+  "drive": "R:",
+  "remote_root": "/",
+  "temporary_remote_directory": "/tmp/scpfs-acceptance-b8386c014e2245e59bd4a5d5c27c7f8e",
+  "case_sensitive_crud": true,
+  "explicit_time_update_and_immediate_delete": true,
+  "case_variant_inbox_is_ordinary_file": true,
+  "close_command_output": "scpfs-final-close\n/tmp/scpfs-acceptance-b8386c014e2245e59bd4a5d5c27c7f8e",
+  "inbox_close_cwd_output": true,
+  "rename_command_output": "scpfs-final-rename\n/tmp/scpfs-acceptance-b8386c014e2245e59bd4a5d5c27c7f8e",
+  "inbox_rename_cwd_output": true,
+  "temporary_files_removed": true
+}

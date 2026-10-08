@@ -1,0 +1,25 @@
+# Build trees, packaged releases and dependency installs
+build/
+dist/
+out/
+vcpkg_installed/
+
+# Agent/acceptance run artifacts
+.agent/
+
+# IDE and per-user state
+.vs/
+CMakeUserPresets.json
+*.user
+*.suo
+*.vcxproj.user
+
+# Compiler intermediates outside build trees
+*.obj
+*.pdb
+*.ilk
+
+# Python bytecode and logs
+__pycache__/
+*.pyc
+*.log

@@ -1,0 +1,23 @@
+{
+  "checked_at": "2026-10-03T05:32:10+0800",
+  "executable": "D:\\work\\fs\\scp\\dist\\scpfs-x64\\scpfs.exe",
+  "exe_sha256": "F20505BE1A4250CD7F43B909FCEA271F6D07232C39CAA3A29AE309F90B385698",
+  "checks": [
+    {
+      "host": "7b9b732410644317a20d2138ef4ed0da.invalid",
+      "port": 22,
+      "timeout_ms": 250,
+      "exit_code": 1,
+      "elapsed_seconds": 0.05303380009718239,
+      "diagnostic": "probe: SSH connection, host-key verification, or authentication failed (0xC00000BE)"
+    },
+    {
+      "host": "127.0.0.1",
+      "port": 1,
+      "timeout_ms": 1,
+      "exit_code": 1,
+      "elapsed_seconds": 0.038312100106850266,
+      "diagnostic": "probe: SSH connection, host-key verification, or authentication failed (0xC00000B5)"
+    }
+  ]
+}

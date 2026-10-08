@@ -1,0 +1,10 @@
+{
+  "name": "cryptfs",
+  "version-string": "0.1.0",
+  "builtin-baseline": "6d332a018c433fad20822ff4b536e4ccdc3413bd",
+  "description": "A compressed encrypted single-file filesystem for Windows using WinFsp",
+  "dependencies": [
+    "libsodium",
+    "zstd"
+  ]
+}
