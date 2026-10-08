@@ -54,6 +54,9 @@ struct SCPFS_BACKEND {
 	char *host;
 	char *username;
 	char *remote_root;
+	/* Persistent "/bin/sh" channel for commands; see scpfs_execute_locked. */
+	LIBSSH2_CHANNEL *shell;
+	bool shell_unavailable;
 };
 
 struct SCPFS_WATCH_STREAM {
@@ -316,6 +319,31 @@ scpfs_is_windows_component(PCWSTR component, size_t length)
 		return false;
 	free(utf8);
 	return utf8_length <= 255u;
+}
+
+NTSTATUS
+scp_backend_decode_name(const char *utf8, size_t length, WCHAR **name_out,
+	size_t *name_length_out)
+{
+	WCHAR *name = NULL;
+	size_t name_length = 0;
+	NTSTATUS status;
+	if(!utf8 || !name_out || !name_length_out)
+		return STATUS_INVALID_PARAMETER;
+	*name_out = NULL;
+	*name_length_out = 0;
+	if(length == 0 || length > 255u)
+		return STATUS_OBJECT_NAME_INVALID;
+	status = scpfs_utf8_to_wide_n(utf8, length, &name, &name_length);
+	if(!NT_SUCCESS(status))
+		return status;
+	if(!scpfs_is_windows_component(name, name_length)) {
+		free(name);
+		return STATUS_OBJECT_NAME_INVALID;
+	}
+	*name_out = name;
+	*name_length_out = name_length;
+	return STATUS_SUCCESS;
 }
 
 /* Quote one UTF-8 shell word for both Bourne shells and csh-family shells.
@@ -658,8 +686,10 @@ scpfs_poison_backend(SCPFS_BACKEND *backend, NTSTATUS status)
 		shutdown(backend->socket, SD_BOTH);
 }
 
+/* One exec channel per command: isolated, but each costs several round trips
+ * (channel open, exec request, EOF/exit status, close). */
 static NTSTATUS
-scpfs_execute_locked(SCPFS_BACKEND *backend, const char *command,
+scpfs_execute_channel_locked(SCPFS_BACKEND *backend, const char *command,
 	size_t max_output, char **output, size_t *output_length, int *exit_status)
 {
 	static const char status_prefix[] = "\036SCPFS_RC:";
@@ -823,6 +853,227 @@ done:
 			(*output)[0] = '\0';
 	}
 	scpfs_buffer_free(&full_command);
+	scpfs_buffer_free(&result);
+	return status;
+}
+
+/* SCPFS_TRACE=1 logs every remote command with its latency to stderr. */
+static bool
+scpfs_trace_enabled(void)
+{
+	static volatile LONG state = -1;
+	if(state < 0) {
+		WCHAR value[8];
+		InterlockedExchange(&state, GetEnvironmentVariableW(L"SCPFS_TRACE", value,
+			ARRAYSIZE(value)) != 0 ? 1 : 0);
+	}
+	return state == 1;
+}
+
+static void
+scpfs_shell_close_locked(SCPFS_BACKEND *backend)
+{
+	if(backend->shell) {
+		(void)libssh2_channel_free(backend->shell);
+		backend->shell = NULL;
+	}
+}
+
+static bool
+scpfs_random_hex(char *text, size_t bytes)
+{
+	static const char hex[] = "0123456789abcdef";
+	unsigned char random[32];
+	size_t index;
+	if(bytes > sizeof(random) || !BCRYPT_SUCCESS(BCryptGenRandom(NULL, random,
+		(ULONG)bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+		return false;
+	for(index = 0; index < bytes; index++) {
+		text[index * 2u] = hex[random[index] >> 4];
+		text[index * 2u + 1u] = hex[random[index] & 15u];
+	}
+	text[bytes * 2u] = '\0';
+	return true;
+}
+
+/* Writes script to the persistent shell and reads until the output ends with
+ * terminator. Any failure leaves the shell closed. */
+static NTSTATUS
+scpfs_shell_exchange_locked(SCPFS_BACKEND *backend, const char *script,
+	size_t script_length, const char *terminator, size_t max_output,
+	SCPFS_BUFFER *result)
+{
+	size_t terminator_length = strlen(terminator);
+	size_t offset = 0;
+	char io_buffer[SCPFS_IO_BUFFER_SIZE];
+	while(offset < script_length) {
+		ssize_t written = libssh2_channel_write(backend->shell, script + offset,
+			script_length - offset);
+		if(written <= 0) {
+			scpfs_shell_close_locked(backend);
+			return written == LIBSSH2_ERROR_TIMEOUT ? STATUS_IO_TIMEOUT :
+				STATUS_CONNECTION_DISCONNECTED;
+		}
+		offset += (size_t)written;
+	}
+	for(;;) {
+		ssize_t read_count;
+		if(result->length >= terminator_length &&
+			memcmp(result->data + result->length - terminator_length, terminator,
+				terminator_length) == 0)
+			return STATUS_SUCCESS;
+		read_count = libssh2_channel_read(backend->shell, io_buffer, sizeof(io_buffer));
+		if(read_count <= 0) {
+			scpfs_shell_close_locked(backend);
+			return read_count == LIBSSH2_ERROR_TIMEOUT ? STATUS_IO_TIMEOUT :
+				STATUS_CONNECTION_DISCONNECTED;
+		}
+		if(result->length > max_output + 128u ||
+			(size_t)read_count > max_output + 128u - result->length ||
+			!scpfs_buffer_append(result, io_buffer, (size_t)read_count)) {
+			scpfs_shell_close_locked(backend);
+			return STATUS_BUFFER_OVERFLOW;
+		}
+	}
+}
+
+/* Starts "/bin/sh" on one long-lived exec channel and discards anything the
+ * login shell printed before it. */
+static NTSTATUS
+scpfs_shell_open_locked(SCPFS_BACKEND *backend)
+{
+	static const char start[] = "exec /bin/sh";
+	SCPFS_BUFFER script = { 0 };
+	SCPFS_BUFFER result = { 0 };
+	char nonce[33];
+	char terminator[64];
+	NTSTATUS status;
+	backend->shell = libssh2_channel_open_session(backend->session);
+	if(!backend->shell)
+		return STATUS_NOT_SUPPORTED;
+	if(libssh2_channel_handle_extended_data2(backend->shell,
+		LIBSSH2_CHANNEL_EXTENDED_DATA_IGNORE) != 0 ||
+		libssh2_channel_process_startup(backend->shell, "exec", 4u, start,
+			(unsigned int)(sizeof(start) - 1u)) != 0 ||
+		!scpfs_random_hex(nonce, 16u)) {
+		scpfs_shell_close_locked(backend);
+		return STATUS_NOT_SUPPORTED;
+	}
+	(void)_snprintf_s(terminator, sizeof(terminator), _TRUNCATE,
+		"\036SCPFS_READY:%s\037", nonce);
+	if(!scpfs_buffer_append_text(&script, "printf '\\036SCPFS_READY:%s\\037' ") ||
+		!scpfs_buffer_append_text(&script, nonce) ||
+		!scpfs_buffer_append_text(&script, "\n")) {
+		scpfs_shell_close_locked(backend);
+		return STATUS_NO_MEMORY;
+	}
+	status = scpfs_shell_exchange_locked(backend, script.data, script.length,
+		terminator, 64u * 1024u, &result);
+	scpfs_buffer_free(&script);
+	scpfs_buffer_free(&result);
+	return status;
+}
+
+/*
+ * Runs one command on the persistent shell: one round trip instead of the
+ * several an exec channel costs. Each command runs in a subshell with stdin
+ * from /dev/null, so it cannot change the shell's state or consume the
+ * following commands; a random per-command nonce frames the exit status.
+ * Falls back to an exec channel when the shell cannot be started.
+ */
+static NTSTATUS
+scpfs_execute_locked(SCPFS_BACKEND *backend, const char *command,
+	size_t max_output, char **output, size_t *output_length, int *exit_status)
+{
+	static const char status_prefix[] = "\036SCPFS_RC:";
+	SCPFS_BUFFER script = { 0 };
+	SCPFS_BUFFER result = { 0 };
+	char nonce[33];
+	char terminator[48];
+	size_t terminator_length;
+	size_t digits_start;
+	size_t digits_end;
+	unsigned int code = 0;
+	ULONGLONG started = 0;
+	NTSTATUS status;
+	if(output)
+		*output = NULL;
+	if(output_length)
+		*output_length = 0;
+	if(exit_status)
+		*exit_status = -1;
+	if(!backend || !command || !output || !output_length || !exit_status)
+		return STATUS_INVALID_PARAMETER;
+	if(backend->broken || !backend->session)
+		return STATUS_CONNECTION_DISCONNECTED;
+	if(strlen(command) > SCPFS_MAX_COMMAND_BYTES)
+		return STATUS_NAME_TOO_LONG;
+	if(!backend->shell && !backend->shell_unavailable &&
+		scpfs_shell_open_locked(backend) == STATUS_NOT_SUPPORTED)
+		backend->shell_unavailable = true;
+	if(!backend->shell)
+		return scpfs_execute_channel_locked(backend, command, max_output,
+			output, output_length, exit_status);
+	if(scpfs_trace_enabled())
+		started = GetTickCount64();
+	if(!scpfs_random_hex(nonce, 16u))
+		return STATUS_INTERNAL_ERROR;
+	(void)_snprintf_s(terminator, sizeof(terminator), _TRUNCATE, ":%s\037", nonce);
+	terminator_length = strlen(terminator);
+	if(!scpfs_buffer_append_text(&script, "(LC_ALL=C; export LC_ALL; ") ||
+		!scpfs_buffer_append_text(&script, command) ||
+		!scpfs_buffer_append_text(&script,
+			"\n) </dev/null 2>&1; printf '\\036SCPFS_RC:%d:") ||
+		!scpfs_buffer_append_text(&script, nonce) ||
+		!scpfs_buffer_append_text(&script, "\\037' \"$?\"\n")) {
+		status = STATUS_NO_MEMORY;
+		goto done;
+	}
+	status = scpfs_shell_exchange_locked(backend, script.data, script.length,
+		terminator, max_output, &result);
+	if(!NT_SUCCESS(status)) {
+		/* The shell's state is unknown; like a failed exec, poison the session. */
+		scpfs_poison_backend(backend, status);
+		goto done;
+	}
+	digits_end = result.length - terminator_length;
+	digits_start = digits_end;
+	while(digits_start > 0 && result.data[digits_start - 1u] >= '0' &&
+		result.data[digits_start - 1u] <= '9')
+		digits_start--;
+	if(digits_start == digits_end || digits_end - digits_start > 3u ||
+		digits_start < sizeof(status_prefix) - 1u ||
+		memcmp(result.data + digits_start - (sizeof(status_prefix) - 1u),
+			status_prefix, sizeof(status_prefix) - 1u) != 0) {
+		status = STATUS_DATA_ERROR;
+		scpfs_shell_close_locked(backend);
+		scpfs_poison_backend(backend, status);
+		goto done;
+	}
+	/* The command's own output ends where the status trailer begins. */
+	result.length = digits_start - (sizeof(status_prefix) - 1u);
+	while(digits_start < digits_end)
+		code = code * 10u + (unsigned int)(result.data[digits_start++] - '0');
+	if(code > 255u || result.length > max_output) {
+		status = code > 255u ? STATUS_DATA_ERROR : STATUS_BUFFER_OVERFLOW;
+		scpfs_poison_backend(backend, status);
+		goto done;
+	}
+	if(!scpfs_buffer_reserve(&result, 1u)) {
+		status = STATUS_NO_MEMORY;
+		goto done;
+	}
+	result.data[result.length] = '\0';
+	*exit_status = (int)code;
+	*output = result.data;
+	*output_length = result.length;
+	result.data = NULL;
+	status = STATUS_SUCCESS;
+done:
+	if(started)
+		fprintf(stderr, "SCPFS trace: %5llu ms rc=%d sh %.100s\n",
+			(unsigned long long)(GetTickCount64() - started), *exit_status, command);
+	scpfs_buffer_free(&script);
 	scpfs_buffer_free(&result);
 	return status;
 }
@@ -1321,36 +1572,55 @@ scpfs_parse_remote_root_command(SCPFS_BACKEND *backend)
 	size_t output_length = 0;
 	char *canonical = NULL;
 	SCPFS_REMOTE_STAT stat;
+	const char *terminator;
+	size_t canonical_length;
+	int exit_status = -1;
 	NTSTATUS status;
+	/* Canonical root and its stat in one exec: each exec costs several
+	 * round trips. "cd -P" resolves the same way realpath does. */
 	if(!scpfs_buffer_append_text(&command, "realpath -e -z -- ") ||
 		!scpfs_append_shell_word(&command, backend->remote_root) ||
+		!scpfs_buffer_append_text(&command, " && cd -P -- ") ||
+		!scpfs_append_shell_word(&command, backend->remote_root) ||
+		!scpfs_buffer_append_text(&command, " && " SCPFS_STAT_FORMAT ".") ||
 		!scpfs_buffer_reserve(&command, 1u)) {
 		status = STATUS_NO_MEMORY;
 		goto done;
 	}
 	command.data[command.length] = '\0';
-	status = scpfs_run_command_locked(backend, command.data,
-		SCPFS_MAX_STAT_OUTPUT, &output, &output_length);
+	status = scpfs_execute_locked(backend, command.data,
+		2u * SCPFS_MAX_STAT_OUTPUT, &output, &output_length, &exit_status);
 	if(!NT_SUCCESS(status))
 		goto done;
-	if(output_length < 2u || output[output_length - 1u] != '\0' ||
-		output[0] != '/') {
+	terminator = (const char *)memchr(output, '\0', output_length);
+	if(exit_status != 0 || !terminator) {
+		status = exit_status != 0 ? scpfs_map_remote_error(output, output_length) :
+			STATUS_DATA_ERROR;
+		goto done;
+	}
+	canonical_length = (size_t)(terminator - output);
+	if(canonical_length == 0 || output[0] != '/') {
 		status = STATUS_DATA_ERROR;
 		goto done;
 	}
-	canonical = (char *)malloc(output_length);
+	status = scpfs_parse_stat_output(terminator + 1, output_length - canonical_length - 1u,
+		&stat);
+	if(!NT_SUCCESS(status))
+		goto done;
+	if(stat.type != SCPFS_REMOTE_DIRECTORY) {
+		status = STATUS_NOT_A_DIRECTORY;
+		goto done;
+	}
+	canonical = (char *)malloc(canonical_length + 1u);
 	if(!canonical) {
 		status = STATUS_NO_MEMORY;
 		goto done;
 	}
-	memcpy(canonical, output, output_length - 1u);
-	canonical[output_length - 1u] = '\0';
+	memcpy(canonical, output, canonical_length);
+	canonical[canonical_length] = '\0';
 	free(backend->remote_root);
 	backend->remote_root = canonical;
 	canonical = NULL;
-	status = scpfs_stat_locked(backend, backend->remote_root, &stat);
-	if(NT_SUCCESS(status) && stat.type != SCPFS_REMOTE_DIRECTORY)
-		status = STATUS_NOT_A_DIRECTORY;
 done:
 	free(canonical);
 	free(output);
@@ -1898,8 +2168,10 @@ scpfs_verify_host_key(SCPFS_BACKEND *backend, PCWSTR known_hosts_file,
 	return status;
 }
 
-NTSTATUS
-scp_backend_connect(const SCPFS_BACKEND_OPTIONS *options,
+/* resolve_root pins the canonical remote root (one exec). The monitor skips
+ * it: its helper resolves the root itself and reports it in the greeting. */
+static NTSTATUS
+scpfs_connect(const SCPFS_BACKEND_OPTIONS *options, bool resolve_root,
 	SCPFS_BACKEND **backend_out)
 {
 	SCPFS_BACKEND *backend = NULL;
@@ -1989,11 +2261,13 @@ scp_backend_connect(const SCPFS_BACKEND_OPTIONS *options,
 		status = scpfs_map_libssh2_error(rc);
 		goto failed;
 	}
-	EnterCriticalSection(&backend->mutex);
-	status = scpfs_parse_remote_root_command(backend);
-	LeaveCriticalSection(&backend->mutex);
-	if(!NT_SUCCESS(status))
-		goto failed;
+	if(resolve_root) {
+		EnterCriticalSection(&backend->mutex);
+		status = scpfs_parse_remote_root_command(backend);
+		LeaveCriticalSection(&backend->mutex);
+		if(!NT_SUCCESS(status))
+			goto failed;
+	}
 	*backend_out = backend;
 	return STATUS_SUCCESS;
 failed:
@@ -2026,6 +2300,13 @@ failed:
 	return status;
 }
 
+NTSTATUS
+scp_backend_connect(const SCPFS_BACKEND_OPTIONS *options,
+	SCPFS_BACKEND **backend_out)
+{
+	return scpfs_connect(options, true, backend_out);
+}
+
 void
 scp_backend_disconnect(SCPFS_BACKEND *backend)
 {
@@ -2033,6 +2314,7 @@ scp_backend_disconnect(SCPFS_BACKEND *backend)
 		return;
 	if(backend->mutex_initialized)
 		EnterCriticalSection(&backend->mutex);
+	scpfs_shell_close_locked(backend);
 	if(backend->session) {
 		if(!backend->broken)
 			(void)libssh2_session_disconnect(backend->session, "scpfs unmount");
@@ -2079,7 +2361,6 @@ scp_backend_watch_stream_open(const SCPFS_BACKEND_OPTIONS *options,
 	SCPFS_WATCH_STREAM *stream = NULL;
 	SCPFS_BACKEND *backend = NULL;
 	SCPFS_BUFFER command = { 0 };
-	char *expected_root = NULL;
 	char length_text[32];
 	int written;
 	size_t offset;
@@ -2092,18 +2373,11 @@ scp_backend_watch_stream_open(const SCPFS_BACKEND_OPTIONS *options,
 	bounded_options = *options;
 	if(bounded_options.timeout_ms == 0 || bounded_options.timeout_ms > 5000u)
 		bounded_options.timeout_ms = 5000u;
-	status = scp_backend_connect(&bounded_options, &backend);
+	/* The helper resolves --root itself and reports the result in its
+	 * greeting; the monitor compares that with the main connection's root. */
+	status = scpfs_connect(&bounded_options, false, &backend);
 	if(!NT_SUCCESS(status))
 		return status;
-	/* The caller supplies the main connection's pinned canonical root.
-	 * Refuse monitoring if another canonicalization resolves elsewhere. */
-	status = scpfs_normalize_remote_root(options->remote_root, &expected_root);
-	if(!NT_SUCCESS(status) || strcmp(expected_root, backend->remote_root) != 0) {
-		free(expected_root);
-		scp_backend_disconnect(backend);
-		return NT_SUCCESS(status) ? STATUS_NOT_SUPPORTED : status;
-	}
-	free(expected_root);
 	stream = (SCPFS_WATCH_STREAM *)calloc(1, sizeof(*stream));
 	if(!stream) {
 		scp_backend_disconnect(backend);
@@ -2745,20 +3019,13 @@ scp_backend_download(SCPFS_BACKEND *backend, PCWSTR path,
 	status = scpfs_finish_scp_channel_locked(backend, channel);
 	if(!NT_SUCCESS(status))
 		goto done;
-	/* SCP reads may update remote atime; restore the exact snapshot value. */
-	status = scpfs_set_times_locked(backend, remote, before.atime_ns, 0,
-		true, false);
-	if(!NT_SUCCESS(status))
-		goto done;
-	if(!FlushFileBuffers(local_file)) {
-		status = STATUS_DISK_FULL;
-		goto done;
-	}
+	/* A read may advance the remote atime, as any reader's would. Restoring
+	 * it cost another round trip and an ATTRIB event that dropped the
+	 * freshly cached stat and parent listing. */
 	status = scpfs_stat_locked(backend, remote, &after);
 	if(!NT_SUCCESS(status))
 		goto done;
-	if(!scpfs_same_snapshot(&before, &after) ||
-		after.atime_ns != before.atime_ns) {
+	if(!scpfs_same_snapshot(&before, &after)) {
 		status = STATUS_FILE_LOCK_CONFLICT;
 		goto done;
 	}
@@ -4222,7 +4489,8 @@ scp_backend_execute_inbox(SCPFS_BACKEND *backend, PCWSTR exact_path,
 		if(!NT_SUCCESS(status))
 			goto done;
 		failure_stage = L"execute command";
-		status = scpfs_execute_locked(backend, command.data,
+		/* User commands get their own channel, never the shared shell. */
+		status = scpfs_execute_channel_locked(backend, command.data,
 			SCPFS_INBOX_CAPTURE_BYTES, &command_output,
 			&command_output_length, &command_exit);
 		scpfs_restore_execution_timeout_locked(backend, old_receive_timeout,

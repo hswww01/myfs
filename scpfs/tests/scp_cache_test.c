@@ -106,313 +106,258 @@ static SCPFS_REMOTE_STAT make_stat(uint64_t size)
 	return value;
 }
 
-static bool test_stat_list_epochs_and_failure(SCPFS_CACHE *cache)
+static void test_free_list(SCPFS_DIR_LIST *list)
+{
+	size_t index;
+	for(index = 0; index < list->count; index++)
+		free(list->entries[index].name);
+	free(list->entries);
+	memset(list, 0, sizeof(*list));
+}
+
+static bool same_stat(const SCPFS_REMOTE_STAT *left, const SCPFS_REMOTE_STAT *right)
+{
+	return memcmp(left, right, sizeof(*left)) == 0;
+}
+
+/* Exact-case stat/list, negative entries, list-populated child stats. */
+static bool test_metadata(SCPFS_CACHE *cache)
 {
 	SCPFS_REMOTE_STAT value = make_stat(11);
 	SCPFS_REMOTE_STAT output;
 	SCPFS_DIR_LIST input, output_list;
-	uint32_t fetches = 0;
+	bool ok = false;
 	memset(&input, 0, sizeof(input));
-	input.entries = (SCPFS_DIR_ENTRY *)calloc(1, sizeof(*input.entries));
-	if(input.entries == NULL)
-		return false;
-	input.count = 1;
+	memset(&output_list, 0, sizeof(output_list));
+	CHECK(scp_cache_get_stat(cache, L"\\Case.txt", &output) == SCPFS_CACHE_MISS);
+	scp_cache_put_stat(cache, L"\\Case.txt", &value, scp_cache_sequence(cache));
+	CHECK(scp_cache_get_stat(cache, L"\\Case.txt", &output) == SCPFS_CACHE_PRESENT);
+	CHECK(same_stat(&output, &value));
+	CHECK(scp_cache_get_stat(cache, L"\\case.txt", &output) == SCPFS_CACHE_MISS);
+	scp_cache_put_stat(cache, L"\\absent", NULL, scp_cache_sequence(cache));
+	CHECK(scp_cache_get_stat(cache, L"\\absent", &output) == SCPFS_CACHE_ABSENT);
+	/* A creation reported by the parent's watch drops the negative entry. */
+	scp_cache_invalidate_path(cache, L"\\absent", SCPFS_CACHE_CHANGE_CONTENT);
+	CHECK(scp_cache_get_stat(cache, L"\\absent", &output) == SCPFS_CACHE_MISS);
+
+	input.entries = (SCPFS_DIR_ENTRY *)calloc(2, sizeof(*input.entries));
+	CHECK(input.entries != NULL);
+	input.count = 2;
 	input.entries[0].name = test_wcsdup(L"Alpha");
 	input.entries[0].name_length = 5;
 	input.entries[0].stat = value;
-	if(input.entries[0].name == NULL)
-		goto failed;
-
-	/* Simulated exact-case stat miss/fetch, then hit with no fetch call. */
-	if(scp_cache_get_stat(cache, L"\\Case.txt", 4, 9, &output))
-		goto failed;
-	fetches++;
-	scp_cache_put_stat(cache, L"\\Case.txt", &value, 4, 9);
-	if(!scp_cache_get_stat(cache, L"\\Case.txt", 4, 9, &output) ||
-		fetches != 1 || output.inode != value.inode ||
-		scp_cache_get_stat(cache, L"\\case.txt", 4, 9, &output))
-		goto failed;
-	if(scp_cache_get_stat(cache, L"\\Case.txt", 5, 9, &output))
-		goto failed;
-
-	/* A failed remote fetch is not published; the next success can be cached. */
-	if(scp_cache_get_stat(cache, L"\\retry", 4, 9, &output))
-		goto failed;
-	fetches++; /* simulated failure; deliberately do not put */
-	if(scp_cache_get_stat(cache, L"\\retry", 4, 9, &output))
-		goto failed;
-	fetches++;
-	scp_cache_put_stat(cache, L"\\retry", &value, 4, 9);
-	if(!scp_cache_get_stat(cache, L"\\retry", 4, 9, &output) || fetches != 3)
-		goto failed;
-
-	if(scp_cache_get_list(cache, L"\\Root", 4, 9, &output_list))
-		goto failed;
-	fetches++;
-	scp_cache_put_list(cache, L"\\Root", &input, 4, 9);
-	free(input.entries[0].name);
-	input.entries[0].name = NULL;
-	free(input.entries);
-	input.entries = NULL;
-	input.count = 0;
-	memset(&output_list, 0, sizeof(output_list));
-	if(!scp_cache_get_list(cache, L"\\Root", 4, 9, &output_list) ||
-		output_list.count != 1 || wcscmp(output_list.entries[0].name, L"Alpha") != 0 ||
-	fetches != 4) {
-		if(output_list.entries != NULL) {
-			free(output_list.entries[0].name);
-			free(output_list.entries);
-		}
-		goto failed;
-	}
-	free(output_list.entries[0].name);
-	free(output_list.entries);
-	if(scp_cache_get_list(cache, L"\\root", 4, 9, &input))
-		goto failed;
-	fetches++;
-	if(fetches != 5)
-		goto failed;
-	return true;
-failed:
-	if(input.entries != NULL) {
-		if(input.count != 0)
-			free(input.entries[0].name);
-		free(input.entries);
-	}
-	return false;
+	input.entries[1].name = test_wcsdup(L"beta");
+	input.entries[1].name_length = 4;
+	input.entries[1].stat = make_stat(22);
+	CHECK(input.entries[0].name != NULL && input.entries[1].name != NULL);
+	CHECK(!scp_cache_get_list(cache, L"\\Root", &output_list));
+	scp_cache_put_list(cache, L"\\Root", &input, scp_cache_sequence(cache));
+	CHECK(scp_cache_get_list(cache, L"\\Root", &output_list));
+	CHECK(output_list.count == 2 && wcscmp(output_list.entries[0].name, L"Alpha") == 0 &&
+		output_list.entries[1].stat.size == 22);
+	test_free_list(&output_list);
+	CHECK(!scp_cache_get_list(cache, L"\\root", &output_list));
+	/* Listing a directory records each child's stat. */
+	CHECK(scp_cache_get_stat(cache, L"\\Root\\beta", &output) == SCPFS_CACHE_PRESENT &&
+		output.size == 22);
+	/* A metadata change of one child keeps its siblings but drops the listing. */
+	scp_cache_invalidate_path(cache, L"\\Root\\beta", SCPFS_CACHE_CHANGE_METADATA);
+	CHECK(scp_cache_get_stat(cache, L"\\Root\\beta", &output) == SCPFS_CACHE_MISS);
+	CHECK(scp_cache_get_stat(cache, L"\\Root\\Alpha", &output) == SCPFS_CACHE_PRESENT);
+	CHECK(!scp_cache_get_list(cache, L"\\Root", &output_list));
+	/* Unrelated paths survive any change. */
+	CHECK(scp_cache_get_stat(cache, L"\\Case.txt", &output) == SCPFS_CACHE_PRESENT);
+	/* A lost subtree drops everything below it, nothing beside it. */
+	scp_cache_put_list(cache, L"\\Root", &input, scp_cache_sequence(cache));
+	scp_cache_invalidate_path(cache, L"\\Root", SCPFS_CACHE_CHANGE_SUBTREE);
+	CHECK(scp_cache_get_stat(cache, L"\\Root\\Alpha", &output) == SCPFS_CACHE_MISS);
+	CHECK(!scp_cache_get_list(cache, L"\\Root", &output_list));
+	CHECK(scp_cache_get_stat(cache, L"\\Case.txt", &output) == SCPFS_CACHE_PRESENT);
+	ok = true;
+done:
+	test_free_list(&input);
+	test_free_list(&output_list);
+	return ok;
 }
 
-static bool test_payload_copy_provenance_and_atime(SCPFS_CACHE *cache,
-	PCWSTR directory)
+/* A put observed before a related invalidation must be dropped. */
+static bool test_sequence_admission(SCPFS_CACHE *cache)
 {
+	SCPFS_REMOTE_STAT value = make_stat(33);
+	SCPFS_REMOTE_STAT output;
+	uint64_t observed;
+	unsigned index;
+	bool ok = false;
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_path(cache, L"\\seq\\file", SCPFS_CACHE_CHANGE_CONTENT);
+	scp_cache_put_stat(cache, L"\\seq\\file", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\seq\\file", &output) == SCPFS_CACHE_MISS);
+	/* Ancestors and descendants are related too. */
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_path(cache, L"\\seq\\dir\\child", SCPFS_CACHE_CHANGE_METADATA);
+	scp_cache_put_stat(cache, L"\\seq\\dir", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\seq\\dir", &output) == SCPFS_CACHE_MISS);
+	/* An unrelated change does not block admission. */
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_path(cache, L"\\elsewhere", SCPFS_CACHE_CHANGE_CONTENT);
+	scp_cache_put_stat(cache, L"\\seq\\file", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\seq\\file", &output) == SCPFS_CACHE_PRESENT);
+	/* A sibling with a common name prefix is unrelated. */
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_path(cache, L"\\seq\\fil", SCPFS_CACHE_CHANGE_CONTENT);
+	scp_cache_put_stat(cache, L"\\seq\\filex", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\seq\\filex", &output) == SCPFS_CACHE_PRESENT);
+	/* invalidate_all rejects everything observed before it. */
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_all(cache);
+	scp_cache_put_stat(cache, L"\\late", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\late", &output) == SCPFS_CACHE_MISS);
+	/* Too many changes to remember: reject conservatively. */
+	observed = scp_cache_sequence(cache);
+	for(index = 0; index < 2000u; index++)
+		scp_cache_invalidate_path(cache, L"\\other", SCPFS_CACHE_CHANGE_METADATA);
+	scp_cache_put_stat(cache, L"\\late", &value, observed);
+	CHECK(scp_cache_get_stat(cache, L"\\late", &output) == SCPFS_CACHE_MISS);
+	scp_cache_put_stat(cache, L"\\late", &value, scp_cache_sequence(cache));
+	CHECK(scp_cache_get_stat(cache, L"\\late", &output) == SCPFS_CACHE_PRESENT);
+	ok = true;
+done:
+	return ok;
+}
+
+static bool test_payload(SCPFS_CACHE *cache, PCWSTR directory)
+{
+	static const char bytes[] = "payload-bytes";
+	char copy[sizeof(bytes) - 1u];
 	WCHAR source[MAX_PATH];
-	WCHAR source2[MAX_PATH];
-	SCPFS_REMOTE_STAT provenance = make_stat(4);
-	SCPFS_REMOTE_STAT fresh;
-	PCWSTR copied = NULL;
-	uint64_t stored_metadata_epoch = 0;
-	bool metadata_stale = false;
-	char bytes[8] = { 0 };
-	unsigned int iteration;
-	DWORD handles_before = 0, handles_after = 0;
-	if(swprintf_s(source, ARRAYSIZE(source), L"%ls\\source.bin", directory) < 0 ||
-		swprintf_s(source2, ARRAYSIZE(source2), L"%ls\\source2.bin", directory) < 0 ||
-		!write_test_file(source, "old!", 4) || !write_test_file(source2, "other", 5)) {
-		fwprintf(stderr, L"payload subtest: fixture files could not be created\n");
-		return false;
-	}
-	scp_cache_put_payload(cache, L"\\payload.bin", source, &provenance, 10, 20);
-	if(!write_test_file(source, "new!", 4) ||
-		!scp_cache_get_payload(cache, L"\\payload.bin", 10, 20, &copied,
-			&fresh, &stored_metadata_epoch, &metadata_stale) ||
-		metadata_stale || stored_metadata_epoch != 10 ||
-		!read_test_file(copied, bytes, 4) || memcmp(bytes, "old!", 4) != 0) {
-		fwprintf(stderr, L"payload subtest: copy isolation/initial candidate failed\n");
-		return false;
-	}
-	scp_cache_record_payload_hit(cache);
-
-	if(scp_cache_get_payload(cache, L"\\payload.bin", 10, 21, &copied,
-		&fresh, &stored_metadata_epoch, &metadata_stale)) {
-		fwprintf(stderr, L"payload subtest: content epoch did not evict candidate\n");
-		return false;
-	}
-	if(!write_test_file(source, "old!", 4)) {
-		fwprintf(stderr, L"payload subtest: could not restore immutable source fixture\n");
-		return false;
-	}
-	scp_cache_put_payload(cache, L"\\payload.bin", source, &provenance, 10, 20);
-
-	/* ATTRIB-only epoch keeps bytes but requires an exact fresh provenance check. */
-	scp_cache_invalidate_metadata(cache);
-	if(!scp_cache_get_payload(cache, L"\\payload.bin", 11, 20, &copied,
-		&fresh, &stored_metadata_epoch, &metadata_stale) || !metadata_stale) {
-		fwprintf(stderr, L"payload subtest: metadata epoch did not expose stale candidate\n");
-		return false;
-	}
-	if(!scp_cache_validate_payload(cache, L"\\payload.bin", &provenance, 11) ||
-		!scp_cache_get_payload(cache, L"\\payload.bin", 11, 20, &copied,
-			&fresh, &stored_metadata_epoch, &metadata_stale) || metadata_stale) {
-		fwprintf(stderr, L"payload subtest: matching fresh provenance was rejected\n");
-		return false;
-	}
-	if(!read_test_file(copied, bytes, 4) || memcmp(bytes, "old!", 4) != 0)
-	{
-		fwprintf(stderr, L"payload subtest: validated cache copy changed\n");
-		return false;
-	}
-	scp_cache_record_payload_hit(cache);
-	/* A genuine access-time update changes the returned metadata while the
-	 * same immutable bytes remain reusable after fresh provenance validation. */
-	{
-		SCPFS_REMOTE_STAT access_updated = provenance;
-		access_updated.atime_ns += 1234;
-		scp_cache_invalidate_metadata(cache);
-		if(!scp_cache_validate_payload(cache, L"\\payload.bin", &access_updated, 12) ||
-			!scp_cache_get_payload(cache, L"\\payload.bin", 12, 20, &copied,
-				&fresh, &stored_metadata_epoch, &metadata_stale) || metadata_stale ||
-			fresh.atime_ns != access_updated.atime_ns ||
-			!read_test_file(copied, bytes, 4) || memcmp(bytes, "old!", 4) != 0) {
-			fwprintf(stderr, L"payload subtest: access time refresh lost bytes or kept old metadata\n");
-			return false;
-		}
-	}
-	fresh = provenance;
-	fresh.uid++;
-	if(scp_cache_validate_payload(cache, L"\\payload.bin", &fresh, 11) ||
-		scp_cache_get_payload(cache, L"\\payload.bin", 11, 20, &copied,
-			&fresh, &stored_metadata_epoch, &metadata_stale)) {
-		fwprintf(stderr, L"payload subtest: mismatched provenance remained reusable\n");
-		return false;
-	}
-	scp_cache_record_payload_miss(cache);
-
-	/* Repeat replacement/copy operations and ensure transient source handles close. */
-	GetProcessHandleCount(GetCurrentProcess(), &handles_before);
-	for(iteration = 0; iteration < 32; iteration++) {
-		provenance = make_stat(5);
-		scp_cache_put_payload(cache, L"\\replaced.bin", source2, &provenance, 1, 2);
-		if(!scp_cache_get_payload(cache, L"\\replaced.bin", 1, 2, &copied,
-			&fresh, &stored_metadata_epoch, &metadata_stale)) {
-			fwprintf(stderr, L"payload subtest: replacement candidate missing\n");
-			return false;
-		}
-		if(!read_test_file(copied, bytes, 5) || memcmp(bytes, "other", 5) != 0)
-		{
-			fwprintf(stderr, L"payload subtest: replacement copy differs\n");
-			return false;
-		}
-		scp_cache_record_payload_hit(cache);
-	}
-	GetProcessHandleCount(GetCurrentProcess(), &handles_after);
-	if(handles_before != 0 && handles_after > handles_before + 2u)
-	{
-		fwprintf(stderr, L"payload subtest: transient file handles grew %lu -> %lu\n",
-			handles_before, handles_after);
-		return false;
-	}
-
-	/* All provenance dimensions used by ATTRIB validation must reject a change. */
-	provenance = make_stat(4);
-	{
-		unsigned int index;
-		for(index = 0; index < 3u; index++) {
-			SCPFS_REMOTE_STAT changed = make_stat(4);
-			if(index == 0)
-				changed.uid++;
-			else if(index == 1)
-				changed.gid++;
-			else
-				changed.ctime_ns++;
-			scp_cache_put_payload(cache, L"\\provenance", source, &provenance, 3, 4);
-			if(scp_cache_validate_payload(cache, L"\\provenance", &changed, 3) ||
-				scp_cache_get_payload(cache, L"\\provenance", 3, 4, &copied,
-					&fresh, &stored_metadata_epoch, &metadata_stale)) {
-				fwprintf(stderr, L"payload subtest: UID/GID/ctime provenance field %u accepted\n", index);
-				return false;
-			}
-		}
-	}
-	return true;
+	WCHAR target[MAX_PATH];
+	SCPFS_REMOTE_STAT provenance = make_stat(sizeof(bytes) - 1u);
+	SCPFS_REMOTE_STAT changed;
+	SCPFS_REMOTE_STAT atime_only;
+	uint64_t observed;
+	bool ok = false;
+	CHECK(swprintf_s(source, MAX_PATH, L"%ls\\source.bin", directory) >= 0);
+	CHECK(swprintf_s(target, MAX_PATH, L"%ls\\target.bin", directory) >= 0);
+	CHECK(write_test_file(source, bytes, sizeof(bytes) - 1u));
+	scp_cache_put_payload(cache, L"\\payload.bin", source, &provenance,
+		scp_cache_sequence(cache));
+	CHECK(scp_cache_copy_payload(cache, L"\\payload.bin", &provenance, target));
+	CHECK(read_test_file(target, copy, sizeof(copy)) && memcmp(copy, bytes, sizeof(copy)) == 0);
+	DeleteFileW(target);
+	/* Access time and mode are not provenance; size/mtime/inode are. */
+	atime_only = provenance;
+	atime_only.atime_ns += 5;
+	atime_only.mode = 0600;
+	CHECK(scp_cache_copy_payload(cache, L"\\payload.bin", &atime_only, target));
+	DeleteFileW(target);
+	changed = provenance;
+	changed.mtime_ns += 1;
+	CHECK(!scp_cache_copy_payload(cache, L"\\payload.bin", &changed, target));
+	CHECK(!scp_cache_copy_payload(cache, L"\\payload.bin", &provenance, target));
+	/* Metadata changes keep bytes, content changes drop them. */
+	scp_cache_put_payload(cache, L"\\payload.bin", source, &provenance,
+		scp_cache_sequence(cache));
+	scp_cache_invalidate_path(cache, L"\\payload.bin", SCPFS_CACHE_CHANGE_METADATA);
+	CHECK(scp_cache_copy_payload(cache, L"\\payload.bin", &provenance, target));
+	DeleteFileW(target);
+	scp_cache_invalidate_path(cache, L"\\payload.bin", SCPFS_CACHE_CHANGE_CONTENT);
+	CHECK(!scp_cache_copy_payload(cache, L"\\payload.bin", &provenance, target));
+	/* A change during the transfer rejects the bytes. */
+	observed = scp_cache_sequence(cache);
+	scp_cache_invalidate_path(cache, L"\\payload.bin", SCPFS_CACHE_CHANGE_CONTENT);
+	scp_cache_put_payload(cache, L"\\payload.bin", source, &provenance, observed);
+	CHECK(!scp_cache_copy_payload(cache, L"\\payload.bin", &provenance, target));
+	/* Size mismatch with the local file is never admitted. */
+	changed = provenance;
+	changed.size += 1;
+	scp_cache_put_payload(cache, L"\\payload.bin", source, &changed,
+		scp_cache_sequence(cache));
+	CHECK(!scp_cache_copy_payload(cache, L"\\payload.bin", &changed, target));
+	ok = true;
+done:
+	DeleteFileW(target);
+	DeleteFileW(source);
+	return ok;
 }
 
 static bool test_payload_limits(SCPFS_CACHE *cache, PCWSTR directory)
 {
-	WCHAR source_a[MAX_PATH], source_b[MAX_PATH];
-	char *block = (char *)malloc(700u * 1024u);
+	WCHAR source_a[MAX_PATH];
+	WCHAR source_b[MAX_PATH];
+	WCHAR empty[MAX_PATH];
+	WCHAR target[MAX_PATH];
 	SCPFS_REMOTE_STAT stat = make_stat(700u * 1024u);
-	SCPFS_REMOTE_STAT output;
-	PCWSTR path;
-	uint64_t epoch;
-	bool stale;
-	if(block == NULL)
-		return false;
-	memset(block, 0x5a, 700u * 1024u);
-	if(swprintf_s(source_a, ARRAYSIZE(source_a), L"%ls\\large-a.bin", directory) < 0 ||
-		swprintf_s(source_b, ARRAYSIZE(source_b), L"%ls\\large-b.bin", directory) < 0 ||
-		!write_test_file(source_a, block, 700u * 1024u) ||
-		!write_test_file(source_b, block, 700u * 1024u)) {
-		free(block);
-		return false;
-	}
-	free(block);
-	scp_cache_put_payload(cache, L"\\large-a", source_a, &stat, 1, 1);
-	scp_cache_put_payload(cache, L"\\large-b", source_b, &stat, 1, 1);
-	if(scp_cache_get_payload(cache, L"\\large-a", 1, 1, &path,
-		&output, &epoch, &stale))
-		return false;
-	if(!scp_cache_get_payload(cache, L"\\large-b", 1, 1, &path,
-		&output, &epoch, &stale))
-		return false;
-	{
-		WCHAR empty[MAX_PATH];
-		SCPFS_REMOTE_STAT zero_stat = make_stat(0);
-		if(swprintf_s(empty, ARRAYSIZE(empty), L"%ls\\empty.bin", directory) < 0 ||
-			!write_test_file(empty, "", 0))
-			return false;
-		scp_cache_put_payload(cache, L"\\empty", empty, &zero_stat, 1, 1);
-		if(!scp_cache_get_payload(cache, L"\\empty", 1, 1, &path,
-			&output, &epoch, &stale) || output.size != 0)
-			return false;
-	}
+	SCPFS_REMOTE_STAT zero_stat = make_stat(0);
+	char *large = (char *)calloc(1, 700u * 1024u);
+	bool ok = false;
+	CHECK(large != NULL);
+	CHECK(swprintf_s(source_a, MAX_PATH, L"%ls\\large-a.bin", directory) >= 0);
+	CHECK(swprintf_s(source_b, MAX_PATH, L"%ls\\large-b.bin", directory) >= 0);
+	CHECK(swprintf_s(empty, MAX_PATH, L"%ls\\empty.bin", directory) >= 0);
+	CHECK(swprintf_s(target, MAX_PATH, L"%ls\\limit-target.bin", directory) >= 0);
+	CHECK(write_test_file(source_a, large, 700u * 1024u));
+	CHECK(write_test_file(source_b, large, 700u * 1024u));
+	CHECK(write_test_file(empty, "", 0));
+	/* The 1 MiB budget holds one of the two; the older one is evicted. */
+	scp_cache_put_payload(cache, L"\\large-a", source_a, &stat, scp_cache_sequence(cache));
+	scp_cache_put_payload(cache, L"\\large-b", source_b, &stat, scp_cache_sequence(cache));
+	CHECK(!scp_cache_copy_payload(cache, L"\\large-a", &stat, target));
+	CHECK(scp_cache_copy_payload(cache, L"\\large-b", &stat, target));
+	DeleteFileW(target);
+	scp_cache_put_payload(cache, L"\\empty", empty, &zero_stat, scp_cache_sequence(cache));
+	CHECK(scp_cache_copy_payload(cache, L"\\empty", &zero_stat, target));
+	DeleteFileW(target);
 	scp_cache_invalidate_all(cache);
-	return !scp_cache_get_payload(cache, L"\\large-b", 1, 1, &path,
-		&output, &epoch, &stale);
+	CHECK(!scp_cache_copy_payload(cache, L"\\large-b", &stat, target));
+	ok = true;
+done:
+	free(large);
+	DeleteFileW(target);
+	DeleteFileW(source_a);
+	DeleteFileW(source_b);
+	DeleteFileW(empty);
+	return ok;
 }
 
 static bool test_metadata_entry_bound(SCPFS_CACHE *cache)
 {
-	WCHAR path[48];
-	SCPFS_REMOTE_STAT value = make_stat(1), output;
-	unsigned int index;
+	SCPFS_REMOTE_STAT value = make_stat(1);
+	SCPFS_REMOTE_STAT output;
+	WCHAR path[64];
+	uint32_t index;
+	bool ok = false;
 	for(index = 0; index < SCPFS_CACHE_METADATA_LIMIT_ENTRIES + 8u; index++) {
-		if(swprintf_s(path, ARRAYSIZE(path), L"\\bound-%04u", index) < 0)
-			return false;
-		scp_cache_put_stat(cache, path, &value, 1, 1);
+		CHECK(swprintf_s(path, ARRAYSIZE(path), L"\\bound-%06u", index) >= 0);
+		scp_cache_put_stat(cache, path, &value, scp_cache_sequence(cache));
 	}
-	if(scp_cache_get_stat(cache, L"\\bound-0000", 1, 1, &output) ||
-		!scp_cache_get_stat(cache, L"\\bound-4103", 1, 1, &output))
-		return false;
-	return true;
+	CHECK(scp_cache_get_stat(cache, L"\\bound-000000", &output) == SCPFS_CACHE_MISS);
+	CHECK(swprintf_s(path, ARRAYSIZE(path), L"\\bound-%06u",
+		SCPFS_CACHE_METADATA_LIMIT_ENTRIES + 7u) >= 0);
+	CHECK(scp_cache_get_stat(cache, path, &output) == SCPFS_CACHE_PRESENT);
+	ok = true;
+done:
+	return ok;
 }
 
 static bool test_unlimited_cache(SCPFS_CACHE *cache, PCWSTR directory)
 {
-	const DWORD payload_size = 1024u * 1024u + 17u;
 	WCHAR source[MAX_PATH];
-	char *payload = (char *)malloc(payload_size);
-	SCPFS_REMOTE_STAT value = make_stat(payload_size), output;
-	PCWSTR cached_path = NULL;
-	uint64_t metadata_epoch = 0;
-	bool metadata_stale = false;
-	LARGE_INTEGER copied_size;
-	WIN32_FILE_ATTRIBUTE_DATA attributes;
-	if(payload == NULL)
-		return false;
-	memset(payload, 0xa7, payload_size);
-	if(swprintf_s(source, ARRAYSIZE(source), L"%ls\\unlimited.bin", directory) < 0 ||
-		!write_test_file(source, payload, payload_size)) {
-		free(payload);
-		return false;
-	}
-	free(payload);
-	if(scp_cache_get_stat(cache, L"\\unlimited-stat", 7, 8, &output))
-		return false;
-	scp_cache_put_stat(cache, L"\\unlimited-stat", &value, 7, 8);
-	if(!scp_cache_get_stat(cache, L"\\unlimited-stat", 7, 8, &output) ||
-		output.size != payload_size)
-		return false;
-	scp_cache_put_payload(cache, L"\\unlimited.bin", source, &value, 7, 8);
-	if(!scp_cache_get_payload(cache, L"\\unlimited.bin", 7, 8, &cached_path,
-		&output, &metadata_epoch, &metadata_stale) || metadata_stale ||
-		!GetFileAttributesExW(cached_path, GetFileExInfoStandard, &attributes))
-		return false;
-	copied_size.HighPart = attributes.nFileSizeHigh;
-	copied_size.LowPart = attributes.nFileSizeLow;
-	if(copied_size.QuadPart != payload_size)
-		return false;
-	scp_cache_record_payload_hit(cache);
-	return true;
+	WCHAR target[MAX_PATH];
+	SCPFS_REMOTE_STAT value = make_stat(4);
+	SCPFS_REMOTE_STAT output;
+	bool ok = false;
+	CHECK(swprintf_s(source, MAX_PATH, L"%ls\\unlimited.bin", directory) >= 0);
+	CHECK(swprintf_s(target, MAX_PATH, L"%ls\\unlimited-target.bin", directory) >= 0);
+	CHECK(write_test_file(source, "1234", 4));
+	scp_cache_put_stat(cache, L"\\unlimited-stat", &value, scp_cache_sequence(cache));
+	CHECK(scp_cache_get_stat(cache, L"\\unlimited-stat", &output) == SCPFS_CACHE_PRESENT);
+	scp_cache_put_payload(cache, L"\\unlimited.bin", source, &value, scp_cache_sequence(cache));
+	CHECK(scp_cache_copy_payload(cache, L"\\unlimited.bin", &value, target));
+	ok = true;
+done:
+	DeleteFileW(target);
+	DeleteFileW(source);
+	return ok;
 }
 
 int wmain(void)
@@ -432,16 +377,20 @@ int wmain(void)
 		fwprintf(stderr, L"FAIL: scp_cache_create failed\n");
 		goto done;
 	}
-	if(!test_stat_list_epochs_and_failure(cache)) {
-		fwprintf(stderr, L"FAIL: exact-case stat/list or miss-retry subtest\n");
+	if(!test_metadata(cache)) {
+		fwprintf(stderr, L"FAIL: metadata subtest\n");
 		goto done;
 	}
-	if(!test_payload_copy_provenance_and_atime(cache, directory)) {
-		fwprintf(stderr, L"FAIL: payload copy/provenance/handle subtest\n");
+	if(!test_sequence_admission(cache)) {
+		fwprintf(stderr, L"FAIL: sequence admission subtest\n");
+		goto done;
+	}
+	if(!test_payload(cache, directory)) {
+		fwprintf(stderr, L"FAIL: payload subtest\n");
 		goto done;
 	}
 	if(!test_payload_limits(cache, directory)) {
-		fwprintf(stderr, L"FAIL: payload LRU/zero-length subtest\n");
+		fwprintf(stderr, L"FAIL: payload limit subtest\n");
 		goto done;
 	}
 	if(!test_metadata_entry_bound(cache)) {
@@ -457,7 +406,7 @@ int wmain(void)
 		goto done;
 	scp_cache_get_counters(cache, &counters);
 	if(counters.stat_hit == 0 || counters.list_hit == 0 || counters.payload_hit == 0 ||
-		counters.evictions == 0 || counters.invalidations == 0)
+		counters.evictions == 0 || counters.invalidations == 0 || counters.rejected_puts == 0)
 		goto done;
 	passed = true;
 done:
@@ -468,6 +417,6 @@ done:
 		fwprintf(stderr, L"FAIL: cache module contract regression\n");
 		return 1;
 	}
-	wprintf(L"PASS: exact-case metadata, retry, copied payload, provenance, epochs, LRU, zero-length entries and unlimited 0 mode\n");
+	wprintf(L"PASS: metadata, negative entries, path-scoped invalidation, sequence admission, payload provenance, LRU and unlimited mode\n");
 	return 0;
 }

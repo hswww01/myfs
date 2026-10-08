@@ -26,45 +26,16 @@
 #define SCPFS_SECTOR_SIZE 4096U
 #define SCPFS_DEFAULT_CACHE_ROOT L"scpfs"
 #define SCPFS_MAX_COMMAND_TIMEOUT_MS 540000U
+#define SCPFS_CLEANUP_GRACE_MS 500U
+#define SCPFS_WATCH_STARTUP_WAIT_MS 8000U
+#define SCPFS_DEFAULT_DISPATCHER_THREADS 4U
+#define SCPFS_MAX_DISPATCHER_THREADS 16U
+/* Files up to this size are read through the watch helper's stream. */
+#define SCPFS_STREAM_READ_LIMIT (8U * 1024U * 1024U)
+#define SCPFS_STREAM_WRITE_LIMIT (8U * 1024U * 1024U)
 
 
 typedef struct SCPFS_HANDLE SCPFS_HANDLE;
-
-typedef struct SCPFS_CACHE_DIAGNOSTICS {
-	uint64_t cold_attempt;
-	uint64_t cold_unavailable;
-	uint64_t cold_watch_unhealthy;
-	uint64_t cold_ensure_failed;
-	uint64_t cold_barrier_failed;
-	uint64_t cold_pre_content_changed;
-	uint64_t cold_post_barrier_failed;
-	uint64_t cold_post_unhealthy;
-	uint64_t cold_post_content_changed;
-	uint64_t cold_stat_failed;
-	uint64_t cold_verify_barrier_failed;
-	uint64_t cold_verify_unhealthy;
-	uint64_t cold_verify_content_changed;
-	uint64_t cold_verify_metadata_changed;
-	uint64_t cold_provenance_mismatch;
-	uint64_t cold_atime_mismatch;
-	uint64_t cold_put_attempt;
-	uint64_t warm_candidate;
-	uint64_t warm_metadata_stale;
-	uint64_t warm_watch_unhealthy;
-	uint64_t warm_ensure_failed;
-	uint64_t warm_barrier_failed;
-	uint64_t warm_stat_failed;
-	uint64_t warm_verify_barrier_failed;
-	uint64_t warm_verify_unhealthy;
-	uint64_t warm_content_changed;
-	uint64_t warm_metadata_changed;
-	uint64_t warm_provenance_mismatch;
-	uint64_t warm_copy_failed;
-	uint32_t provenance_mismatch_mask;
-} SCPFS_CACHE_DIAGNOSTICS;
-
-#define SCPFS_CACHE_DIAG(instance, counter) \
-	(void)InterlockedIncrement64((volatile LONG64 *)&(instance)->cache_diagnostics.counter)
 
 struct SCPFS_HANDLE {
 	SCPFS_HANDLE *previous;
@@ -111,10 +82,12 @@ struct SCPFS {
 	SCPFS_BACKEND *backend;
 	SCPFS_CACHE *read_cache;
 	SCPFS_WATCH *watch;
-	SCPFS_WATCH_STATE observed_watch;
-	bool observed_watch_valid;
+	/* Reads that the watch helper could not answer (backend fallback). */
+	volatile LONG64 watch_fallbacks;
 	SCPFS_HANDLE *handles;
 	SRWLOCK lock;
+	/* Signaled after Cleanup/Close change handle state; see scpfs_await_handles. */
+	CONDITION_VARIABLE handles_changed;
 	volatile LONG dispatcher_stop_reason;
 	bool dispatcher_started;
 	WCHAR *cache_directory;
@@ -131,7 +104,6 @@ struct SCPFS {
 	uint64_t volume_free_bytes;
 	ULONGLONG volume_sample_tick;
 	volatile LONG cache_counter;
-	SCPFS_CACHE_DIAGNOSTICS cache_diagnostics;
 };
 
 enum {
@@ -615,125 +587,63 @@ static bool scpfs_cacheable_path(PCWSTR path)
 	return wcscmp(leaf, L".in.txt") != 0 && wcscmp(leaf, L".out.txt") != 0;
 }
 
-/* Called with instance->lock held. A failed/lost monitor invalidates all clean
- * entries and makes this read bypass the cache until coverage is healthy again. */
-static bool scpfs_cache_watch_state(SCPFS *instance, SCPFS_WATCH_STATE *state)
-{
-	if (state != NULL)
-		memset(state, 0, sizeof(*state));
-	if (instance == NULL || instance->read_cache == NULL || instance->watch == NULL) {
-		if (instance != NULL)
-			scp_cache_record_monitor_bypass(instance->read_cache);
-		return false;
-	}
-	scp_watch_snapshot(instance->watch, state);
-	if (!state->healthy) {
-		if (!instance->observed_watch_valid || instance->observed_watch.healthy)
-			scp_cache_invalidate_all(instance->read_cache);
-		instance->observed_watch = *state;
-		instance->observed_watch_valid = true;
-		scp_cache_record_monitor_bypass(instance->read_cache);
-		return false;
-	}
-	if (!instance->observed_watch_valid || !instance->observed_watch.healthy) {
-		scp_cache_invalidate_all(instance->read_cache);
-		instance->observed_watch_valid = true;
-	} else if (instance->observed_watch.content_epoch != state->content_epoch) {
-		scp_cache_invalidate_all(instance->read_cache);
-	} else if (instance->observed_watch.metadata_epoch != state->metadata_epoch) {
-		scp_cache_invalidate_metadata(instance->read_cache);
-	}
-	instance->observed_watch = *state;
-	return true;
-}
-
-static bool scpfs_watch_same_generation(const SCPFS_WATCH_STATE *left,
-	const SCPFS_WATCH_STATE *right)
-{
-	return left->healthy && right->healthy &&
-		left->metadata_epoch == right->metadata_epoch &&
-		left->content_epoch == right->content_epoch;
-}
-
-static uint32_t scpfs_cache_stat_provenance_mismatch_mask(
-	const SCPFS_REMOTE_STAT *left, const SCPFS_REMOTE_STAT *right)
-{
-	uint32_t mismatch = 0;
-	if (left->type != right->type) mismatch |= 1u << 0;
-	if (left->device != right->device) mismatch |= 1u << 1;
-	if (left->inode != right->inode) mismatch |= 1u << 2;
-	if (left->size != right->size) mismatch |= 1u << 3;
-	if (left->mtime_ns != right->mtime_ns) mismatch |= 1u << 4;
-	if (left->mode != right->mode) mismatch |= 1u << 5;
-	if (left->uid != right->uid) mismatch |= 1u << 6;
-	if (left->gid != right->gid) mismatch |= 1u << 7;
-	if (left->ctime_ns != right->ctime_ns) mismatch |= 1u << 8;
-	return mismatch;
-}
-
 static void scpfs_cache_invalidate_all(SCPFS *instance)
 {
 	if (instance != NULL && instance->read_cache != NULL)
 		scp_cache_invalidate_all(instance->read_cache);
 }
 
-/* Cache only read-side stat callbacks. Mutation preflight and writeback continue
- * to call scpfs_stat_path/scp_backend_stat directly. */
+/* Drops cached state for a path this adapter just changed. The monitor will
+ * report the change too, but only after a round trip. */
+static void scpfs_cache_changed(SCPFS *instance, PCWSTR path, bool subtree)
+{
+	if (instance != NULL && instance->read_cache != NULL && path != NULL)
+		scp_cache_invalidate_path(instance->read_cache, path,
+			subtree ? SCPFS_CACHE_CHANGE_SUBTREE : SCPFS_CACHE_CHANGE_CONTENT);
+}
+
+/*
+ * Read-side stat; instance->lock is not required. Answers come from the
+ * cache, else from the watch helper (one round trip, and the answer stays
+ * covered by its watches), else from the backend. Mutation preflight that
+ * must see the remote state itself calls scpfs_stat_path directly.
+ */
 static NTSTATUS scpfs_read_stat(SCPFS *instance, PCWSTR path,
 	SCPFS_REMOTE_STAT *stat)
 {
-	SCPFS_WATCH_STATE before;
-	SCPFS_WATCH_STATE after;
-	SCPFS_REMOTE_STAT discovery;
+	SCPFS_REMOTE_STAT fetched;
+	uint64_t sequence = 0;
+	bool cacheable = false;
+	bool use_cache;
 	NTSTATUS status;
 	if (!scpfs_valid_path(path, true))
 		return STATUS_OBJECT_NAME_INVALID;
-	if (instance == NULL || instance->read_cache == NULL ||
-		!scpfs_cacheable_path(path))
+	use_cache = instance->read_cache != NULL && scpfs_cacheable_path(path);
+	if (use_cache) {
+		switch (scp_cache_get_stat(instance->read_cache, path, &fetched)) {
+		case SCPFS_CACHE_PRESENT:
+			goto found;
+		case SCPFS_CACHE_ABSENT:
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+		default:
+			break;
+		}
+	}
+	status = scp_watch_stat(instance->watch, path, &fetched, &cacheable, &sequence);
+	if (status == STATUS_NOT_SUPPORTED) {
+		InterlockedIncrement64(&instance->watch_fallbacks);
 		return scpfs_stat_path(instance, path, stat);
-	if (scpfs_cache_watch_state(instance, &before) &&
-		scp_cache_get_stat(instance->read_cache, path,
-			before.metadata_epoch, before.content_epoch, stat))
-		return STATUS_SUCCESS;
-
-	/* Discover the object kind, establish file/directory coverage, then fetch
-	 * again inside one acknowledged generation before admitting metadata. */
-	status = scpfs_stat_path(instance, path, &discovery);
+	}
+	if (use_cache && cacheable &&
+		(NT_SUCCESS(status) || status == STATUS_OBJECT_NAME_NOT_FOUND))
+		scp_cache_put_stat(instance->read_cache, path,
+			NT_SUCCESS(status) ? &fetched : NULL, sequence);
 	if (!NT_SUCCESS(status))
 		return status;
-	scp_watch_snapshot(instance->watch, &before);
-	if (!before.healthy || !scpfs_cache_watch_state(instance, &before)) {
-		*stat = discovery;
-		return STATUS_SUCCESS;
-	}
-	if (!scp_watch_ensure(instance->watch, path,
-		discovery.type == SCPFS_REMOTE_DIRECTORY) ||
-		!scp_watch_barrier(instance->watch)) {
-		*stat = discovery;
-		return STATUS_SUCCESS;
-	}
-	scp_watch_snapshot(instance->watch, &after);
-	(void)scpfs_cache_watch_state(instance, &after);
-	if (!after.healthy) {
-		*stat = discovery;
-		return STATUS_SUCCESS;
-	}
-	if (before.content_epoch != after.content_epoch)
-		return scpfs_stat_path(instance, path, stat);
-	before = after;
-	status = scpfs_stat_path(instance, path, stat);
-	if (!NT_SUCCESS(status))
-		return status;
-	if (!scp_watch_barrier(instance->watch)) {
-		(void)scpfs_cache_watch_state(instance, &after);
-		return STATUS_SUCCESS;
-	}
-	scp_watch_snapshot(instance->watch, &after);
-	if (scpfs_watch_same_generation(&before, &after) &&
-		scpfs_cacheable_path(path))
-		scp_cache_put_stat(instance->read_cache, path, stat,
-			after.metadata_epoch, after.content_epoch);
-	(void)scpfs_cache_watch_state(instance, &after);
+found:
+	if (!scpfs_is_remote_object_supported(&fetched))
+		return STATUS_ACCESS_DENIED;
+	*stat = fetched;
 	return STATUS_SUCCESS;
 }
 
@@ -751,91 +661,28 @@ static bool scpfs_list_has_inbox_entry(const SCPFS_DIR_LIST *list)
 
 static int __cdecl scpfs_compare_dir_entry(const void *left, const void *right);
 
-/* Called with instance->lock held. A list is admitted only after every child
- * has acknowledged its own file/directory watch coverage. */
+/* Read-side listing, sorted by ordinal name; instance->lock is not required. */
 static NTSTATUS scpfs_read_list(SCPFS *instance, PCWSTR path,
 	SCPFS_DIR_LIST *list)
 {
-	SCPFS_WATCH_STATE before;
-	SCPFS_WATCH_STATE after;
+	uint64_t sequence = 0;
 	NTSTATUS status;
-	size_t index;
-	bool can_cache = false;
+	bool use_cache = instance->read_cache != NULL && scpfs_cacheable_path(path);
 	memset(list, 0, sizeof(*list));
-	if (instance->read_cache != NULL && scpfs_cacheable_path(path) &&
-		scpfs_cache_watch_state(instance, &before) &&
-		scp_cache_get_list(instance->read_cache, path,
-			before.metadata_epoch, before.content_epoch, list))
+	if (use_cache && scp_cache_get_list(instance->read_cache, path, list))
 		return STATUS_SUCCESS;
-	if (instance->read_cache != NULL && scpfs_cacheable_path(path)) {
-		SCPFS_WATCH_STATE before_ensure;
-		scp_watch_snapshot(instance->watch, &before_ensure);
-		if (before_ensure.healthy &&
-			scpfs_cache_watch_state(instance, &before_ensure) &&
-			scp_watch_ensure(instance->watch, path, true) &&
-			scp_watch_barrier(instance->watch)) {
-			scp_watch_snapshot(instance->watch, &before);
-			(void)scpfs_cache_watch_state(instance, &before);
-			can_cache = before.healthy &&
-				before.content_epoch == before_ensure.content_epoch;
-		}
+	status = scp_watch_list(instance->watch, path, list, &sequence);
+	if (status == STATUS_NOT_SUPPORTED) {
+		InterlockedIncrement64(&instance->watch_fallbacks);
+		use_cache = false;
+		status = scp_backend_list(instance->backend, path, list);
 	}
-	status = scp_backend_list(instance->backend, path, list);
 	if (!NT_SUCCESS(status))
 		return status;
 	if (list->count > 1)
 		qsort(list->entries, list->count, sizeof(list->entries[0]), scpfs_compare_dir_entry);
-	if (can_cache && scpfs_list_has_inbox_entry(list))
-		can_cache = false;
-	if (can_cache) {
-		for (index = 0; index < list->count; index++) {
-			WCHAR *child_path = NULL;
-			SCPFS_DIR_ENTRY *entry = &list->entries[index];
-			if (!scpfs_valid_name(entry->name, entry->name_length) ||
-				!scpfs_is_remote_object_supported(&entry->stat) ||
-				!scpfs_cacheable_path(entry->name) ||
-				!scpfs_join_path(path, entry->name, entry->name_length, &child_path)) {
-				can_cache = false;
-				free(child_path);
-				break;
-			}
-			if (!scp_watch_ensure(instance->watch, child_path,
-				entry->stat.type == SCPFS_REMOTE_DIRECTORY))
-				can_cache = false;
-			free(child_path);
-			if (!can_cache)
-				break;
-		}
-	}
-	if (can_cache && scp_watch_barrier(instance->watch)) {
-		SCPFS_DIR_LIST verified;
-		memset(&verified, 0, sizeof(verified));
-		/* Child watches may have taken time to install. Fetch the list again
-		 * after coverage so the returned/admitted snapshot is from afterward. */
-		status = scp_backend_list(instance->backend, path, &verified);
-		if (!NT_SUCCESS(status)) {
-			scp_backend_free_list(&verified);
-			scp_backend_free_list(list);
-			return status;
-		}
-		if (verified.count > 1)
-			qsort(verified.entries, verified.count, sizeof(verified.entries[0]),
-				scpfs_compare_dir_entry);
-		scp_backend_free_list(list);
-		*list = verified;
-		if (scp_watch_barrier(instance->watch)) {
-			scp_watch_snapshot(instance->watch, &after);
-			if (scpfs_watch_same_generation(&before, &after) &&
-				!scpfs_list_has_inbox_entry(list))
-				scp_cache_put_list(instance->read_cache, path, list,
-					after.metadata_epoch, after.content_epoch);
-		} else {
-			memset(&after, 0, sizeof(after));
-		}
-		(void)scpfs_cache_watch_state(instance, &after);
-	} else if (instance->read_cache != NULL) {
-		(void)scpfs_cache_watch_state(instance, &after);
-	}
+	if (use_cache && !scpfs_list_has_inbox_entry(list))
+		scp_cache_put_list(instance->read_cache, path, list, sequence);
 	return STATUS_SUCCESS;
 }
 
@@ -936,6 +783,24 @@ static bool scpfs_has_open_descendant(SCPFS *instance, PCWSTR path,
 			return true;
 	}
 	return false;
+}
+
+/*
+ * With several dispatcher threads, the Cleanup of a handle the application
+ * already closed can still be queued behind the callback that needs it gone.
+ * Before reporting a sharing conflict, callers wait here (lock released)
+ * for handle state to change. Returns false once the grace period is over.
+ */
+static bool scpfs_await_handles(SCPFS *instance, ULONGLONG *deadline)
+{
+	ULONGLONG now = GetTickCount64();
+	if (*deadline == 0)
+		*deadline = now + SCPFS_CLEANUP_GRACE_MS;
+	if (now >= *deadline)
+		return false;
+	(void)SleepConditionVariableSRW(&instance->handles_changed, &instance->lock,
+		(DWORD)(*deadline - now), 0);
+	return true;
 }
 
 static void scpfs_link_handle(SCPFS *instance, SCPFS_HANDLE *handle)
@@ -1190,7 +1055,7 @@ static NTSTATUS scpfs_commit_handle(SCPFS_HANDLE *handle, PCWSTR operation)
 	update_metadata = handle->mode_dirty || handle->atime_dirty || handle->mtime_dirty;
 	if (!commit_payload && !update_metadata)
 		return STATUS_SUCCESS;
-	scpfs_cache_invalidate_all(instance);
+	scpfs_cache_changed(instance, handle->remote_path, false);
 	if (commit_payload) {
 		if (handle->cache_file == NULL) {
 			status = STATUS_INVALID_HANDLE;
@@ -1202,13 +1067,38 @@ static NTSTATUS scpfs_commit_handle(SCPFS_HANDLE *handle, PCWSTR operation)
 			scpfs_write_recovery_manifest(handle, operation, status);
 			return status;
 		}
-		status = scp_backend_upload_atomic(instance->backend,
-			handle->remote_path, handle->cache_path,
-			handle->remote_exists ? &handle->snapshot : NULL, &updated);
+		status = STATUS_NOT_SUPPORTED;
+		if (handle->file_size <= SCPFS_STREAM_WRITE_LIMIT) {
+			/* Small files go through the helper in one round trip. Times
+			 * follow upload_atomic: an existing file keeps its snapshot
+			 * times, a new one takes the local file's. */
+			FILETIME access_time;
+			FILETIME write_time;
+			int64_t atime_ns = handle->snapshot.atime_ns;
+			int64_t mtime_ns = handle->snapshot.mtime_ns;
+			bool times_known = handle->remote_exists;
+			if (!times_known && GetFileTime(handle->cache_file, NULL,
+				&access_time, &write_time)) {
+				atime_ns = scpfs_filetime_to_unix_ns(
+					((uint64_t)access_time.dwHighDateTime << 32) | access_time.dwLowDateTime);
+				mtime_ns = scpfs_filetime_to_unix_ns(
+					((uint64_t)write_time.dwHighDateTime << 32) | write_time.dwLowDateTime);
+				times_known = true;
+			}
+			if (times_known)
+				status = scp_watch_write(instance->watch, handle->remote_path,
+					handle->cache_path, handle->remote_exists ? &handle->snapshot : NULL,
+					atime_ns, mtime_ns, &updated);
+		}
+		if (status == STATUS_NOT_SUPPORTED)
+			status = scp_backend_upload_atomic(instance->backend,
+				handle->remote_path, handle->cache_path,
+				handle->remote_exists ? &handle->snapshot : NULL, &updated);
 		if (!NT_SUCCESS(status)) {
 			scpfs_write_recovery_manifest(handle, operation, status);
 			return status;
 		}
+		scpfs_cache_changed(instance, handle->remote_path, false);
 		handle->snapshot = updated;
 		handle->current = updated;
 		handle->remote_exists = true;
@@ -1220,11 +1110,19 @@ static NTSTATUS scpfs_commit_handle(SCPFS_HANDLE *handle, PCWSTR operation)
 			handle->current.mode = handle->mode;
 	}
 	if (update_metadata) {
-		status = scp_backend_setmeta(instance->backend, handle->remote_path,
+		bool have_stat;
+		status = scp_watch_setmeta(instance->watch, handle->remote_path,
 			handle->mode,
 			handle->atime_dirty ? handle->pending_atime_ns : handle->current.atime_ns,
 			handle->mtime_dirty ? handle->pending_mtime_ns : handle->current.mtime_ns,
-			handle->mode_dirty, handle->atime_dirty, handle->mtime_dirty);
+			handle->mode_dirty, handle->atime_dirty, handle->mtime_dirty, &updated);
+		have_stat = NT_SUCCESS(status);
+		if (status == STATUS_NOT_SUPPORTED)
+			status = scp_backend_setmeta(instance->backend, handle->remote_path,
+				handle->mode,
+				handle->atime_dirty ? handle->pending_atime_ns : handle->current.atime_ns,
+				handle->mtime_dirty ? handle->pending_mtime_ns : handle->current.mtime_ns,
+				handle->mode_dirty, handle->atime_dirty, handle->mtime_dirty);
 		if (!NT_SUCCESS(status)) {
 			scpfs_write_recovery_manifest(handle, operation, status);
 			return status;
@@ -1244,7 +1142,10 @@ static NTSTATUS scpfs_commit_handle(SCPFS_HANDLE *handle, PCWSTR operation)
 		handle->mode_dirty = false;
 		handle->atime_dirty = false;
 		handle->mtime_dirty = false;
-		status = scpfs_stat_path(instance, handle->remote_path, &updated);
+		scpfs_cache_changed(instance, handle->remote_path, false);
+		/* The helper answers with the resulting stat; the backend needs one. */
+		status = have_stat ? STATUS_SUCCESS :
+			scpfs_stat_path(instance, handle->remote_path, &updated);
 		if (!NT_SUCCESS(status)) {
 			scpfs_write_recovery_manifest(handle, operation, status);
 			return status;
@@ -1353,11 +1254,16 @@ static NTSTATUS scpfs_open_existing(SCPFS *instance, PCWSTR path,
 	SCPFS_HANDLE *handle;
 	SCPFS_HANDLE *active_handle;
 	NTSTATUS status;
-	bool downloaded = false;
 
 	if (handle_out == NULL)
 		return STATUS_INVALID_PARAMETER;
 	*handle_out = NULL;
+	if (stat->type == SCPFS_REMOTE_FILE && enforce_single_file_handle) {
+		ULONGLONG grace = 0;
+		while (scpfs_has_open_regular_path(instance, path) &&
+			scpfs_await_handles(instance, &grace))
+			;
+	}
 	if (stat->type == SCPFS_REMOTE_FILE && enforce_single_file_handle &&
 		scpfs_has_open_regular_path(instance, path)) {
 		for (active_handle = instance->handles; active_handle != NULL;
@@ -1389,222 +1295,66 @@ static NTSTATUS scpfs_open_existing(SCPFS *instance, PCWSTR path,
 	}
 	handle->metadata_only = metadata_only && !handle->directory;
 	if (!handle->directory && !handle->metadata_only) {
-		PCWSTR cached_payload = NULL;
-		SCPFS_REMOTE_STAT cached_provenance;
-		SCPFS_REMOTE_STAT fresh_stat;
-		uint64_t payload_metadata_epoch = 0;
-		bool metadata_stale = false;
-		bool cache_hit = false;
-		bool payload_candidate = false;
-		bool download_cacheable = false;
-		SCPFS_WATCH_STATE before;
-		SCPFS_WATCH_STATE after;
+		bool cacheable = instance->read_cache != NULL && scpfs_cacheable_path(path);
 		if (!scpfs_make_cache_file_name(instance, &handle->cache_path)) {
 			scpfs_log_failure(handle, L"allocate cache path", STATUS_INSUFFICIENT_RESOURCES, NULL);
 			scpfs_dispose_handle(handle, false);
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
-		if (instance->read_cache != NULL && scpfs_cacheable_path(path) &&
-			scpfs_cache_watch_state(instance, &before) &&
-			scp_cache_get_payload(instance->read_cache, path,
-				before.metadata_epoch, before.content_epoch, &cached_payload,
-				&cached_provenance, &payload_metadata_epoch, &metadata_stale)) {
-			payload_candidate = true;
-			SCPFS_CACHE_DIAG(instance, warm_candidate);
-			if (payload_metadata_epoch != before.metadata_epoch)
-				metadata_stale = true;
-			if (metadata_stale)
-				SCPFS_CACHE_DIAG(instance, warm_metadata_stale);
-			bool provenance_valid = !metadata_stale;
-			if (metadata_stale) {
-				SCPFS_WATCH_STATE before_ensure;
-				bool coverage_ready;
-				/* ATTRIB retains immutable bytes only after a fresh complete
-				 * provenance stat and a monitor barrier agree. */
-				provenance_valid = false;
-				scp_watch_snapshot(instance->watch, &before_ensure);
-				if (!before_ensure.healthy ||
-					before_ensure.content_epoch != before.content_epoch) {
-					if (!before_ensure.healthy)
-						SCPFS_CACHE_DIAG(instance, warm_watch_unhealthy);
-					else
-						SCPFS_CACHE_DIAG(instance, warm_content_changed);
-					(void)scpfs_cache_watch_state(instance, &before_ensure);
-					coverage_ready = false;
-				} else {
-					(void)scpfs_cache_watch_state(instance, &before_ensure);
-					if (!scp_watch_ensure(instance->watch, path, false)) {
-						SCPFS_CACHE_DIAG(instance, warm_ensure_failed);
-						coverage_ready = false;
-					} else if (!scp_watch_barrier(instance->watch)) {
-						SCPFS_CACHE_DIAG(instance, warm_barrier_failed);
-						coverage_ready = false;
-					} else {
-						coverage_ready = true;
-					}
-				}
-				if (coverage_ready) {
-					scp_watch_snapshot(instance->watch, &before);
-					(void)scpfs_cache_watch_state(instance, &before);
-					if (!before.healthy) {
-						SCPFS_CACHE_DIAG(instance, warm_watch_unhealthy);
-						coverage_ready = false;
-					} else if (before.content_epoch != before_ensure.content_epoch) {
-						SCPFS_CACHE_DIAG(instance, warm_content_changed);
-						coverage_ready = false;
-					}
-				}
-				status = coverage_ready ? scpfs_stat_path(instance, path, &fresh_stat) :
-					STATUS_UNSUCCESSFUL;
-				if (coverage_ready && !NT_SUCCESS(status)) {
-					SCPFS_CACHE_DIAG(instance, warm_stat_failed);
-				} else if (coverage_ready && !scp_watch_barrier(instance->watch)) {
-					SCPFS_CACHE_DIAG(instance, warm_verify_barrier_failed);
-				} else if (coverage_ready) {
-					scp_watch_snapshot(instance->watch, &after);
-					if (!scpfs_watch_same_generation(&before, &after)) {
-						if (!after.healthy)
-							SCPFS_CACHE_DIAG(instance, warm_verify_unhealthy);
-						else if (before.content_epoch != after.content_epoch)
-							SCPFS_CACHE_DIAG(instance, warm_content_changed);
-						else if (before.metadata_epoch != after.metadata_epoch)
-							SCPFS_CACHE_DIAG(instance, warm_metadata_changed);
-						(void)scpfs_cache_watch_state(instance, &after);
-					} else {
-						bool provenance_matches = scp_cache_validate_payload(
-							instance->read_cache, path, &fresh_stat,
-							after.metadata_epoch);
-						(void)scpfs_cache_watch_state(instance, &after);
-						if (provenance_matches)
-							provenance_valid = scp_cache_get_payload(
-								instance->read_cache, path, after.metadata_epoch,
-								after.content_epoch, &cached_payload,
-								&cached_provenance, &payload_metadata_epoch,
-								&metadata_stale) && !metadata_stale;
-						else {
-							SCPFS_CACHE_DIAG(instance, warm_provenance_mismatch);
-							(void)InterlockedOr(
-								(volatile LONG *)&instance->cache_diagnostics.provenance_mismatch_mask,
-								(LONG)scpfs_cache_stat_provenance_mismatch_mask(
-									&cached_provenance, &fresh_stat));
-						}
-					}
+		/* stat is current (cached entries are dropped as the helper reports
+		 * changes), so matching inode/size/mtime means the bytes are too. */
+		if (cacheable && scp_cache_copy_payload(instance->read_cache, path, stat,
+			handle->cache_path)) {
+			handle->current = *stat;
+		} else {
+			SCPFS_REMOTE_STAT covered_stat;
+			uint64_t sequence = 0;
+			bool covered = false;
+			if (cacheable) {
+				/* Only bytes of a path the helper covers may be kept; its cached
+				 * stat proves coverage. Take the sequence before the transfer
+				 * so a change reported during it rejects the copy. */
+				sequence = scp_cache_sequence(instance->read_cache);
+				covered = scp_cache_get_stat(instance->read_cache, path,
+					&covered_stat) == SCPFS_CACHE_PRESENT;
 			}
-			if (!provenance_valid)
-					(void)scp_cache_evict_payload(instance->read_cache, path);
-			}
-			if (provenance_valid) {
-				if (CopyFileW(cached_payload, handle->cache_path, TRUE)) {
-					cache_hit = true;
-					scp_cache_record_payload_hit(instance->read_cache);
-					handle->current = cached_provenance;
-					if (metadata_stale)
-						handle->current = fresh_stat;
-				} else {
-					SCPFS_CACHE_DIAG(instance, warm_copy_failed);
-					SetFileAttributesW(handle->cache_path, FILE_ATTRIBUTE_NORMAL);
-					DeleteFileW(handle->cache_path);
+			/* The handle is not linked yet; let other callbacks run meanwhile. */
+			ReleaseSRWLockExclusive(&instance->lock);
+			/* Small files come over the monitor stream in one round trip, and
+			 * the helper's watches cover the bytes it returns. */
+			status = STATUS_NOT_SUPPORTED;
+			if (stat->size <= SCPFS_STREAM_READ_LIMIT) {
+				uint64_t read_sequence;
+				status = scp_watch_read(instance->watch, path, SCPFS_STREAM_READ_LIMIT,
+					handle->cache_path, &handle->current, &read_sequence);
+				if (NT_SUCCESS(status)) {
+					covered = cacheable;
+					sequence = read_sequence;
 				}
 			}
-		}
-		if (!cache_hit) {
-			if (payload_candidate)
-				scp_cache_record_payload_miss(instance->read_cache);
-			/* Establish the file and all ancestor coverage immediately before
-			 * the network transfer; content events reset subscriptions. */
-			if (instance->read_cache != NULL && scpfs_cacheable_path(path)) {
-				SCPFS_WATCH_STATE before_ensure;
-				scp_watch_snapshot(instance->watch, &before_ensure);
-				SCPFS_CACHE_DIAG(instance, cold_attempt);
-				if (!before_ensure.healthy) {
-					SCPFS_CACHE_DIAG(instance, cold_watch_unhealthy);
-				} else if (!scpfs_cache_watch_state(instance, &before_ensure)) {
-					SCPFS_CACHE_DIAG(instance, cold_watch_unhealthy);
-				} else if (!scp_watch_ensure(instance->watch, path, false)) {
-					SCPFS_CACHE_DIAG(instance, cold_ensure_failed);
-				} else if (!scp_watch_barrier(instance->watch)) {
-					SCPFS_CACHE_DIAG(instance, cold_barrier_failed);
-				} else {
-					scp_watch_snapshot(instance->watch, &before);
-					(void)scpfs_cache_watch_state(instance, &before);
-					download_cacheable = before.healthy &&
-						before.content_epoch == before_ensure.content_epoch;
-					if (!before.healthy)
-						SCPFS_CACHE_DIAG(instance, cold_watch_unhealthy);
-					else if (before.content_epoch != before_ensure.content_epoch)
-						SCPFS_CACHE_DIAG(instance, cold_pre_content_changed);
-				}
-			} else {
-				SCPFS_CACHE_DIAG(instance, cold_unavailable);
-			}
-			status = scp_backend_download(instance->backend, path,
-				handle->cache_path, &handle->current);
+			if (status == STATUS_NOT_SUPPORTED)
+				status = scp_backend_download(instance->backend, path,
+					handle->cache_path, &handle->current);
+			AcquireSRWLockExclusive(&instance->lock);
 			if (!NT_SUCCESS(status)) {
 				scpfs_log_failure(handle, L"download file cache", status, NULL);
 				scpfs_dispose_handle(handle, true);
 				return status;
 			}
-			downloaded = true;
-		}
-		if (downloaded && download_cacheable) {
-			if (!scp_watch_barrier(instance->watch)) {
-				SCPFS_CACHE_DIAG(instance, cold_post_barrier_failed);
-			} else {
-				scp_watch_snapshot(instance->watch, &after);
-				/* Backend download's final stat is after restoring atime. A second
-				 * stat confirms no chmod, replacement, or other metadata change was
-				 * folded into this generation before admitting the byte copy. */
-				if (!after.healthy) {
-					SCPFS_CACHE_DIAG(instance, cold_post_unhealthy);
-				} else if (before.content_epoch != after.content_epoch) {
-					SCPFS_CACHE_DIAG(instance, cold_post_content_changed);
-				} else {
-					status = scpfs_stat_path(instance, path, &fresh_stat);
-					if (!NT_SUCCESS(status)) {
-						SCPFS_CACHE_DIAG(instance, cold_stat_failed);
-					} else if (!scp_watch_barrier(instance->watch)) {
-						SCPFS_CACHE_DIAG(instance, cold_verify_barrier_failed);
-					} else {
-						SCPFS_WATCH_STATE verified;
-						bool same_generation;
-						bool same_stat;
-						uint32_t provenance_mismatch;
-						scp_watch_snapshot(instance->watch, &verified);
-						same_generation = scpfs_watch_same_generation(&after, &verified);
-						if (!verified.healthy) {
-							SCPFS_CACHE_DIAG(instance, cold_verify_unhealthy);
-						} else if (verified.content_epoch != after.content_epoch) {
-							SCPFS_CACHE_DIAG(instance, cold_verify_content_changed);
-						} else if (verified.metadata_epoch != after.metadata_epoch) {
-							SCPFS_CACHE_DIAG(instance, cold_verify_metadata_changed);
-						}
-						provenance_mismatch =
-							scpfs_cache_stat_provenance_mismatch_mask(
-								&handle->current, &fresh_stat);
-						same_stat = provenance_mismatch == 0 &&
-							handle->current.atime_ns == fresh_stat.atime_ns;
-						if (same_generation && same_stat) {
-							SCPFS_CACHE_DIAG(instance, cold_put_attempt);
-							scp_cache_put_payload(instance->read_cache, path,
-								handle->cache_path, &handle->current,
-								verified.metadata_epoch, verified.content_epoch);
-						} else if (same_generation) {
-							if (provenance_mismatch != 0) {
-								SCPFS_CACHE_DIAG(instance, cold_provenance_mismatch);
-								(void)InterlockedOr(
-									(volatile LONG *)&instance->cache_diagnostics.provenance_mismatch_mask,
-									(LONG)provenance_mismatch);
-							}
-							if (handle->current.atime_ns != fresh_stat.atime_ns) {
-								SCPFS_CACHE_DIAG(instance, cold_atime_mismatch);
-								(void)InterlockedOr(
-									(volatile LONG *)&instance->cache_diagnostics.provenance_mismatch_mask,
-									(LONG)(1u << 9));
-							}
-						}
-						(void)scpfs_cache_watch_state(instance, &verified);
-					}
-				}
+			if (covered)
+				scp_cache_put_payload(instance->read_cache, path,
+					handle->cache_path, &handle->current, sequence);
+			if (enforce_single_file_handle) {
+				ULONGLONG grace = 0;
+				while (scpfs_has_open_regular_path(instance, path) &&
+					scpfs_await_handles(instance, &grace))
+					;
+			}
+			if (enforce_single_file_handle && scpfs_has_open_regular_path(instance, path)) {
+				scpfs_log_open_failure(instance, path,
+					L"open raced with another open during download", STATUS_SHARING_VIOLATION);
+				scpfs_dispose_handle(handle, true);
+				return STATUS_SHARING_VIOLATION;
 			}
 		}
 		handle->snapshot = handle->current;
@@ -1717,19 +1467,33 @@ static NTSTATUS scpfs_fs_get_volume_info(FSP_FILE_SYSTEM *file_system,
 	SCPFS *instance = scpfs_from_file_system(file_system);
 	if (instance == NULL || volume_info == NULL)
 		return STATUS_INVALID_PARAMETER;
+	{
+		/* Volume info is queried constantly; refresh the remote sample at most
+		 * every 30 seconds, outside the lock, and keep the last good one if a
+		 * refresh fails. */
+		ULONGLONG now = GetTickCount64();
+		bool refresh;
+		AcquireSRWLockExclusive(&instance->lock);
+		refresh = instance->volume_sample_tick == 0 ||
+			now - instance->volume_sample_tick >= 30000;
+		if (refresh)
+			instance->volume_sample_tick = now;
+		ReleaseSRWLockExclusive(&instance->lock);
+		if (refresh) {
+			uint64_t total = 0, available = 0;
+			NTSTATUS status = scp_watch_statfs(instance->watch, &total, &available);
+			if (status == STATUS_NOT_SUPPORTED)
+				status = scp_backend_statfs(instance->backend, &total, &available);
+			if (NT_SUCCESS(status)) {
+				AcquireSRWLockExclusive(&instance->lock);
+				instance->volume_total_bytes = total;
+				instance->volume_free_bytes = available;
+				ReleaseSRWLockExclusive(&instance->lock);
+			}
+		}
+	}
 	AcquireSRWLockExclusive(&instance->lock);
 	memset(volume_info, 0, sizeof(*volume_info));
-	/* Volume info is queried constantly; refresh the remote sample at most
-	 * every 30 seconds and keep the last good one if a refresh fails. */
-	if (instance->volume_sample_tick == 0 ||
-		GetTickCount64() - instance->volume_sample_tick >= 30000) {
-		uint64_t total = 0, available = 0;
-		if (NT_SUCCESS(scp_backend_statfs(instance->backend, &total, &available))) {
-			instance->volume_total_bytes = total;
-			instance->volume_free_bytes = available;
-		}
-		instance->volume_sample_tick = GetTickCount64();
-	}
 	volume_info->TotalSize = instance->volume_total_bytes;
 	volume_info->FreeSize = instance->volume_free_bytes;
 	volume_info->VolumeLabelLength = instance->volume_label_bytes;
@@ -1767,7 +1531,8 @@ static NTSTATUS scpfs_fs_get_security_by_name(FSP_FILE_SYSTEM *file_system,
 	(void)security_descriptor;
 	if (instance == NULL || file_name == NULL)
 		return STATUS_INVALID_PARAMETER;
-	AcquireSRWLockExclusive(&instance->lock);
+	/* No instance lock: the stat path is thread safe and the default
+	 * descriptor is immutable after mount. */
 	status = scpfs_read_stat(instance, file_name, &stat);
 	if (NT_SUCCESS(status) && file_attributes != NULL)
 		*file_attributes = scpfs_attributes(file_name, &stat);
@@ -1783,7 +1548,6 @@ static NTSTATUS scpfs_fs_get_security_by_name(FSP_FILE_SYSTEM *file_system,
 					instance->default_security_size);
 		}
 	}
-	ReleaseSRWLockExclusive(&instance->lock);
 	return status;
 }
 
@@ -1809,40 +1573,52 @@ static NTSTATUS scpfs_fs_create(FSP_FILE_SYSTEM *file_system,
 	*file_context = NULL;
 	if (!scpfs_valid_path(file_name, false))
 		return STATUS_OBJECT_NAME_INVALID;
-	AcquireSRWLockExclusive(&instance->lock);
 	parent_path = scpfs_parent_path(file_name);
-	if (parent_path == NULL) {
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto done;
-	}
-	status = scpfs_stat_path(instance, parent_path, &parent_stat);
-	if (!NT_SUCCESS(status))
-		goto done;
-	if (parent_stat.type != SCPFS_REMOTE_DIRECTORY) {
+	if (parent_path == NULL)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	/* Preflight from the watched cache, outside the lock. A stale "absent"
+	 * is still safe: mkdir and the exclusive upload refuse existing names. */
+	status = scpfs_read_stat(instance, parent_path, &parent_stat);
+	if (NT_SUCCESS(status) && parent_stat.type != SCPFS_REMOTE_DIRECTORY)
 		status = STATUS_NOT_A_DIRECTORY;
-		goto done;
+	if (NT_SUCCESS(status)) {
+		status = scpfs_read_stat(instance, file_name, &target_stat);
+		if (NT_SUCCESS(status) || status == STATUS_ACCESS_DENIED)
+			status = STATUS_OBJECT_NAME_COLLISION;
+		else if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
+			status == STATUS_OBJECT_PATH_NOT_FOUND || status == STATUS_NO_SUCH_FILE)
+			status = STATUS_SUCCESS;
+	}
+	if (!NT_SUCCESS(status)) {
+		free(parent_path);
+		return status;
+	}
+	AcquireSRWLockExclusive(&instance->lock);
+	{
+		ULONGLONG grace = 0;
+		while (scpfs_has_open_path(instance, file_name) &&
+			scpfs_await_handles(instance, &grace))
+			;
 	}
 	if (scpfs_has_open_path(instance, file_name)) {
 		status = STATUS_OBJECT_NAME_COLLISION;
 		goto done;
 	}
-	status = scp_backend_stat(instance->backend, file_name, &target_stat);
-	if (NT_SUCCESS(status)) {
-		status = STATUS_OBJECT_NAME_COLLISION;
-		goto done;
-	}
-	if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND &&
-		status != STATUS_NO_SUCH_FILE)
-		goto done;
 
 	directory = (create_options & FILE_DIRECTORY_FILE) != 0;
-	scpfs_cache_invalidate_all(instance);
+	scpfs_cache_changed(instance, file_name, false);
 	if (directory) {
 		SCPFS_REMOTE_STAT created_stat;
-		status = scp_backend_mkdir(instance->backend, file_name, 0777U);
+		bool have_stat;
+		status = scp_watch_mkdir(instance->watch, file_name, 0777U, &created_stat);
+		have_stat = NT_SUCCESS(status);
+		if (status == STATUS_NOT_SUPPORTED)
+			status = scp_backend_mkdir(instance->backend, file_name, 0777U);
 		if (!NT_SUCCESS(status))
 			goto done;
-		status = scpfs_stat_path(instance, file_name, &created_stat);
+		scpfs_cache_changed(instance, file_name, false);
+		if (!have_stat)
+			status = scpfs_read_stat(instance, file_name, &created_stat);
 		if (!NT_SUCCESS(status)) {
 			(void)scp_backend_remove(instance->backend, file_name, true);
 			goto done;
@@ -1900,8 +1676,8 @@ static NTSTATUS scpfs_fs_open(FSP_FILE_SYSTEM *file_system,
 	*file_context = NULL;
 	if (!scpfs_valid_path(file_name, true))
 		return STATUS_OBJECT_NAME_INVALID;
-	AcquireSRWLockExclusive(&instance->lock);
 	status = scpfs_read_stat(instance, file_name, &stat);
+	AcquireSRWLockExclusive(&instance->lock);
 	if (!NT_SUCCESS(status)) {
 		if (status != STATUS_OBJECT_NAME_NOT_FOUND && status != STATUS_OBJECT_PATH_NOT_FOUND &&
 			status != STATUS_NO_SUCH_FILE)
@@ -1967,7 +1743,6 @@ static NTSTATUS scpfs_fs_overwrite(FSP_FILE_SYSTEM *file_system,
 		ReleaseSRWLockExclusive(&instance->lock);
 		return status;
 	}
-	scpfs_cache_invalidate_all(instance);
 	handle->file_size = 0;
 	handle->current.size = 0;
 	handle->dirty = true;
@@ -1983,7 +1758,7 @@ static NTSTATUS scpfs_fs_overwrite(FSP_FILE_SYSTEM *file_system,
 	return STATUS_SUCCESS;
 }
 
-static VOID scpfs_fs_cleanup(FSP_FILE_SYSTEM *file_system,
+static VOID scpfs_fs_cleanup_locked(FSP_FILE_SYSTEM *file_system,
 	PVOID file_context, PWSTR file_name, ULONG flags)
 {
 	SCPFS *instance = scpfs_from_file_system(file_system);
@@ -2012,6 +1787,12 @@ static VOID scpfs_fs_cleanup(FSP_FILE_SYSTEM *file_system,
 		return;
 	}
 	if (flags & FspCleanupDelete) {
+		ULONGLONG grace = 0;
+		while ((scpfs_has_other_open_path(instance, handle->remote_path, handle) ||
+			(handle->directory && scpfs_has_open_descendant(instance,
+				handle->remote_path, handle))) &&
+			scpfs_await_handles(instance, &grace))
+			;
 		if (scpfs_has_other_open_path(instance, handle->remote_path, handle) ||
 			(handle->directory && scpfs_has_open_descendant(instance, handle->remote_path, handle))) {
 			status = STATUS_SHARING_VIOLATION;
@@ -2022,9 +1803,12 @@ static VOID scpfs_fs_cleanup(FSP_FILE_SYSTEM *file_system,
 			return;
 		}
 		if (handle->remote_exists) {
-			scpfs_cache_invalidate_all(instance);
-			status = scp_backend_remove(instance->backend,
-				handle->remote_path, handle->directory);
+			status = scp_watch_remove(instance->watch, handle->remote_path,
+				handle->directory);
+			if (status == STATUS_NOT_SUPPORTED)
+				status = scp_backend_remove(instance->backend,
+					handle->remote_path, handle->directory);
+			scpfs_cache_changed(instance, handle->remote_path, handle->directory);
 			if (!NT_SUCCESS(status)) {
 				scpfs_log_failure(handle, L"CleanupDelete remote remove", status, NULL);
 				handle->delete_failed = true;
@@ -2067,7 +1851,16 @@ static VOID scpfs_fs_cleanup(FSP_FILE_SYSTEM *file_system,
 	ReleaseSRWLockExclusive(&instance->lock);
 }
 
-static VOID scpfs_fs_close(FSP_FILE_SYSTEM *file_system, PVOID file_context)
+static VOID scpfs_fs_cleanup(FSP_FILE_SYSTEM *file_system,
+	PVOID file_context, PWSTR file_name, ULONG flags)
+{
+	SCPFS *instance = scpfs_from_file_system(file_system);
+	scpfs_fs_cleanup_locked(file_system, file_context, file_name, flags);
+	if (instance != NULL)
+		WakeAllConditionVariable(&instance->handles_changed);
+}
+
+static VOID scpfs_fs_close_locked(FSP_FILE_SYSTEM *file_system, PVOID file_context)
 {
 	SCPFS *instance = scpfs_from_file_system(file_system);
 	SCPFS_HANDLE *handle;
@@ -2106,6 +1899,14 @@ static VOID scpfs_fs_close(FSP_FILE_SYSTEM *file_system, PVOID file_context)
 			(handle->dirty || handle->mode_dirty || handle->atime_dirty || handle->mtime_dirty)));
 	ReleaseSRWLockExclusive(&instance->lock);
 	scpfs_dispose_handle(handle, !keep_cache);
+}
+
+static VOID scpfs_fs_close(FSP_FILE_SYSTEM *file_system, PVOID file_context)
+{
+	SCPFS *instance = scpfs_from_file_system(file_system);
+	scpfs_fs_close_locked(file_system, file_context);
+	if (instance != NULL)
+		WakeAllConditionVariable(&instance->handles_changed);
 }
 
 static NTSTATUS scpfs_fs_read(FSP_FILE_SYSTEM *file_system,
@@ -2214,10 +2015,6 @@ static NTSTATUS scpfs_fs_write(FSP_FILE_SYSTEM *file_system,
 		status = scpfs_map_win32_error(GetLastError());
 		goto done;
 	}
-	/* Local cache writes do not change the remote until commit; only this
-	 * path's entries can disagree with the open handle meanwhile. */
-	if (bytes_written != 0 && instance->read_cache != NULL)
-		scp_cache_invalidate_path(instance->read_cache, handle->remote_path);
 	{
 		LARGE_INTEGER size;
 		if (!GetFileSizeEx(handle->cache_file, &size) || size.QuadPart < 0) {
@@ -2315,9 +2112,6 @@ static NTSTATUS scpfs_fs_set_basic_info(FSP_FILE_SYSTEM *file_system,
 		ReleaseSRWLockExclusive(&instance->lock);
 		return STATUS_SHARING_VIOLATION;
 	}
-	if (file_attributes != INVALID_FILE_ATTRIBUTES || last_access_time != 0 ||
-		last_write_time != 0)
-		scpfs_cache_invalidate_all(instance);
 	if (file_attributes != INVALID_FILE_ATTRIBUTES) {
 		if (file_attributes & FILE_ATTRIBUTE_READONLY)
 			handle->mode &= ~0222U;
@@ -2389,8 +2183,6 @@ static NTSTATUS scpfs_fs_set_file_size(FSP_FILE_SYSTEM *file_system,
 		status = scpfs_map_win32_error(GetLastError());
 		goto done;
 	}
-	if (instance->read_cache != NULL)
-		scp_cache_invalidate_path(instance->read_cache, handle->remote_path);
 	handle->file_size = new_size;
 	handle->current.size = new_size;
 	handle->dirty = true;
@@ -2411,6 +2203,14 @@ static NTSTATUS scpfs_fs_can_delete(FSP_FILE_SYSTEM *file_system,
 	if (instance == NULL || handle == NULL)
 		return STATUS_INVALID_PARAMETER;
 	AcquireSRWLockExclusive(&instance->lock);
+	if (handle->owner == instance && !handle->deleted) {
+		ULONGLONG grace = 0;
+		while ((scpfs_has_other_open_path(instance, handle->remote_path, handle) ||
+			(handle->directory && scpfs_has_open_descendant(instance,
+				handle->remote_path, handle))) &&
+			scpfs_await_handles(instance, &grace))
+			;
+	}
 	if (handle->owner != instance || handle->deleted) {
 		status = STATUS_INVALID_HANDLE;
 	} else if (handle->stale_namespace) {
@@ -2423,7 +2223,8 @@ static NTSTATUS scpfs_fs_can_delete(FSP_FILE_SYSTEM *file_system,
 	} else if (handle->directory) {
 		SCPFS_DIR_LIST list;
 		memset(&list, 0, sizeof(list));
-		status = scp_backend_list(instance->backend, handle->remote_path, &list);
+		/* A stale "empty" is harmless: rmdir itself refuses a non-empty directory. */
+		status = scpfs_read_list(instance, handle->remote_path, &list);
 		if (NT_SUCCESS(status) && list.count != 0)
 			status = STATUS_DIRECTORY_NOT_EMPTY;
 		scp_backend_free_list(&list);
@@ -2517,6 +2318,14 @@ static NTSTATUS scpfs_fs_rename(FSP_FILE_SYSTEM *file_system,
 		goto done;
 	}
 	stage = L"validate source handles";
+	{
+		ULONGLONG grace = 0;
+		while ((scpfs_has_other_open_path(instance, handle->remote_path, handle) ||
+			(handle->directory && scpfs_has_open_descendant(instance,
+				handle->remote_path, handle))) &&
+			scpfs_await_handles(instance, &grace))
+			;
+	}
 	if (scpfs_has_other_open_path(instance, handle->remote_path, handle) ||
 		(handle->directory &&
 		 (scpfs_path_is_descendant(new_file_name, handle->remote_path) ||
@@ -2540,7 +2349,7 @@ static NTSTATUS scpfs_fs_rename(FSP_FILE_SYSTEM *file_system,
 		goto done;
 	}
 	stage = L"stat destination parent";
-	status = scpfs_stat_path(instance, parent_path, &parent_stat);
+	status = scpfs_read_stat(instance, parent_path, &parent_stat);
 	if (!NT_SUCCESS(status))
 		goto done;
 	if (parent_stat.type != SCPFS_REMOTE_DIRECTORY) {
@@ -2566,6 +2375,14 @@ static NTSTATUS scpfs_fs_rename(FSP_FILE_SYSTEM *file_system,
 			status = STATUS_NOT_SUPPORTED;
 			goto done;
 		}
+		{
+			ULONGLONG grace = 0;
+			while ((scpfs_has_open_path(instance, new_file_name) ||
+				(handle->directory && scpfs_has_open_descendant(instance,
+					new_file_name, NULL))) &&
+				scpfs_await_handles(instance, &grace))
+				;
+		}
 		if (scpfs_has_open_path(instance, new_file_name) ||
 			(handle->directory && scpfs_has_open_descendant(instance, new_file_name, NULL))) {
 			status = STATUS_SHARING_VIOLATION;
@@ -2590,9 +2407,13 @@ static NTSTATUS scpfs_fs_rename(FSP_FILE_SYSTEM *file_system,
 	}
 	if (handle->remote_exists) {
 		stage = L"remote rename";
-		scpfs_cache_invalidate_all(instance);
-		status = scp_backend_rename(instance->backend, handle->remote_path,
+		status = scp_watch_rename(instance->watch, handle->remote_path,
 			new_file_name, destination_exists && replace_if_exists);
+		if (status == STATUS_NOT_SUPPORTED)
+			status = scp_backend_rename(instance->backend, handle->remote_path,
+				new_file_name, destination_exists && replace_if_exists);
+		scpfs_cache_changed(instance, handle->remote_path, true);
+		scpfs_cache_changed(instance, new_file_name, true);
 		if (!NT_SUCCESS(status))
 			goto done;
 		scpfs_mark_metadata_handles_stale(instance, handle->remote_path,
@@ -2619,44 +2440,30 @@ done:
 	return status;
 }
 
-/* Called with instance->lock held and the directory buffer acquired. */
-static NTSTATUS scpfs_fill_directory_snapshot(SCPFS *instance,
-	SCPFS_HANDLE *directory, PCWSTR pattern)
+/* Called with instance->lock held and the directory buffer acquired.
+ * list is sorted by ordinal name; parent_stat is NULL for the root. */
+static NTSTATUS scpfs_fill_directory_snapshot(SCPFS_HANDLE *directory,
+	PCWSTR pattern, const SCPFS_DIR_LIST *list, PCWSTR parent_path,
+	const SCPFS_REMOTE_STAT *parent_stat)
 {
-	SCPFS_DIR_LIST list;
-	SCPFS_REMOTE_STAT parent_stat;
-	WCHAR *parent_path = NULL;
 	NTSTATUS status;
 	size_t i;
 
-	memset(&list, 0, sizeof(list));
-	/* scpfs_read_list returns entries already sorted by ordinal name. */
-	status = scpfs_read_list(instance, directory->remote_path, &list);
-	if (!NT_SUCCESS(status))
-		goto done;
-	if (!scpfs_is_root_path(directory->remote_path)) {
+	if (parent_stat != NULL) {
 		if (scpfs_is_name_in_pattern(pattern, L".")) {
 			status = scpfs_fill_dir_entry(directory, directory->remote_path,
 				&directory->current, L".");
 			if (!NT_SUCCESS(status))
-				goto done;
+				return status;
 		}
-		parent_path = scpfs_parent_path(directory->remote_path);
-		if (parent_path == NULL) {
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			goto done;
-		}
-		status = scpfs_read_stat(instance, parent_path, &parent_stat);
-		if (!NT_SUCCESS(status))
-			goto done;
 		if (scpfs_is_name_in_pattern(pattern, L"..")) {
-			status = scpfs_fill_dir_entry(directory, parent_path, &parent_stat, L"..");
+			status = scpfs_fill_dir_entry(directory, parent_path, parent_stat, L"..");
 			if (!NT_SUCCESS(status))
-				goto done;
+				return status;
 		}
 	}
-	for (i = 0; i < list.count; i++) {
-		SCPFS_DIR_ENTRY *entry = &list.entries[i];
+	for (i = 0; i < list->count; i++) {
+		SCPFS_DIR_ENTRY *entry = &list->entries[i];
 		WCHAR *entry_path = NULL;
 		if (!scpfs_valid_name(entry->name, entry->name_length) ||
 			!scpfs_is_remote_object_supported(&entry->stat) ||
@@ -2668,13 +2475,22 @@ static NTSTATUS scpfs_fill_directory_snapshot(SCPFS *instance,
 		status = scpfs_fill_dir_entry(directory, entry_path, &entry->stat, entry->name);
 		free(entry_path);
 		if (!NT_SUCCESS(status))
-			goto done;
+			return status;
 	}
-	status = STATUS_SUCCESS;
-done:
-	free(parent_path);
-	scp_backend_free_list(&list);
-	return status;
+	return STATUS_SUCCESS;
+}
+
+/* Validates a directory handle and copies its path; lock held. */
+static NTSTATUS scpfs_directory_path(SCPFS *instance, SCPFS_HANDLE *directory,
+	WCHAR **path_out)
+{
+	*path_out = NULL;
+	if (directory->owner != instance || directory->deleted)
+		return STATUS_INVALID_HANDLE;
+	if (!directory->directory)
+		return STATUS_NOT_A_DIRECTORY;
+	*path_out = scpfs_wcsdup(directory->remote_path);
+	return *path_out != NULL ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
 }
 
 static NTSTATUS scpfs_fs_read_directory(FSP_FILE_SYSTEM *file_system,
@@ -2683,6 +2499,11 @@ static NTSTATUS scpfs_fs_read_directory(FSP_FILE_SYSTEM *file_system,
 {
 	SCPFS *instance = scpfs_from_file_system(file_system);
 	SCPFS_HANDLE *directory = (SCPFS_HANDLE *)file_context;
+	SCPFS_DIR_LIST list;
+	SCPFS_REMOTE_STAT parent_stat;
+	bool have_parent = false;
+	WCHAR *path = NULL;
+	WCHAR *parent_path = NULL;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	if (instance == NULL || directory == NULL || bytes_transferred == NULL)
@@ -2690,6 +2511,33 @@ static NTSTATUS scpfs_fs_read_directory(FSP_FILE_SYSTEM *file_system,
 	*bytes_transferred = 0;
 	if (buffer == NULL && length != 0)
 		return STATUS_INVALID_PARAMETER;
+	memset(&list, 0, sizeof(list));
+	/*
+	 * Snapshot the listing once per enumeration (marker == NULL) and serve
+	 * continuation pages from it. The remote listing is fetched without the
+	 * instance lock so a slow directory never stalls other callbacks.
+	 */
+	AcquireSRWLockExclusive(&instance->lock);
+	status = scpfs_directory_path(instance, directory, &path);
+	if (NT_SUCCESS(status) && marker != NULL && directory->dir_buffer != NULL) {
+		/* Continuation page: served from the snapshot. */
+		free(path);
+		path = NULL;
+	}
+	ReleaseSRWLockExclusive(&instance->lock);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (path != NULL) {
+		status = scpfs_read_list(instance, path, &list);
+		if (NT_SUCCESS(status) && !scpfs_is_root_path(path)) {
+			parent_path = scpfs_parent_path(path);
+			status = parent_path == NULL ? STATUS_INSUFFICIENT_RESOURCES :
+				scpfs_read_stat(instance, parent_path, &parent_stat);
+			have_parent = NT_SUCCESS(status);
+		}
+		if (!NT_SUCCESS(status))
+			goto done_unlocked;
+	}
 	AcquireSRWLockExclusive(&instance->lock);
 	if (directory->owner != instance || directory->deleted) {
 		status = STATUS_INVALID_HANDLE;
@@ -2699,15 +2547,10 @@ static NTSTATUS scpfs_fs_read_directory(FSP_FILE_SYSTEM *file_system,
 		status = STATUS_NOT_A_DIRECTORY;
 		goto done;
 	}
-	/*
-	 * Snapshot the listing once per enumeration (marker == NULL) and serve
-	 * continuation pages from it. Re-listing per page cost a remote find for
-	 * every buffer of a large directory, and could skip or repeat entries
-	 * that changed between pages.
-	 */
 	if (FspFileSystemAcquireDirectoryBuffer(&directory->dir_buffer,
-		marker == NULL, &status)) {
-		status = scpfs_fill_directory_snapshot(instance, directory, pattern);
+		path != NULL, &status)) {
+		status = scpfs_fill_directory_snapshot(directory, pattern, &list,
+			parent_path, have_parent ? &parent_stat : NULL);
 		FspFileSystemReleaseDirectoryBuffer(&directory->dir_buffer);
 	}
 	if (!NT_SUCCESS(status))
@@ -2717,6 +2560,10 @@ static NTSTATUS scpfs_fs_read_directory(FSP_FILE_SYSTEM *file_system,
 	status = STATUS_SUCCESS;
 done:
 	ReleaseSRWLockExclusive(&instance->lock);
+done_unlocked:
+	free(path);
+	free(parent_path);
+	scp_backend_free_list(&list);
 	return status;
 }
 
@@ -2726,6 +2573,7 @@ static NTSTATUS scpfs_fs_get_dir_info_by_name(FSP_FILE_SYSTEM *file_system,
 	SCPFS *instance = scpfs_from_file_system(file_system);
 	SCPFS_HANDLE *directory = (SCPFS_HANDLE *)file_context;
 	SCPFS_REMOTE_STAT stat;
+	WCHAR *directory_path = NULL;
 	WCHAR *path = NULL;
 	PCWSTR output_name = file_name;
 	NTSTATUS status;
@@ -2735,22 +2583,19 @@ static NTSTATUS scpfs_fs_get_dir_info_by_name(FSP_FILE_SYSTEM *file_system,
 	if (instance == NULL || directory == NULL || file_name == NULL || dir_info == NULL)
 		return STATUS_INVALID_PARAMETER;
 	AcquireSRWLockExclusive(&instance->lock);
-	if (directory->owner != instance || directory->deleted) {
-		status = STATUS_INVALID_HANDLE;
-		goto done;
-	}
-	if (!directory->directory) {
-		status = STATUS_NOT_A_DIRECTORY;
-		goto done;
-	}
+	status = scpfs_directory_path(instance, directory, &directory_path);
+	ReleaseSRWLockExclusive(&instance->lock);
+	if (!NT_SUCCESS(status))
+		return status;
 	if (wcscmp(file_name, L".") == 0) {
-		path = scpfs_wcsdup(directory->remote_path);
+		path = directory_path;
+		directory_path = NULL;
 	} else if (wcscmp(file_name, L"..") == 0) {
-		path = scpfs_parent_path(directory->remote_path);
-		if (path == NULL && scpfs_is_root_path(directory->remote_path))
+		path = scpfs_parent_path(directory_path);
+		if (path == NULL && scpfs_is_root_path(directory_path))
 			path = scpfs_wcsdup(L"\\");
 	} else if (scpfs_valid_name(file_name, wcslen(file_name))) {
-		if (!scpfs_join_path(directory->remote_path, file_name,
+		if (!scpfs_join_path(directory_path, file_name,
 			wcslen(file_name), &path)) {
 			status = STATUS_OBJECT_NAME_INVALID;
 			goto done;
@@ -2766,10 +2611,6 @@ static NTSTATUS scpfs_fs_get_dir_info_by_name(FSP_FILE_SYSTEM *file_system,
 	status = scpfs_read_stat(instance, path, &stat);
 	if (!NT_SUCCESS(status))
 		goto done;
-	if (!scpfs_is_remote_object_supported(&stat)) {
-		status = STATUS_ACCESS_DENIED;
-		goto done;
-	}
 	name_chars = wcslen(output_name);
 	if (name_chars > SCPFS_MAX_COMPONENT_CHARS) {
 		status = STATUS_OBJECT_NAME_INVALID;
@@ -2792,8 +2633,8 @@ static NTSTATUS scpfs_fs_get_dir_info_by_name(FSP_FILE_SYSTEM *file_system,
 	status = STATUS_SUCCESS;
 
 done:
+	free(directory_path);
 	free(path);
-	ReleaseSRWLockExclusive(&instance->lock);
 	return status;
 }
 
@@ -3153,14 +2994,11 @@ static NTSTATUS scpfs_resolve_create_failure(void *backend_context,
 NTSTATUS scpfs_create(const SCPFS_OPTIONS *options, SCPFS **instance_out)
 {
 	SCPFS *instance = NULL;
-	SCPFS_REMOTE_STAT root_stat;
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	FSF_WINFSP_CONFIG frontend_config;
 	DWORD frontend_win32_detail = ERROR_SUCCESS;
 	NTSTATUS status;
 	LARGE_INTEGER counter;
-	SCPFS_BACKEND_OPTIONS monitor_options;
-	WCHAR *monitor_root = NULL;
 
 	if (options == NULL || instance_out == NULL || options->backend.host == NULL ||
 		options->backend.username == NULL || options->backend.remote_root == NULL ||
@@ -3173,6 +3011,7 @@ NTSTATUS scpfs_create(const SCPFS_OPTIONS *options, SCPFS **instance_out)
 	if (instance == NULL)
 		return STATUS_INSUFFICIENT_RESOURCES;
 	InitializeSRWLock(&instance->lock);
+	InitializeConditionVariable(&instance->handles_changed);
 	instance->dispatcher_stop_reason = SCPFS_DISPATCHER_ACTIVE;
 	instance->volume_label[0] = L'S';
 	instance->volume_label[1] = L'C';
@@ -3190,33 +3029,28 @@ NTSTATUS scpfs_create(const SCPFS_OPTIONS *options, SCPFS **instance_out)
 	QueryPerformanceCounter(&counter);
 	instance->cache_counter = (LONG)(counter.LowPart & 0x3fffffff);
 
-	status = scp_backend_connect(&options->backend, &instance->backend);
-	if (!NT_SUCCESS(status))
-		goto fail;
-	status = scp_backend_stat(instance->backend, L"\\", &root_stat);
-	if (!NT_SUCCESS(status))
-		goto fail;
-	if (root_stat.type != SCPFS_REMOTE_DIRECTORY) {
-		status = STATUS_NOT_A_DIRECTORY;
-		goto fail;
-	}
 	status = scpfs_prepare_cache_directory(options->cache_directory,
 		&instance->cache_directory);
 	if (!NT_SUCCESS(status))
 		goto fail;
 	if (NT_SUCCESS(scp_cache_create(instance->cache_directory,
 		instance->read_cache_max_mib, &instance->read_cache))) {
-		/* Change notifications are required for reuse. Startup failure is
-		 * deliberately cache-off and does not change mount availability. */
-		monitor_root = scp_backend_dup_remote_root(instance->backend);
-		if (monitor_root != NULL) {
-			monitor_options = options->backend;
-			monitor_options.remote_root = monitor_root;
-			if (!NT_SUCCESS(scp_watch_start(&monitor_options, &instance->watch)))
-				instance->watch = NULL;
-			free(monitor_root);
-			monitor_root = NULL;
-		}
+		/* Change notifications are required for reuse. The monitor connects
+		 * in parallel with the main session (each SSH login is several round
+		 * trips); it is held back until the main session pins the root.
+		 * Startup failure is cache-off and does not change availability. */
+		if (!NT_SUCCESS(scp_watch_start(&options->backend, instance->read_cache,
+			&instance->watch)))
+			instance->watch = NULL;
+	}
+	/* Connect also verifies that the canonical root is a directory. */
+	status = scp_backend_connect(&options->backend, &instance->backend);
+	if (!NT_SUCCESS(status))
+		goto fail;
+	if (instance->watch != NULL) {
+		WCHAR *canonical_root = scp_backend_dup_remote_root(instance->backend);
+		scp_watch_expect_root(instance->watch, canonical_root);
+		free(canonical_root);
 	}
 	instance->remote_host = scpfs_wcsdup(options->backend.host);
 	instance->remote_root = scpfs_wcsdup(options->backend.remote_root);
@@ -3279,6 +3113,11 @@ NTSTATUS scpfs_create(const SCPFS_OPTIONS *options, SCPFS **instance_out)
 	}
 	FspFileSystemSetOperationGuardStrategy(instance->file_system,
 		FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
+	/* The monitor connected in parallel; give it a moment so the first
+	 * Explorer burst after mounting is answered from the helper, not by
+	 * per-operation SSH execs. A server without it just mounts uncached. */
+	if (instance->watch != NULL)
+		(void)scp_watch_wait_healthy(instance->watch, SCPFS_WATCH_STARTUP_WAIT_MS);
 	*instance_out = instance;
 	return STATUS_SUCCESS;
 
@@ -3296,7 +3135,6 @@ fail:
 			LocalFree(instance->default_security);
 		if (instance->cache_directory != NULL)
 			RemoveDirectoryW(instance->cache_directory);
-		free(monitor_root);
 		free(instance->cache_directory);
 		free(instance->remote_host);
 		free(instance->remote_root);
@@ -3323,17 +3161,14 @@ NTSTATUS scpfs_start(SCPFS *instance, uint32_t dispatcher_thread_count)
 	if (instance == NULL || instance->frontend == NULL)
 		return STATUS_INVALID_PARAMETER;
 	/*
-	 * Keep cleanup and the following open/rename callback in IOQ order. WinFsp
-	 * posts clean Cleanup requests best-effort; multiple dispatcher workers can
-	 * dequeue Cleanup and Open together and race for the adapter's serialization
-	 * lock, making a just-closed clean handle look active to the next callback.
-	 * SCPFS already serializes its backend/cache callbacks, so extra workers do
-	 * not provide useful backend parallelism.
+	 * Several workers let cached lookups and listings proceed while another
+	 * callback waits on the network. A Cleanup that races the next Open or
+	 * Rename on another worker is absorbed by scpfs_await_handles.
 	 */
-	if (dispatcher_thread_count > 1)
+	if (dispatcher_thread_count > SCPFS_MAX_DISPATCHER_THREADS)
 		return STATUS_INVALID_PARAMETER;
 	if (dispatcher_thread_count == 0)
-		dispatcher_thread_count = 1;
+		dispatcher_thread_count = SCPFS_DEFAULT_DISPATCHER_THREADS;
 	InterlockedExchange(&instance->dispatcher_stop_reason, SCPFS_DISPATCHER_ACTIVE);
 	status = fsf_winfsp_start(instance->frontend, dispatcher_thread_count);
 	if (NT_SUCCESS(status))
@@ -3408,7 +3243,7 @@ void scpfs_destroy(SCPFS *instance)
 	if (instance->read_cache != NULL) {
 		scp_cache_get_counters(instance->read_cache, &cache_counters);
 		fwprintf(stderr,
-			L"SCPFS cache stats: stat_hit=%llu stat_miss=%llu list_hit=%llu list_miss=%llu payload_hit=%llu payload_miss=%llu evictions=%llu invalidations=%llu monitor_bypass=%llu\n",
+			L"SCPFS cache stats: stat_hit=%llu stat_miss=%llu list_hit=%llu list_miss=%llu payload_hit=%llu payload_miss=%llu evictions=%llu invalidations=%llu rejected_puts=%llu watch_fallbacks=%lld\n",
 			(unsigned long long)cache_counters.stat_hit,
 			(unsigned long long)cache_counters.stat_miss,
 			(unsigned long long)cache_counters.list_hit,
@@ -3417,44 +3252,12 @@ void scpfs_destroy(SCPFS *instance)
 			(unsigned long long)cache_counters.payload_miss,
 			(unsigned long long)cache_counters.evictions,
 			(unsigned long long)cache_counters.invalidations,
-			(unsigned long long)cache_counters.monitor_bypass);
+			(unsigned long long)cache_counters.rejected_puts,
+			(long long)instance->watch_fallbacks);
 		fflush(stderr);
 		scp_cache_destroy(instance->read_cache);
 		instance->read_cache = NULL;
 	}
-	fwprintf(stderr,
-		L"SCPFS cache admission diag: cold_attempt=%llu cold_unavailable=%llu cold_watch_unhealthy=%llu cold_ensure_failed=%llu cold_barrier_failed=%llu cold_pre_content_changed=%llu cold_post_barrier_failed=%llu cold_post_unhealthy=%llu cold_post_content_changed=%llu cold_stat_failed=%llu cold_verify_barrier_failed=%llu cold_verify_unhealthy=%llu cold_verify_content_changed=%llu cold_verify_metadata_changed=%llu cold_provenance_mismatch=%llu cold_atime_mismatch=%llu cold_put_attempt=%llu warm_candidate=%llu warm_metadata_stale=%llu warm_watch_unhealthy=%llu warm_ensure_failed=%llu warm_barrier_failed=%llu warm_stat_failed=%llu warm_verify_barrier_failed=%llu warm_verify_unhealthy=%llu warm_content_changed=%llu warm_metadata_changed=%llu warm_provenance_mismatch=%llu warm_copy_failed=%llu provenance_mask=0x%03X\n",
-		(unsigned long long)instance->cache_diagnostics.cold_attempt,
-		(unsigned long long)instance->cache_diagnostics.cold_unavailable,
-		(unsigned long long)instance->cache_diagnostics.cold_watch_unhealthy,
-		(unsigned long long)instance->cache_diagnostics.cold_ensure_failed,
-		(unsigned long long)instance->cache_diagnostics.cold_barrier_failed,
-		(unsigned long long)instance->cache_diagnostics.cold_pre_content_changed,
-		(unsigned long long)instance->cache_diagnostics.cold_post_barrier_failed,
-		(unsigned long long)instance->cache_diagnostics.cold_post_unhealthy,
-		(unsigned long long)instance->cache_diagnostics.cold_post_content_changed,
-		(unsigned long long)instance->cache_diagnostics.cold_stat_failed,
-		(unsigned long long)instance->cache_diagnostics.cold_verify_barrier_failed,
-		(unsigned long long)instance->cache_diagnostics.cold_verify_unhealthy,
-		(unsigned long long)instance->cache_diagnostics.cold_verify_content_changed,
-		(unsigned long long)instance->cache_diagnostics.cold_verify_metadata_changed,
-		(unsigned long long)instance->cache_diagnostics.cold_provenance_mismatch,
-		(unsigned long long)instance->cache_diagnostics.cold_atime_mismatch,
-		(unsigned long long)instance->cache_diagnostics.cold_put_attempt,
-		(unsigned long long)instance->cache_diagnostics.warm_candidate,
-		(unsigned long long)instance->cache_diagnostics.warm_metadata_stale,
-		(unsigned long long)instance->cache_diagnostics.warm_watch_unhealthy,
-		(unsigned long long)instance->cache_diagnostics.warm_ensure_failed,
-		(unsigned long long)instance->cache_diagnostics.warm_barrier_failed,
-		(unsigned long long)instance->cache_diagnostics.warm_stat_failed,
-		(unsigned long long)instance->cache_diagnostics.warm_verify_barrier_failed,
-		(unsigned long long)instance->cache_diagnostics.warm_verify_unhealthy,
-		(unsigned long long)instance->cache_diagnostics.warm_content_changed,
-		(unsigned long long)instance->cache_diagnostics.warm_metadata_changed,
-		(unsigned long long)instance->cache_diagnostics.warm_provenance_mismatch,
-		(unsigned long long)instance->cache_diagnostics.warm_copy_failed,
-		(unsigned int)instance->cache_diagnostics.provenance_mismatch_mask);
-	fflush(stderr);
 	if (instance->backend != NULL)
 		scp_backend_disconnect(instance->backend);
 	if (instance->default_security != NULL)

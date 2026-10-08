@@ -787,7 +787,7 @@ static FSF_SERVICE_EXIT scpfs_service_backend_run(void *context,
 		result.service_specific_error = (DWORD)status;
 		goto done;
 	}
-	status = scpfs_start(instance, 1);
+	status = scpfs_start(instance, 0);
 	if (!NT_SUCCESS(status)) {
 		_snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE,
 			L"SCPFS dispatcher start failed (NTSTATUS 0x%08X).", (unsigned int)status);

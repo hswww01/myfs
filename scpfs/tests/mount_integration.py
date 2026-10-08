@@ -379,17 +379,19 @@ def main() -> int:
             )
             with open(timestamp_path, "rb") as stream:
                 assert stream.read() == b"timestamp seed\n"
+            # A read may advance atime like any Linux reader (relatime); it
+            # must never touch mtime.
             post_write_times = remote_times(fixture, f"{fixture.remote_root}/{timestamp_name}")
-            assert post_write_times == (seed_atime_ns, seed_mtime_ns), (
-                f"timestamp preservation mismatch: expected {(seed_atime_ns, seed_mtime_ns)}, "
+            assert post_write_times[1] == seed_mtime_ns and post_write_times[0] >= seed_atime_ns, (
+                f"read changed timestamps: seed {(seed_atime_ns, seed_mtime_ns)}, "
                 f"got {post_write_times}"
             )
             with open(timestamp_path, "r+b") as stream:
                 stream.seek(0)
                 stream.write(b"modified timestamp seed\n")
             post_write_times = remote_times(fixture, f"{fixture.remote_root}/{timestamp_name}")
-            assert post_write_times == (seed_atime_ns, seed_mtime_ns), (
-                f"timestamp preservation after write mismatch: expected {(seed_atime_ns, seed_mtime_ns)}, "
+            assert post_write_times[1] == seed_mtime_ns, (
+                f"timestamp preservation after write mismatch: expected mtime {seed_mtime_ns}, "
                 f"got {post_write_times}"
             )
             # Windows FILETIME has 100 ns precision; ask for representable values.

@@ -99,131 +99,47 @@ def encode_path(value: str) -> str:
     return value.encode("utf-8").hex()
 
 
-def run_snapshot_regressions(helper_script_wsl: str) -> None:
-    script = r'''
-import contextlib, importlib.util, io, os, pathlib, stat, sys, tempfile, time
-spec = importlib.util.spec_from_file_location("scpfs_watch_test", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-Snapshot = module.FileSnapshot
-base = Snapshot(7, 11, stat.S_IFREG | 0o644, 1000, 1000, 23,
-                100, 200, 300)
-assert module.classify_access_snapshot(base, base) == 0
-assert module.classify_access_snapshot(base, base._replace(atime_ns=101)) == 2
-restore_b = base._replace(atime_ns=999, ctime_ns=301)
-restore_a = base._replace(ctime_ns=302)
-assert restore_b.atime_ns != base.atime_ns and restore_a.atime_ns == base.atime_ns
-assert module.classify_access_snapshot(base, restore_a) == 2, "ctime must detect B->A atime restoration"
-assert module.classify_access_snapshot(base, base._replace(size=24)) == 1
-assert module.classify_access_snapshot(base, base._replace(mtime_ns=201)) == 1
-assert module.classify_inotify_event(module.IN_ATTRIB, base, base) == 2
-for changed in (base._replace(device=8), base._replace(inode=12),
-                base._replace(mode=stat.S_IFDIR | 0o644)):
-    try:
-        module.classify_access_snapshot(base, changed)
-    except module.WatchError:
-        pass
-    else:
-        raise AssertionError("an identity/type change was not rejected")
+def decode_event(line: str) -> tuple[str, str]:
+    kind, _, payload = line.partition(" ")
+    return kind, bytes.fromhex(payload).decode("utf-8", errors="surrogateescape")
 
-root = pathlib.Path(tempfile.mkdtemp(prefix="scpfs-watch-wd-test-"))
-primary = root / "file.txt"
-alias = root / "alias.txt"
-primary.write_bytes(b"fixture")
-os.link(primary, alias)
-watcher = None
-try:
-    watcher = module.Watcher(str(root))
-    watcher.ensure("/file.txt", False)
-    wd = watcher.path_wds[str(primary)]
-    baseline = watcher.wd_samples[wd]
-    changed_atime = max(time.time_ns() + 10**12, baseline.atime_ns + 10**12)
-    os.utime(primary, ns=(changed_atime, baseline.mtime_ns))
-    watcher.ensure("/alias.txt", False)
-    assert watcher.path_wds[str(alias)] == wd, "hard-link aliases did not share one wd"
-    assert watcher.wd_samples[wd] == baseline, "alias ensure reset the per-wd sample"
-    events = io.StringIO()
-    with contextlib.redirect_stdout(events):
-        watcher.drain_events()
-    assert "E 2\n" in events.getvalue(), "queued inode metadata change was swallowed by alias ensure"
-    assert watcher.wd_samples[wd].atime_ns == changed_atime
 
-    alias.unlink()
-    remaining = watcher._verified_file_snapshot(wd)
-    assert module._file_identity(remaining) == module._file_identity(watcher.wd_samples[wd]), (
-        "remaining hard-link path was not accepted as a safe sample source"
-    )
-    events = io.StringIO()
-    with contextlib.redirect_stdout(events):
-        watcher.drain_events()
-    assert "E 2\n" in events.getvalue() or "E 1\n" in events.getvalue(), (
-        "removing a watched hard-link alias did not invalidate the relevant state"
-    )
-    assert watcher.wd_samples[wd] == watcher._verified_file_snapshot(wd)
+def request(helper: Helper, line: str, request_id: int) -> tuple[list[str], list[str]]:
+    """Send one request; return (events seen before the reply, reply lines)."""
+    helper.send(line)
+    events = []
+    prefix = f"A {request_id} "
+    while True:
+        received = helper.recv()
+        if received.startswith("X "):
+            raise AssertionError(f"helper failed: {received}; events={events!r}")
+        if received.startswith(prefix):
+            reply = [received]
+            fields = received.split(" ")
+            if len(fields) == 4 and fields[2] == "L":
+                reply += [helper.recv() for _ in range(int(fields[3]))]
+            return events, reply
+        events.append(received)
 
-    # A pure access still reaches the monitor after relatime is suppressed.
-    # If every registered alias becomes unstatable, the event must fail closed.
-    original_lstat = module.os.lstat
-    def denied_lstat(path, *args, **kwargs):
-        if os.fspath(path) in (str(primary), str(alias)):
-            raise PermissionError("injected fixture lstat failure")
-        return original_lstat(path, *args, **kwargs)
-    try:
-        with open(primary, "rb") as stream:
-            stream.read(1)
-        module.os.lstat = denied_lstat
-        try:
-            watcher.drain_events()
-        except module.WatchError as error:
-            assert str(error) == "watch-path-unavailable", str(error)
-        else:
-            raise AssertionError("ACCESS event with no statable alias did not fail closed")
-    finally:
-        module.os.lstat = original_lstat
 
-    replacement = root / "replacement"
-    replacement.write_bytes(b"other")
-    os.replace(replacement, primary)
-    try:
-        watcher._verified_file_snapshot(wd)
-    except module.WatchError:
-        pass
-    else:
-        raise AssertionError("replaced inode path was accepted for a stale wd")
-    try:
-        watcher.ensure("/file.txt", False)
-    except module.WatchError:
-        pass
-    else:
-        raise AssertionError("W acknowledged a replacement inode for a stale wd")
-    print("PASS: access snapshot classification, ctime B->A, hard-link sample ownership and stale identity rejection")
-finally:
-    if watcher is not None:
-        os.close(watcher.fd)
-    import shutil
-    shutil.rmtree(root, ignore_errors=True)
-'''
-    output = wsl("python3", "-c", script, helper_script_wsl)
-    assert output.endswith(
-        "PASS: access snapshot classification, ctime B->A, hard-link sample ownership and stale identity rejection"
-    ), output
+def barrier_events(helper: Helper, request_id: int) -> set[tuple[str, str]]:
+    events, reply = request(helper, f"B {request_id}", request_id)
+    assert reply == [f"A {request_id} OK"], reply
+    return {decode_event(line) for line in events if line != "R"}
 
 
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: watch_helper_test.py <server/scpfs_watch.py>")
     helper_script = Path(sys.argv[1]).resolve()
-    script_wsl = to_wsl(helper_script)
-    run_snapshot_regressions(script_wsl)
     root = f"/tmp/scpfs-watch-test-{uuid.uuid4().hex}"
     wsl("python3", "-c",
         "import os,pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(); "
-        "(p/'file.txt').write_text('seed'); (p/'link.txt').symlink_to(p/'file.txt')",
+        "(p/'file.txt').write_text('seed'); (p/'link.txt').symlink_to(p/'file.txt'); "
+        "(p/'sub').mkdir(); (p/'sub'/'inner.txt').write_text('payload' + chr(10)); (p/'hidden').mkdir()",
         root)
     try:
-        # Verify the exact stdin bootstrap used by the native SSH monitor. It
-        # must consume source bytes, remove the source length from argv, and
-        # leave only helper arguments for argparse.
+        # The exact stdin bootstrap used by the native SSH monitor.
         source = helper_script.read_bytes()
         bootstrap = (
             "import sys; n=int(sys.argv[1]); sys.argv=['scpfs_watch.py']+sys.argv[2:]; "
@@ -232,147 +148,159 @@ def main() -> int:
         result = subprocess.run(
             ["wsl.exe", "-d", "Ubuntu", "--", "python3", "-u", "-c", bootstrap,
              str(len(source)), "--root", root],
-            input=source,
-            check=False,
-            capture_output=True,
-            timeout=10,
+            input=source, check=False, capture_output=True, timeout=10,
         )
-        assert result.stdout.startswith(b"G SCPFS-WATCH 1\n"), (
+        assert result.stdout.startswith(
+                b"G SCPFS-WATCH 2 " + root.encode().hex().encode() + b"\n"), (
             f"stdout={result.stdout!r} stderr={result.stderr!r} exit={result.returncode}"
         )
         assert result.returncode == 0, result.stderr
 
         helper = Helper(helper_script, root)
-        assert helper.recv() == "G SCPFS-WATCH 1"
-        helper.send(f"W 1 F {encode_path('/file.txt')}")
-        assert helper.until_ack(1)[-1] == "A 1 OK"
-        helper.send(f"W 2 D {encode_path('/')}")
-        assert helper.until_ack(2)[-1] == "A 2 OK"
+        assert helper.recv().startswith("G SCPFS-WATCH 2 ")
+        _, reply = request(helper, f"S 1 {encode_path('/file.txt')}", 1)
+        fields = reply[0].split(" ")
+        assert fields[:3] == ["A", "1", "S"] and fields[3] == "f" and fields[5] == "4", reply
+        _, reply = request(helper, f"S 2 {encode_path('/missing.txt')}", 2)
+        assert reply == ["A 2 N"], reply
+        _, reply = request(helper, f"S 3 {encode_path('/nope/child')}", 3)
+        assert reply == ["A 3 E noent"], reply
+        _, reply = request(helper, f"S 4 {encode_path('/link.txt')}", 4)
+        assert reply[0].split(" ")[3] == "l", reply
+        _, reply = request(helper, f"S 5 {encode_path('/file.txt/x')}", 5)
+        assert reply == ["A 5 E notdir"], reply
+        _, reply = request(helper, f"L 6 {encode_path('/')}", 6)
+        names = {bytes.fromhex(line.split(" ")[0]).decode() for line in reply[1:]}
+        assert names == {"file.txt", "link.txt", "sub", "hidden"}, reply
+        _, reply = request(helper, f"L 7 {encode_path('/sub')}", 7)
+        assert len(reply) == 2 and reply[0] == "A 7 L 1", reply
+        helper.send(f"R 30 {encode_path('/sub/inner.txt')} 100")
+        reply_line = helper.recv()
+        assert reply_line.startswith("A 30 D 8 f "), reply_line
+        assert helper.recv() == "payload", "raw content must follow the reply"
+        _, reply = request(helper, f"R 31 {encode_path('/sub/inner.txt')} 0", 31)
+        assert reply == ["A 31 U"], reply  # over the limit
+        _, reply = request(helper, f"R 32 {encode_path('/link.txt')} 100", 32)
+        assert reply == ["A 32 U"], reply  # never follows symlinks
+        _, reply = request(helper, "F 8", 8)
+        fields = reply[0].split(" ")
+        assert fields[2] == "F" and int(fields[3]) >= int(fields[4]) > 0, reply
 
-        # A file access is not necessarily an atime change. Put the timestamp
-        # safely in the future (which suppresses relatime updates), drain the
-        # timestamp mutation itself, then prove a normal read leaves atime
-        # unchanged before asserting that it emits no metadata event.
-        wsl("python3", "-c",
-            "import os,sys,time; p=sys.argv[1]; st=os.stat(p); "
-            "os.utime(p, ns=(time.time_ns()+86400*10**9, st.st_mtime_ns))",
+        # Content change of a listed file: the file itself is named.
+        wsl("python3", "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('changed')",
             f"{root}/file.txt")
-        helper.send("B 20")
-        future_atime_events = helper.until_ack(20)
-        assert any(line == "E 2" for line in future_atime_events), future_atime_events
-        read_result = wsl("python3", "-c",
-            "import os,sys; p=sys.argv[1]; before=os.stat(p).st_atime_ns; "
-            "open(p,'rb').read(1); after=os.stat(p).st_atime_ns; "
-            "print(before, after); assert before == after, "
-            "f'atime changed during ordinary read: {before} -> {after}'",
-            f"{root}/file.txt")
-        assert read_result, "remote read did not report its atime verification"
-        helper.send("B 21")
-        ordinary_read_events = helper.until_ack(21)
-        helper.close()
-        assert not any(line == "E 2" for line in ordinary_read_events), (
-            "ordinary file read emitted a metadata event although the test "
-            f"confirmed atime stayed unchanged: {ordinary_read_events!r}"
-        )
-
-        helper = Helper(helper_script, root)
-        assert helper.recv() == "G SCPFS-WATCH 1"
-        helper.send(f"W 22 F {encode_path('/file.txt')}")
-        assert helper.until_ack(22)[-1] == "A 22 OK"
-        helper.send(f"W 23 D {encode_path('/')}")
-        assert helper.until_ack(23)[-1] == "A 23 OK"
-
-        wsl("python3", "-c",
-            "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text('changed')",
-            f"{root}/file.txt")
-        helper.send("B 3")
-        events = helper.until_ack(3)
-        assert any(line == "E 1" for line in events), events
-
+        events = barrier_events(helper, 10)
+        assert ("C", "/file.txt") in events, events
+        # chmod is metadata only.
         wsl("chmod", "600", f"{root}/file.txt")
-        helper.send("B 4")
-        events = helper.until_ack(4)
-        assert any(line == "E 2" for line in events), events
+        events = barrier_events(helper, 11)
+        assert ("M", "/file.txt") in events and ("C", "/file.txt") not in events, events
+        # A plain read (atime unchanged or not) reports nothing.
+        wsl("cat", f"{root}/file.txt")
+        events = barrier_events(helper, 12)
+        assert not events, events
+        # Creation in a covered directory clears a cached "absent".
+        wsl("touch", f"{root}/missing.txt")
+        events = barrier_events(helper, 13)
+        assert ("C", "/missing.txt") in events, events
+        # Changes in a directory never stat'ed or listed are not reported.
+        wsl("touch", f"{root}/hidden/unseen.txt")
+        events = barrier_events(helper, 14)
+        assert ("C", "/hidden/unseen.txt") not in events, events
+        # Changes inside a listed subdirectory name the child.
+        wsl("python3", "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('yy')",
+            f"{root}/sub/inner.txt")
+        events = barrier_events(helper, 15)
+        assert ("C", "/sub/inner.txt") in events, events
+        # Moving a covered directory loses its subtree; the helper keeps running.
+        wsl("mv", f"{root}/sub", f"{root}/moved")
+        events = barrier_events(helper, 16)
+        assert ("T", "/sub") in events, events
+        wsl("touch", f"{root}/moved/inner.txt")
+        events = barrier_events(helper, 17)
+        assert not any(path.startswith("/sub/") for _, path in events), events
+        _, reply = request(helper, f"S 18 {encode_path('/sub/inner.txt')}", 18)
+        assert reply == ["A 18 E noent"], reply
+        # Hard links: a change through an unwatched alias is still reported.
+        wsl("ln", f"{root}/file.txt", f"{root}/hidden/alias.txt")
+        barrier_events(helper, 19)
+        _, reply = request(helper, f"S 20 {encode_path('/file.txt')}", 20)
+        assert reply[0].split(" ")[2] == "S", reply
+        wsl("python3", "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('via alias')",
+            f"{root}/hidden/alias.txt")
+        events = barrier_events(helper, 21)
+        assert ("C", "/file.txt") in events, events
+        # Deleting a watched file does not take the helper down.
+        wsl("rm", f"{root}/file.txt")
+        events = barrier_events(helper, 22)
+        assert ("C", "/file.txt") in events, events
+        _, reply = request(helper, f"S 23 {encode_path('/file.txt')}", 23)
+        assert reply == ["A 23 N"], reply
 
-        # Restore an access timestamp without opening the file for writing.
-        # This must invalidate metadata, not discard all reusable payloads.
-        wsl("touch", "-c", "-a", "-d", "@101", f"{root}/file.txt")
-        helper.send("B 40")
-        events = helper.until_ack(40)
-        assert "E 2" in events and "E 1" not in events, events
+        # Mutations: write (new, replace, conflict), setmeta, mkdir, rename, remove.
+        def put(request_id: int, path: str, data: bytes, expect: str) -> list[str]:
+            assert helper.process.stdin is not None
+            helper.process.stdin.write(
+                f"P {request_id} {encode_path(path)} {len(data)} {expect} "
+                f"1600000000000000000 1600000001000000000\n".encode() + data)
+            helper.process.stdin.flush()
+            return request(helper, f"B {request_id + 1000}", request_id + 1000)[0]
 
-        wsl("ln", f"{root}/file.txt", f"{root}/old-hardlink.txt")
-        helper.send("B 5")
-        hardlink_events = helper.until_ack(5)
-        assert any(line == "E 1" for line in hardlink_events), hardlink_events
-        wsl("python3", "-c",
-            "import os,pathlib,sys; p=pathlib.Path(sys.argv[1]); q=p.with_suffix('.new'); "
-            "q.write_text('replacement'); os.replace(q,p)",
-            f"{root}/file.txt")
-        rename_events = []
-        try:
-            helper.send(f"W 6 F {encode_path('/file.txt')}")
-        except OSError:
-            # The replacement event may already have failed the monitor closed.
-            pass
-        while True:
-            try:
-                event = helper.recv(timeout=1)
-            except queue.Empty:
-                if helper.process.poll() is not None:
-                    break
-                continue
-            except RuntimeError as error:
-                rename_events.append(f"EXIT {error}")
-                break
-            rename_events.append(event)
-            if event.startswith("X "):
-                break
-        assert not any(event == "A 6 OK" for event in rename_events), rename_events
-        assert any(event.startswith("X ") or event.startswith("EXIT ")
-                   for event in rename_events), rename_events
-        helper.close()
-
-        helper = Helper(helper_script, root)
-        assert helper.recv() == "G SCPFS-WATCH 1"
-        helper.send(f"W 7 F {encode_path('/file.txt')}")
-        assert helper.until_ack(7)[-1] == "A 7 OK"
-        wsl("mkdir", f"{root}/aliases")
-        wsl("ln", f"{root}/file.txt", f"{root}/aliases/hardlink.txt")
-        wsl("python3", "-c",
-            "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text()+'external')",
-            f"{root}/aliases/hardlink.txt")
-        helper.send("B 8")
-        events = helper.until_ack(8)
-        assert any(line == "E 1" for line in events), events
-        wsl("python3", "-c",
-            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('new')",
-            f"{root}/fresh.txt")
-        helper.send("B 9")
-        events = helper.until_ack(9)
-        assert any(line == "E 1" for line in events), events
-        wsl("mv", f"{root}/fresh.txt", f"{root}/final.txt")
-        helper.send("B 10")
-        events = helper.until_ack(10)
-        assert any(line == "E 1" for line in events), events
-        wsl("rm", f"{root}/final.txt")
-        helper.send("B 11")
-        events = helper.until_ack(11)
-        assert any(line == "E 1" for line in events), events
-        helper.send(f"W 12 F {encode_path('/link.txt')}")
-        response = helper.until_ack(12)
-        assert response[-1] == "A 12 UNSUPPORTED", response
+        events = put(40, "/made.txt", b"new content", "-")
+        reply = next(line for line in events if line.startswith("A 40 "))
+        fields = reply.split(" ")
+        assert fields[2] == "S" and fields[3] == "f" and fields[5] == "11", reply
+        assert fields[7] == "1600000001000000000", reply
+        made = wsl("python3", "-c", "import os,sys; s=os.stat(sys.argv[1]); "
+                   "print(open(sys.argv[1]).read(), oct(s.st_mode & 0o777))", f"{root}/made.txt")
+        assert made.startswith("new content"), made
+        events = put(41, "/made.txt", b"again", "-")
+        assert any(line == "A 41 E exists" for line in events), events
+        dev, ino = fields[8], fields[9]
+        mode_octal = fields[4]
+        expect = f"{dev}:{ino}:11:1600000001000000000:{int(mode_octal, 8)}"
+        events = put(42, "/made.txt", b"replaced!", expect)
+        reply = next(line for line in events if line.startswith("A 42 "))
+        assert reply.split(" ")[2] == "S" and reply.split(" ")[5] == "9", reply
+        events = put(43, "/made.txt", b"stale", expect)  # inode/size changed since
+        assert any(line == "A 43 E conflict" for line in events), events
+        assert wsl("cat", f"{root}/made.txt") == "replaced!"
+        _, reply = request(helper, f"M 44 {encode_path('/made.txt')} 5 600 0 1500000000000000000", 44)
+        fields = reply[0].split(" ")
+        assert fields[2] == "S" and fields[4] == "600" and fields[7] == "1500000000000000000", reply
+        _, reply = request(helper, f"K 45 {encode_path('/newdir')} 750", 45)
+        assert reply[0].split(" ")[3:5] == ["d", "750"], reply
+        _, reply = request(helper, f"K 46 {encode_path('/newdir')} 750", 46)
+        assert reply == ["A 46 E exists"], reply
+        _, reply = request(helper, f"N 47 {encode_path('/made.txt')} {encode_path('/newdir/moved.txt')} 0", 47)
+        assert reply == ["A 47 OK"], reply
+        wsl("touch", f"{root}/blocker.txt")
+        _, reply = request(helper, f"N 48 {encode_path('/newdir/moved.txt')} {encode_path('/blocker.txt')} 0", 48)
+        assert reply == ["A 48 E exists"], reply
+        _, reply = request(helper, f"N 49 {encode_path('/newdir/moved.txt')} {encode_path('/blocker.txt')} 1", 49)
+        assert reply == ["A 49 OK"], reply
+        assert wsl("cat", f"{root}/blocker.txt") == "replaced!"
+        _, reply = request(helper, f"X 50 {encode_path('/newdir')} F", 50)
+        assert reply == ["A 50 E isdir"], reply
+        wsl("touch", f"{root}/newdir/keep")
+        _, reply = request(helper, f"X 51 {encode_path('/newdir')} D", 51)
+        assert reply == ["A 51 E notempty"], reply
+        wsl("rm", f"{root}/newdir/keep")
+        _, reply = request(helper, f"X 52 {encode_path('/newdir')} D", 52)
+        assert reply == ["A 52 OK"], reply
+        _, reply = request(helper, f"X 53 {encode_path('/link.txt')} F", 53)
+        assert reply == ["A 53 E reparse"], reply
         helper.close()
 
         malformed = Helper(helper_script, root)
-        assert malformed.recv() == "G SCPFS-WATCH 1"
+        assert malformed.recv().startswith("G SCPFS-WATCH 2 ")
         malformed.send("not-a-frame")
         assert malformed.recv().startswith("X invalid-frame"), "malformed frame was accepted"
         malformed.process.wait(timeout=5)
         malformed.close()
 
         overflow = Helper(helper_script, root, test_mode=True)
-        assert overflow.recv() == "G SCPFS-WATCH 1"
+        assert overflow.recv().startswith("G SCPFS-WATCH 2 ")
         overflow.send("T OVERFLOW")
         assert overflow.recv() == "X overflow", "test overflow did not fail closed"
         overflow.process.wait(timeout=5)
@@ -384,7 +312,9 @@ def main() -> int:
         unsupported.close()
     finally:
         wsl("python3", "-c", "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)", root)
-    print("PASS: embedded bootstrap, unchanged-atime access suppression, acknowledged coverage, metadata/content masks, rename/delete, unsupported path, malformed frame and overflow fail-closed")
+    print("PASS: bootstrap, stat/list/statfs replies, negative and error answers, "
+          "per-path content/metadata/subtree events, hard links, delete survival, "
+          "malformed frame, overflow and unsupported filesystem")
     return 0
 
 

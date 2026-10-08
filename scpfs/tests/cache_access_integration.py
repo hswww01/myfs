@@ -23,23 +23,6 @@ from cache_integration import (
 from wsl_sshd_fixture import WslSshdFixture
 
 
-def admission_diagnostics(stderr: str) -> dict[str, int]:
-    line = next((entry for entry in stderr.splitlines()
-                 if entry.startswith("SCPFS cache admission diag: ")), None)
-    if line is None:
-        raise AssertionError(f"mount teardown did not emit cache admission diagnostics:\n{stderr}")
-    result = {key: int(value, 0) for key, value in
-              re.findall(r"([a-z_]+)=(0x[0-9a-fA-F]+|\d+)", line)}
-    expected = {
-        "cold_attempt", "cold_put_attempt", "cold_verify_metadata_changed",
-        "cold_atime_mismatch", "warm_candidate", "warm_metadata_stale",
-        "warm_metadata_changed", "provenance_mask",
-    }
-    if not expected.issubset(result):
-        raise AssertionError(f"unexpected cache admission diagnostic schema: {line!r}")
-    return result
-
-
 def find_session_directory(temp_dir: Path, process: subprocess.Popen,
                            timeout: float = 15) -> Path:
     deadline = time.monotonic() + timeout
@@ -131,7 +114,6 @@ def main() -> int:
     stdout_log = stderr_log = None
     performance: dict[str, object] = {}
     counters: dict[str, int] = {}
-    diagnostics: dict[str, int] = {}
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateEventW.restype = wintypes.HANDLE
     kernel32.CreateEventW.argtypes = [
@@ -337,29 +319,16 @@ def main() -> int:
                 kernel32.CloseHandle(stop_handle)
             if mounted:
                 counters = cache_counters(stderr_text)
-                diagnostics = admission_diagnostics(stderr_text)
                 performance["cache_counters"] = counters
-                performance["cache_admission_diagnostics"] = diagnostics
                 (args.build_dir / "cache-access-results.json").write_text(
                     json.dumps(performance, indent=2) + "\n", encoding="utf-8")
                 if completed:
                     if counters["payload_hit"] < 15:
                         raise AssertionError(f"target did not record enough warm payload hits: {counters}")
-                    if diagnostics["warm_candidate"] < 20:
-                        raise AssertionError(f"warm payload candidates were not observed: {diagnostics}")
-                    if diagnostics["warm_metadata_stale"] > 2:
-                        raise AssertionError(
-                            "unrelated stable-atime B reads churned target metadata admission: "
-                            f"{diagnostics}"
-                        )
-                    if diagnostics["warm_metadata_changed"] > 2:
-                        raise AssertionError(
-                            f"warm target validation raced metadata changes: {diagnostics}"
-                        )
 
     print(
         f"PASS: {drive} kept a warm target payload during {performance.get('background_remote_reads')} "
-        f"owned WSL reads; counters={counters}; admission={diagnostics}"
+        f"owned WSL reads; counters={counters}"
     )
     return 0
 

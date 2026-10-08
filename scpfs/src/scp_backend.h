@@ -107,6 +107,11 @@ void scp_backend_watch_stream_close(SCPFS_WATCH_STREAM *stream);
 NTSTATUS scp_backend_watch_stream_wait(SCPFS_WATCH_STREAM *stream,
 	HANDLE wake_event, HANDLE stop_event, DWORD timeout_ms, bool *readable);
 
+/* Converts one remote UTF-8 directory entry name exactly as listing does;
+ * STATUS_OBJECT_NAME_INVALID when Windows cannot represent it. */
+NTSTATUS scp_backend_decode_name(const char *utf8, size_t length,
+	WCHAR **name_out, size_t *name_length_out);
+
 NTSTATUS scp_backend_stat(SCPFS_BACKEND *backend, PCWSTR path,
 	SCPFS_REMOTE_STAT *stat_out);
 /* Capacity and space available to the account on the remote root's file system. */

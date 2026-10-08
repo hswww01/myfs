@@ -164,7 +164,8 @@ def cache_counters(stderr: str) -> dict[str, int]:
     result = {key: int(value) for key, value in pairs}
     expected = {
         "stat_hit", "stat_miss", "list_hit", "list_miss", "payload_hit",
-        "payload_miss", "evictions", "invalidations", "monitor_bypass",
+        "payload_miss", "evictions", "invalidations", "rejected_puts",
+        "watch_fallbacks",
     }
     if not expected.issubset(result):
         raise AssertionError(f"unexpected cache counter schema: {line!r}")

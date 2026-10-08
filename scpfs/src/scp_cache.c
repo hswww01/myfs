@@ -6,7 +6,6 @@
 #include <string.h>
 #include <wchar.h>
 
-
 typedef enum SCPFS_CACHE_KIND {
 	SCPFS_CACHE_STAT,
 	SCPFS_CACHE_LIST,
@@ -21,32 +20,45 @@ typedef struct SCPFS_CACHE_ENTRY {
 	SCPFS_CACHE_KIND kind;
 	WCHAR *path;
 	size_t metadata_bytes;
-	uint64_t metadata_epoch;
-	uint64_t content_epoch;
 	union {
-		SCPFS_REMOTE_STAT stat;
+		struct {
+			bool absent;
+			SCPFS_REMOTE_STAT stat;
+		} stat;
 		SCPFS_DIR_LIST list;
 		struct {
 			WCHAR *path;
 			SCPFS_REMOTE_STAT provenance;
-			size_t size;
-	} payload;
+			uint64_t size;
+		} payload;
 	} value;
 } SCPFS_CACHE_ENTRY;
 
 /* Power of two; the metadata limit keeps chains short. */
-#define SCPFS_CACHE_BUCKETS 8192u
+#define SCPFS_CACHE_BUCKETS 65536u
+/* Recent invalidations remembered for put admission. */
+#define SCPFS_CACHE_RING 1024u
+#define SCPFS_CACHE_COPY_CHUNK (1024u * 1024u)
+
+typedef struct SCPFS_CACHE_CHANGE {
+	uint64_t sequence;
+	WCHAR *path;
+} SCPFS_CACHE_CHANGE;
 
 struct SCPFS_CACHE {
+	SRWLOCK lock;
 	WCHAR *session_directory;
-	SCPFS_CACHE_ENTRY *buckets[SCPFS_CACHE_BUCKETS];
+	SCPFS_CACHE_ENTRY **buckets;
 	SCPFS_CACHE_ENTRY *most_recent;
 	SCPFS_CACHE_ENTRY *least_recent;
 	size_t metadata_bytes;
 	uint32_t metadata_entries;
 	uint64_t payload_max_bytes;
 	uint64_t payload_bytes;
-	uint32_t filename_counter;
+	uint64_t sequence;
+	/* Puts observed before floor predate an invalidate_all. */
+	uint64_t floor;
+	SCPFS_CACHE_CHANGE ring[SCPFS_CACHE_RING];
 	SCPFS_CACHE_COUNTERS counters;
 };
 
@@ -65,28 +77,36 @@ static WCHAR *scp_cache_wcsdup(PCWSTR text)
 	return copy;
 }
 
-static bool scp_cache_path(SCPFS_CACHE *cache, PCWSTR leaf, WCHAR **path_out)
+/* True when ancestor is path itself or one of its ancestor directories. */
+static bool scp_cache_is_ancestor(PCWSTR ancestor, PCWSTR path)
 {
-	size_t directory_length;
-	size_t leaf_length;
-	WCHAR *path;
-	if (cache == NULL || leaf == NULL || path_out == NULL)
-		return false;
-	*path_out = NULL;
-	directory_length = wcslen(cache->session_directory);
-	leaf_length = wcslen(leaf);
-	if (directory_length > SIZE_MAX - leaf_length - 2u ||
-		(directory_length + leaf_length + 2u) > SIZE_MAX / sizeof(WCHAR))
-		return false;
-	path = (WCHAR *)malloc((directory_length + leaf_length + 2u) * sizeof(WCHAR));
-	if (path == NULL)
-		return false;
-	memcpy(path, cache->session_directory, directory_length * sizeof(WCHAR));
-	if (directory_length != 0 && cache->session_directory[directory_length - 1u] != L'\\')
-		path[directory_length++] = L'\\';
-	memcpy(path + directory_length, leaf, (leaf_length + 1u) * sizeof(WCHAR));
-	*path_out = path;
-	return true;
+	size_t length = wcslen(ancestor);
+	if (length == 1u && ancestor[0] == L'\\')
+		return true;
+	return wcsncmp(ancestor, path, length) == 0 &&
+		(path[length] == L'\0' || path[length] == L'\\');
+}
+
+static bool scp_cache_related(PCWSTR left, PCWSTR right)
+{
+	return scp_cache_is_ancestor(left, right) || scp_cache_is_ancestor(right, left);
+}
+
+/* Returns the parent of path in buffer, or NULL for the root. */
+static WCHAR *scp_cache_parent(PCWSTR path)
+{
+	PCWSTR separator = wcsrchr(path, L'\\');
+	size_t length;
+	WCHAR *parent;
+	if (separator == NULL || (separator == path && path[1] == L'\0'))
+		return NULL;
+	length = separator == path ? 1u : (size_t)(separator - path);
+	parent = (WCHAR *)malloc((length + 1u) * sizeof(WCHAR));
+	if (parent == NULL)
+		return NULL;
+	memcpy(parent, path, length * sizeof(WCHAR));
+	parent[length] = L'\0';
+	return parent;
 }
 
 static void scp_cache_free_list(SCPFS_DIR_LIST *list)
@@ -204,17 +224,6 @@ static void scp_cache_touch(SCPFS_CACHE *cache, SCPFS_CACHE_ENTRY *entry)
 	scp_cache_link_recent(cache, entry);
 }
 
-/* Indexes a fully initialized entry (kind and path set) and makes it most recent. */
-static void scp_cache_insert(SCPFS_CACHE *cache, SCPFS_CACHE_ENTRY *entry)
-{
-	SCPFS_CACHE_ENTRY **bucket;
-	entry->hash = scp_cache_hash(entry->kind, entry->path);
-	bucket = &cache->buckets[entry->hash & (SCPFS_CACHE_BUCKETS - 1u)];
-	entry->bucket_next = *bucket;
-	*bucket = entry;
-	scp_cache_link_recent(cache, entry);
-}
-
 static void scp_cache_remove_entry(SCPFS_CACHE *cache,
 	SCPFS_CACHE_ENTRY *entry, bool eviction)
 {
@@ -225,31 +234,20 @@ static void scp_cache_remove_entry(SCPFS_CACHE *cache,
 		*link = entry->bucket_next;
 	scp_cache_unlink(cache, entry);
 	if (entry->kind == SCPFS_CACHE_PAYLOAD) {
-		if (cache->payload_bytes >= entry->value.payload.size)
-			cache->payload_bytes -= entry->value.payload.size;
-		else
-			cache->payload_bytes = 0;
+		cache->payload_bytes -= entry->value.payload.size <= cache->payload_bytes ?
+			entry->value.payload.size : cache->payload_bytes;
 		if (entry->value.payload.path != NULL) {
 			SetFileAttributesW(entry->value.payload.path, FILE_ATTRIBUTE_NORMAL);
 			DeleteFileW(entry->value.payload.path);
 			free(entry->value.payload.path);
 		}
-		if (cache->metadata_bytes >= entry->metadata_bytes)
-			cache->metadata_bytes -= entry->metadata_bytes;
-		else
-			cache->metadata_bytes = 0;
-		if (cache->metadata_entries != 0)
-			cache->metadata_entries--;
-	} else {
-		if (cache->metadata_bytes >= entry->metadata_bytes)
-			cache->metadata_bytes -= entry->metadata_bytes;
-		else
-			cache->metadata_bytes = 0;
-		if (cache->metadata_entries != 0)
-			cache->metadata_entries--;
-		if (entry->kind == SCPFS_CACHE_LIST)
-			scp_cache_free_list(&entry->value.list);
+	} else if (entry->kind == SCPFS_CACHE_LIST) {
+		scp_cache_free_list(&entry->value.list);
 	}
+	cache->metadata_bytes -= entry->metadata_bytes <= cache->metadata_bytes ?
+		entry->metadata_bytes : cache->metadata_bytes;
+	if (cache->metadata_entries != 0)
+		cache->metadata_entries--;
 	free(entry->path);
 	free(entry);
 	if (eviction)
@@ -257,50 +255,23 @@ static void scp_cache_remove_entry(SCPFS_CACHE *cache,
 }
 
 static void scp_cache_remove_key(SCPFS_CACHE *cache,
-	SCPFS_CACHE_KIND kind, PCWSTR path, bool eviction)
+	SCPFS_CACHE_KIND kind, PCWSTR path)
 {
 	SCPFS_CACHE_ENTRY *entry = scp_cache_find(cache, kind, path);
 	if (entry != NULL)
-		scp_cache_remove_entry(cache, entry, eviction);
+		scp_cache_remove_entry(cache, entry, false);
 }
 
-static void scp_cache_trim_metadata(SCPFS_CACHE *cache)
-{
-	SCPFS_CACHE_ENTRY *entry;
-	while (cache->metadata_bytes > SCPFS_CACHE_METADATA_LIMIT_BYTES ||
-		cache->metadata_entries > SCPFS_CACHE_METADATA_LIMIT_ENTRIES) {
-		entry = cache->least_recent;
-		if (entry == NULL)
-			break;
-		scp_cache_remove_entry(cache, entry, true);
-	}
-}
-
-static void scp_cache_trim_payload(SCPFS_CACHE *cache)
-{
-	SCPFS_CACHE_ENTRY *entry;
-	while (cache->payload_bytes > cache->payload_max_bytes) {
-		for (entry = cache->least_recent; entry != NULL; entry = entry->previous) {
-			if (entry->kind == SCPFS_CACHE_PAYLOAD)
-				break;
-		}
-		if (entry == NULL)
-			break;
-		scp_cache_remove_entry(cache, entry, true);
-	}
-}
-
+/* Makes room for one more entry of the given size; false if it never fits. */
 static bool scp_cache_reserve_metadata(SCPFS_CACHE *cache, size_t bytes)
 {
-	SCPFS_CACHE_ENTRY *entry;
 	if (bytes > SCPFS_CACHE_METADATA_LIMIT_BYTES)
 		return false;
 	while (cache->metadata_bytes > SCPFS_CACHE_METADATA_LIMIT_BYTES - bytes ||
 		cache->metadata_entries >= SCPFS_CACHE_METADATA_LIMIT_ENTRIES) {
-		entry = cache->least_recent;
-		if (entry == NULL)
+		if (cache->least_recent == NULL)
 			return false;
-		scp_cache_remove_entry(cache, entry, true);
+		scp_cache_remove_entry(cache, cache->least_recent, true);
 	}
 	return true;
 }
@@ -322,6 +293,75 @@ static bool scp_cache_reserve_payload(SCPFS_CACHE *cache, uint64_t bytes)
 	return true;
 }
 
+/* Allocates, indexes and accounts a new entry for (kind, path), replacing
+ * any previous one. extra_bytes is the value's own heap footprint. */
+static SCPFS_CACHE_ENTRY *scp_cache_new_entry(SCPFS_CACHE *cache,
+	SCPFS_CACHE_KIND kind, PCWSTR path, size_t extra_bytes)
+{
+	SCPFS_CACHE_ENTRY *entry;
+	SCPFS_CACHE_ENTRY **bucket;
+	size_t path_length = wcslen(path);
+	size_t bytes;
+	if (path_length > SIZE_MAX / sizeof(WCHAR) - 1u)
+		return NULL;
+	bytes = sizeof(*entry) + (path_length + 1u) * sizeof(WCHAR);
+	if (extra_bytes > SIZE_MAX - bytes)
+		return NULL;
+	bytes += extra_bytes;
+	scp_cache_remove_key(cache, kind, path);
+	if (!scp_cache_reserve_metadata(cache, bytes))
+		return NULL;
+	entry = (SCPFS_CACHE_ENTRY *)calloc(1, sizeof(*entry));
+	if (entry == NULL)
+		return NULL;
+	entry->path = scp_cache_wcsdup(path);
+	if (entry->path == NULL) {
+		free(entry);
+		return NULL;
+	}
+	entry->kind = kind;
+	entry->metadata_bytes = bytes;
+	entry->hash = scp_cache_hash(kind, path);
+	bucket = &cache->buckets[entry->hash & (SCPFS_CACHE_BUCKETS - 1u)];
+	entry->bucket_next = *bucket;
+	*bucket = entry;
+	scp_cache_link_recent(cache, entry);
+	cache->metadata_bytes += bytes;
+	cache->metadata_entries++;
+	return entry;
+}
+
+/* Lock held. A put is admissible unless a related path changed after it was observed. */
+static bool scp_cache_admissible(SCPFS_CACHE *cache, PCWSTR path, uint64_t sequence)
+{
+	uint64_t change;
+	if (sequence < cache->floor || sequence > cache->sequence ||
+		cache->sequence - sequence >= SCPFS_CACHE_RING)
+		goto reject;
+	for (change = sequence + 1u; change <= cache->sequence; change++) {
+		const SCPFS_CACHE_CHANGE *slot = &cache->ring[change % SCPFS_CACHE_RING];
+		if (slot->sequence != change || slot->path == NULL ||
+			scp_cache_related(slot->path, path))
+			goto reject;
+	}
+	return true;
+reject:
+	cache->counters.rejected_puts++;
+	return false;
+}
+
+static void scp_cache_record_change(SCPFS_CACHE *cache, PCWSTR path)
+{
+	SCPFS_CACHE_CHANGE *slot;
+	cache->sequence++;
+	slot = &cache->ring[cache->sequence % SCPFS_CACHE_RING];
+	free(slot->path);
+	slot->sequence = cache->sequence;
+	slot->path = scp_cache_wcsdup(path);
+	if (slot->path == NULL)
+		cache->floor = cache->sequence;
+}
+
 NTSTATUS scp_cache_create(PCWSTR session_directory, uint32_t max_payload_mib,
 	SCPFS_CACHE **cache_out)
 {
@@ -336,8 +376,13 @@ NTSTATUS scp_cache_create(PCWSTR session_directory, uint32_t max_payload_mib,
 	cache = (SCPFS_CACHE *)calloc(1, sizeof(*cache));
 	if (cache == NULL)
 		return STATUS_NO_MEMORY;
+	InitializeSRWLock(&cache->lock);
+	cache->buckets = (SCPFS_CACHE_ENTRY **)calloc(SCPFS_CACHE_BUCKETS,
+		sizeof(*cache->buckets));
 	cache->session_directory = scp_cache_wcsdup(session_directory);
-	if (cache->session_directory == NULL) {
+	if (cache->buckets == NULL || cache->session_directory == NULL) {
+		free(cache->buckets);
+		free(cache->session_directory);
 		free(cache);
 		return STATUS_NO_MEMORY;
 	}
@@ -349,372 +394,346 @@ NTSTATUS scp_cache_create(PCWSTR session_directory, uint32_t max_payload_mib,
 
 void scp_cache_destroy(SCPFS_CACHE *cache)
 {
+	size_t index;
 	if (cache == NULL)
 		return;
 	while (cache->most_recent != NULL)
 		scp_cache_remove_entry(cache, cache->most_recent, false);
+	for (index = 0; index < SCPFS_CACHE_RING; index++)
+		free(cache->ring[index].path);
+	free(cache->buckets);
 	free(cache->session_directory);
 	free(cache);
 }
 
-bool scp_cache_get_stat(SCPFS_CACHE *cache, PCWSTR path,
-	uint64_t metadata_epoch, uint64_t content_epoch,
+uint64_t scp_cache_sequence(SCPFS_CACHE *cache)
+{
+	uint64_t sequence;
+	if (cache == NULL)
+		return 0;
+	AcquireSRWLockExclusive(&cache->lock);
+	sequence = cache->sequence;
+	ReleaseSRWLockExclusive(&cache->lock);
+	return sequence;
+}
+
+SCPFS_CACHE_LOOKUP scp_cache_get_stat(SCPFS_CACHE *cache, PCWSTR path,
 	SCPFS_REMOTE_STAT *stat_out)
 {
 	SCPFS_CACHE_ENTRY *entry;
+	SCPFS_CACHE_LOOKUP result = SCPFS_CACHE_MISS;
 	if (cache == NULL || path == NULL || stat_out == NULL)
-		return false;
+		return SCPFS_CACHE_MISS;
+	AcquireSRWLockExclusive(&cache->lock);
 	entry = scp_cache_find(cache, SCPFS_CACHE_STAT, path);
-	if (entry != NULL && (entry->metadata_epoch != metadata_epoch ||
-		entry->content_epoch != content_epoch)) {
-		scp_cache_remove_entry(cache, entry, true);
-		entry = NULL;
-	}
 	if (entry == NULL) {
 		cache->counters.stat_miss++;
-		return false;
+	} else {
+		cache->counters.stat_hit++;
+		scp_cache_touch(cache, entry);
+		if (entry->value.stat.absent) {
+			result = SCPFS_CACHE_ABSENT;
+		} else {
+			*stat_out = entry->value.stat.stat;
+			result = SCPFS_CACHE_PRESENT;
+		}
 	}
-	*stat_out = entry->value.stat;
-	cache->counters.stat_hit++;
-	scp_cache_touch(cache, entry);
-	return true;
+	ReleaseSRWLockExclusive(&cache->lock);
+	return result;
+}
+
+static void scp_cache_put_stat_locked(SCPFS_CACHE *cache, PCWSTR path,
+	const SCPFS_REMOTE_STAT *stat)
+{
+	SCPFS_CACHE_ENTRY *entry = scp_cache_new_entry(cache, SCPFS_CACHE_STAT, path, 0);
+	if (entry == NULL)
+		return;
+	entry->value.stat.absent = stat == NULL;
+	if (stat != NULL)
+		entry->value.stat.stat = *stat;
 }
 
 void scp_cache_put_stat(SCPFS_CACHE *cache, PCWSTR path,
-	const SCPFS_REMOTE_STAT *stat, uint64_t metadata_epoch,
-	uint64_t content_epoch)
+	const SCPFS_REMOTE_STAT *stat, uint64_t sequence)
 {
-	SCPFS_CACHE_ENTRY *entry;
-	size_t path_bytes;
-	if (cache == NULL || path == NULL || stat == NULL)
+	if (cache == NULL || path == NULL)
 		return;
-	if (wcslen(path) > SIZE_MAX / sizeof(WCHAR) - 1u)
-		return;
-	path_bytes = (wcslen(path) + 1u) * sizeof(WCHAR);
-	if (path_bytes > SIZE_MAX - sizeof(*entry))
-		return;
-	scp_cache_remove_key(cache, SCPFS_CACHE_STAT, path, false);
-	entry = (SCPFS_CACHE_ENTRY *)calloc(1, sizeof(*entry));
-	if (entry == NULL)
-		return;
-	entry->path = scp_cache_wcsdup(path);
-	if (entry->path == NULL) {
-		free(entry);
-		return;
-	}
-	entry->kind = SCPFS_CACHE_STAT;
-	entry->metadata_epoch = metadata_epoch;
-	entry->content_epoch = content_epoch;
-	entry->value.stat = *stat;
-	entry->metadata_bytes = sizeof(*entry) + path_bytes;
-	cache->metadata_bytes += entry->metadata_bytes;
-	cache->metadata_entries++;
-	scp_cache_insert(cache, entry);
-	scp_cache_trim_metadata(cache);
+	AcquireSRWLockExclusive(&cache->lock);
+	if (scp_cache_admissible(cache, path, sequence))
+		scp_cache_put_stat_locked(cache, path, stat);
+	ReleaseSRWLockExclusive(&cache->lock);
 }
 
 bool scp_cache_get_list(SCPFS_CACHE *cache, PCWSTR path,
-	uint64_t metadata_epoch, uint64_t content_epoch,
 	SCPFS_DIR_LIST *list_out)
 {
 	SCPFS_CACHE_ENTRY *entry;
+	bool hit = false;
 	if (cache == NULL || path == NULL || list_out == NULL)
 		return false;
 	memset(list_out, 0, sizeof(*list_out));
+	AcquireSRWLockExclusive(&cache->lock);
 	entry = scp_cache_find(cache, SCPFS_CACHE_LIST, path);
-	if (entry != NULL && (entry->metadata_epoch != metadata_epoch ||
-		entry->content_epoch != content_epoch)) {
-		scp_cache_remove_entry(cache, entry, true);
-		entry = NULL;
-	}
-	if (entry == NULL || !scp_cache_clone_list(&entry->value.list, list_out)) {
+	if (entry != NULL && scp_cache_clone_list(&entry->value.list, list_out)) {
+		hit = true;
+		cache->counters.list_hit++;
+		scp_cache_touch(cache, entry);
+	} else {
 		cache->counters.list_miss++;
-		return false;
 	}
-	cache->counters.list_hit++;
-	scp_cache_touch(cache, entry);
-	return true;
+	ReleaseSRWLockExclusive(&cache->lock);
+	return hit;
 }
 
 void scp_cache_put_list(SCPFS_CACHE *cache, PCWSTR path,
-	const SCPFS_DIR_LIST *list, uint64_t metadata_epoch,
-	uint64_t content_epoch)
+	const SCPFS_DIR_LIST *list, uint64_t sequence)
 {
 	SCPFS_CACHE_ENTRY *entry;
-	size_t path_bytes;
 	size_t list_bytes;
-	if (cache == NULL || path == NULL || list == NULL)
-		return;
-	if (wcslen(path) > SIZE_MAX / sizeof(WCHAR) - 1u ||
+	size_t path_length;
+	size_t index;
+	WCHAR *child;
+	if (cache == NULL || path == NULL || list == NULL ||
 		!scp_cache_list_size(list, &list_bytes))
 		return;
-	path_bytes = (wcslen(path) + 1u) * sizeof(WCHAR);
-	if (list_bytes > SIZE_MAX - sizeof(*entry) ||
-		path_bytes > SIZE_MAX - sizeof(*entry) - list_bytes)
-		return;
-	if (sizeof(*entry) + list_bytes + path_bytes > SCPFS_CACHE_METADATA_LIMIT_BYTES)
-		return;
-	scp_cache_remove_key(cache, SCPFS_CACHE_LIST, path, false);
-	entry = (SCPFS_CACHE_ENTRY *)calloc(1, sizeof(*entry));
-	if (entry == NULL)
-		return;
-	entry->path = scp_cache_wcsdup(path);
-	if (entry->path == NULL || !scp_cache_clone_list(list, &entry->value.list)) {
-		free(entry->path);
-		scp_cache_free_list(&entry->value.list);
-		free(entry);
-		return;
+	path_length = wcslen(path);
+	AcquireSRWLockExclusive(&cache->lock);
+	if (!scp_cache_admissible(cache, path, sequence))
+		goto done;
+	/* Child stats first, so the listing itself is the most recent entry. */
+	for (index = 0; index < list->count; index++) {
+		const SCPFS_DIR_ENTRY *item = &list->entries[index];
+		size_t bytes = (path_length + item->name_length + 2u) * sizeof(WCHAR);
+		child = (WCHAR *)malloc(bytes);
+		if (child == NULL)
+			continue;
+		memcpy(child, path, path_length * sizeof(WCHAR));
+		{
+			size_t used = path_length;
+			if (used == 0 || child[used - 1u] != L'\\')
+				child[used++] = L'\\';
+			memcpy(child + used, item->name, item->name_length * sizeof(WCHAR));
+			child[used + item->name_length] = L'\0';
+		}
+		scp_cache_put_stat_locked(cache, child, &item->stat);
+		free(child);
 	}
-	entry->kind = SCPFS_CACHE_LIST;
-	entry->metadata_epoch = metadata_epoch;
-	entry->content_epoch = content_epoch;
-	entry->metadata_bytes = sizeof(*entry) + path_bytes + list_bytes;
-	cache->metadata_bytes += entry->metadata_bytes;
-	cache->metadata_entries++;
-	scp_cache_insert(cache, entry);
-	scp_cache_trim_metadata(cache);
+	entry = scp_cache_new_entry(cache, SCPFS_CACHE_LIST, path, list_bytes);
+	if (entry != NULL && !scp_cache_clone_list(list, &entry->value.list))
+		scp_cache_remove_entry(cache, entry, false);
+done:
+	ReleaseSRWLockExclusive(&cache->lock);
 }
 
-bool scp_cache_get_payload(SCPFS_CACHE *cache, PCWSTR path,
-	uint64_t metadata_epoch, uint64_t content_epoch,
-	PCWSTR *payload_path_out,
-	SCPFS_REMOTE_STAT *provenance_out, uint64_t *metadata_epoch_out,
-	bool *metadata_stale_out)
-{
-	SCPFS_CACHE_ENTRY *entry;
-	if (payload_path_out != NULL)
-		*payload_path_out = NULL;
-	if (metadata_stale_out != NULL)
-		*metadata_stale_out = false;
-	if (cache == NULL || path == NULL ||
-		payload_path_out == NULL || provenance_out == NULL ||
-		metadata_epoch_out == NULL || metadata_stale_out == NULL)
-		return false;
-	entry = scp_cache_find(cache, SCPFS_CACHE_PAYLOAD, path);
-	if (entry != NULL && entry->content_epoch != content_epoch) {
-		scp_cache_remove_entry(cache, entry, true);
-		entry = NULL;
-	}
-	if (entry == NULL) {
-		cache->counters.payload_miss++;
-		return false;
-	}
-	*payload_path_out = entry->value.payload.path;
-	*provenance_out = entry->value.payload.provenance;
-	*metadata_epoch_out = entry->metadata_epoch;
-	*metadata_stale_out = entry->metadata_epoch != metadata_epoch;
-	scp_cache_touch(cache, entry);
-	return true;
-}
-
-static bool scp_cache_same_payload_provenance(const SCPFS_REMOTE_STAT *left,
+static bool scp_cache_same_payload(const SCPFS_REMOTE_STAT *left,
 	const SCPFS_REMOTE_STAT *right)
 {
 	return left->type == right->type && left->device == right->device &&
 		left->inode == right->inode && left->size == right->size &&
-		left->mtime_ns == right->mtime_ns && left->mode == right->mode &&
-		left->uid == right->uid && left->gid == right->gid &&
-		left->ctime_ns == right->ctime_ns;
+		left->mtime_ns == right->mtime_ns;
 }
 
-bool scp_cache_validate_payload(SCPFS_CACHE *cache, PCWSTR path,
-	const SCPFS_REMOTE_STAT *fresh_stat, uint64_t metadata_epoch)
+static bool scp_cache_copy_handle(HANDLE source, PCWSTR destination)
+{
+	HANDLE target;
+	BYTE *buffer;
+	bool ok = false;
+	target = CreateFileW(destination, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+		FILE_ATTRIBUTE_TEMPORARY, NULL);
+	if (target == INVALID_HANDLE_VALUE)
+		return false;
+	buffer = (BYTE *)malloc(SCPFS_CACHE_COPY_CHUNK);
+	if (buffer != NULL) {
+		for (;;) {
+			DWORD read = 0;
+			DWORD written = 0;
+			if (!ReadFile(source, buffer, SCPFS_CACHE_COPY_CHUNK, &read, NULL))
+				break;
+			if (read == 0) {
+				ok = true;
+				break;
+			}
+			if (!WriteFile(target, buffer, read, &written, NULL) || written != read)
+				break;
+		}
+		free(buffer);
+	}
+	CloseHandle(target);
+	if (!ok)
+		DeleteFileW(destination);
+	return ok;
+}
+
+bool scp_cache_copy_payload(SCPFS_CACHE *cache, PCWSTR path,
+	const SCPFS_REMOTE_STAT *expected, PCWSTR destination)
 {
 	SCPFS_CACHE_ENTRY *entry;
-	if (cache == NULL || path == NULL || fresh_stat == NULL)
+	HANDLE source = INVALID_HANDLE_VALUE;
+	bool copied;
+	if (cache == NULL || path == NULL || expected == NULL || destination == NULL)
 		return false;
+	AcquireSRWLockExclusive(&cache->lock);
 	entry = scp_cache_find(cache, SCPFS_CACHE_PAYLOAD, path);
-	if (entry == NULL)
-		return false;
-	if (!scp_cache_same_payload_provenance(&entry->value.payload.provenance,
-		fresh_stat)) {
+	if (entry != NULL && !scp_cache_same_payload(&entry->value.payload.provenance,
+		expected)) {
 		scp_cache_remove_entry(cache, entry, true);
-		return false;
+		entry = NULL;
 	}
-	entry->metadata_epoch = metadata_epoch;
-	entry->value.payload.provenance = *fresh_stat;
-	scp_cache_touch(cache, entry);
-	return true;
+	if (entry != NULL) {
+		/* Share delete: an invalidation may unlink the file mid-copy. */
+		source = CreateFileW(entry->value.payload.path, GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+			FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+		if (source == INVALID_HANDLE_VALUE)
+			scp_cache_remove_entry(cache, entry, true);
+		else
+			scp_cache_touch(cache, entry);
+	}
+	if (source == INVALID_HANDLE_VALUE)
+		cache->counters.payload_miss++;
+	ReleaseSRWLockExclusive(&cache->lock);
+	if (source == INVALID_HANDLE_VALUE)
+		return false;
+	copied = scp_cache_copy_handle(source, destination);
+	CloseHandle(source);
+	AcquireSRWLockExclusive(&cache->lock);
+	if (copied)
+		cache->counters.payload_hit++;
+	else
+		cache->counters.payload_miss++;
+	ReleaseSRWLockExclusive(&cache->lock);
+	return copied;
 }
 
 void scp_cache_put_payload(SCPFS_CACHE *cache, PCWSTR path,
-	PCWSTR source_path, const SCPFS_REMOTE_STAT *provenance,
-	uint64_t metadata_epoch, uint64_t content_epoch)
+	PCWSTR source_path, const SCPFS_REMOTE_STAT *provenance, uint64_t sequence)
 {
 	SCPFS_CACHE_ENTRY *entry;
 	WCHAR leaf[64];
-	WCHAR *cache_path = NULL;
+	GUID guid;
+	WCHAR guid_text[40];
+	WCHAR *cache_path;
+	size_t directory_length;
+	size_t cache_path_bytes;
 	LARGE_INTEGER size;
-	unsigned int attempt;
 	HANDLE source;
-	size_t key_bytes;
-	size_t payload_path_bytes;
-	size_t entry_metadata_bytes;
-	if (cache == NULL || path == NULL ||
-		source_path == NULL || provenance == NULL ||
-		provenance->size > cache->payload_max_bytes || provenance->size > SIZE_MAX)
+	bool admitted = false;
+	if (cache == NULL || path == NULL || source_path == NULL || provenance == NULL ||
+		provenance->type != SCPFS_REMOTE_FILE ||
+		provenance->size > cache->payload_max_bytes)
 		return;
-	source = CreateFileW(source_path, FILE_READ_ATTRIBUTES,
+	if (FAILED(CoCreateGuid(&guid)) ||
+		StringFromGUID2(&guid, guid_text, _countof(guid_text)) == 0 ||
+		swprintf_s(leaf, _countof(leaf), L"read-%s.cache", guid_text) < 0)
+		return;
+	directory_length = wcslen(cache->session_directory);
+	cache_path_bytes = (directory_length + wcslen(leaf) + 2u) * sizeof(WCHAR);
+	cache_path = (WCHAR *)malloc(cache_path_bytes);
+	if (cache_path == NULL)
+		return;
+	memcpy(cache_path, cache->session_directory, directory_length * sizeof(WCHAR));
+	if (directory_length != 0 && cache_path[directory_length - 1u] != L'\\')
+		cache_path[directory_length++] = L'\\';
+	wcscpy_s(cache_path + directory_length,
+		cache_path_bytes / sizeof(WCHAR) - directory_length, leaf);
+	/* Copy outside the lock; the monitor must never wait on disk I/O. */
+	source = CreateFileW(source_path, GENERIC_READ,
 		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 	if (source == INVALID_HANDLE_VALUE) {
+		free(cache_path);
 		return;
 	}
-	size.QuadPart = -1;
 	if (!GetFileSizeEx(source, &size) || size.QuadPart < 0 ||
-		(uint64_t)size.QuadPart != provenance->size) {
+		(uint64_t)size.QuadPart != provenance->size ||
+		!scp_cache_copy_handle(source, cache_path)) {
 		CloseHandle(source);
+		free(cache_path);
 		return;
 	}
 	CloseHandle(source);
-	scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path, false);
-	for (attempt = 0; attempt < 16u; attempt++) {
-		GUID guid;
-		WCHAR guid_text[40];
-		if (FAILED(CoCreateGuid(&guid)) ||
-			StringFromGUID2(&guid, guid_text, _countof(guid_text)) == 0)
-			return;
-		if (swprintf_s(leaf, _countof(leaf), L"read-%s.cache", guid_text) < 0 ||
-			!scp_cache_path(cache, leaf, &cache_path))
-			return;
-		break;
+	AcquireSRWLockExclusive(&cache->lock);
+	if (scp_cache_admissible(cache, path, sequence)) {
+		scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path);
+		if (scp_cache_reserve_payload(cache, provenance->size)) {
+			entry = scp_cache_new_entry(cache, SCPFS_CACHE_PAYLOAD, path,
+				cache_path_bytes);
+			if (entry != NULL) {
+				entry->value.payload.path = cache_path;
+				entry->value.payload.provenance = *provenance;
+				entry->value.payload.size = provenance->size;
+				cache->payload_bytes += provenance->size;
+				admitted = true;
+			}
+		}
 	}
-	if (cache_path == NULL)
-		return;
-	if (wcslen(path) > SIZE_MAX / sizeof(WCHAR) - 1u ||
-		wcslen(cache_path) > SIZE_MAX / sizeof(WCHAR) - 1u) {
-		free(cache_path);
-		return;
-	}
-	key_bytes = (wcslen(path) + 1u) * sizeof(WCHAR);
-	payload_path_bytes = (wcslen(cache_path) + 1u) * sizeof(WCHAR);
-	if (key_bytes > SIZE_MAX - sizeof(*entry) ||
-		payload_path_bytes > SIZE_MAX - sizeof(*entry) - key_bytes) {
-		free(cache_path);
-		return;
-	}
-	entry_metadata_bytes = sizeof(*entry) + key_bytes + payload_path_bytes;
-	if (!scp_cache_reserve_metadata(cache, entry_metadata_bytes) ||
-		!scp_cache_reserve_payload(cache, provenance->size)) {
-		free(cache_path);
-		return;
-	}
-	entry = (SCPFS_CACHE_ENTRY *)calloc(1, sizeof(*entry));
-	if (entry == NULL) {
-		free(cache_path);
-		return;
-	}
-	entry->path = scp_cache_wcsdup(path);
-	if (entry->path == NULL) {
-		free(cache_path);
-		free(entry);
-		return;
-	}
-	/* Reserve both quotas before copying so a full cache directory never
-	 * transiently exceeds the configured payload bound. */
-	if (!CopyFileW(source_path, cache_path, TRUE)) {
+	ReleaseSRWLockExclusive(&cache->lock);
+	if (!admitted) {
 		SetFileAttributesW(cache_path, FILE_ATTRIBUTE_NORMAL);
 		DeleteFileW(cache_path);
-		free(entry->path);
 		free(cache_path);
-		free(entry);
-		return;
-	}
-	entry->kind = SCPFS_CACHE_PAYLOAD;
-	entry->metadata_epoch = metadata_epoch;
-	entry->content_epoch = content_epoch;
-	entry->value.payload.path = cache_path;
-	entry->value.payload.provenance = *provenance;
-	entry->value.payload.size = (size_t)provenance->size;
-	entry->metadata_bytes = entry_metadata_bytes;
-	cache->payload_bytes += provenance->size;
-	cache->metadata_bytes += entry->metadata_bytes;
-	cache->metadata_entries++;
-	scp_cache_insert(cache, entry);
-	scp_cache_trim_metadata(cache);
-	scp_cache_trim_payload(cache);
-}
-
-void scp_cache_evict_payload(SCPFS_CACHE *cache, PCWSTR path)
-{
-	if (cache != NULL && path != NULL)
-		scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path, true);
-}
-
-void scp_cache_invalidate_metadata(SCPFS_CACHE *cache)
-{
-	SCPFS_CACHE_ENTRY *entry = cache != NULL ? cache->most_recent : NULL;
-	if (cache == NULL)
-		return;
-	cache->counters.invalidations++;
-	while (entry != NULL) {
-		SCPFS_CACHE_ENTRY *next = entry->next;
-		if (entry->kind != SCPFS_CACHE_PAYLOAD)
-			scp_cache_remove_entry(cache, entry, false);
-		entry = next;
 	}
 }
 
-void scp_cache_invalidate_path(SCPFS_CACHE *cache, PCWSTR path)
+void scp_cache_invalidate_path(SCPFS_CACHE *cache, PCWSTR path, unsigned kind)
 {
-	PCWSTR separator;
 	WCHAR *parent;
-	size_t parent_length;
 	if (cache == NULL || path == NULL)
 		return;
+	AcquireSRWLockExclusive(&cache->lock);
 	cache->counters.invalidations++;
-	scp_cache_remove_key(cache, SCPFS_CACHE_STAT, path, false);
-	scp_cache_remove_key(cache, SCPFS_CACHE_LIST, path, false);
-	scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path, false);
-	separator = wcsrchr(path, L'\\');
-	if (separator == NULL)
-		return;
-	parent_length = separator == path ? 1u : (size_t)(separator - path);
-	parent = (WCHAR *)malloc((parent_length + 1u) * sizeof(WCHAR));
-	if (parent == NULL) {
-		scp_cache_invalidate_all(cache);
-		return;
+	scp_cache_record_change(cache, path);
+	scp_cache_remove_key(cache, SCPFS_CACHE_STAT, path);
+	parent = scp_cache_parent(path);
+	if (parent != NULL)
+		scp_cache_remove_key(cache, SCPFS_CACHE_LIST, parent);
+	if (kind & (SCPFS_CACHE_CHANGE_CONTENT | SCPFS_CACHE_CHANGE_SUBTREE)) {
+		scp_cache_remove_key(cache, SCPFS_CACHE_LIST, path);
+		scp_cache_remove_key(cache, SCPFS_CACHE_PAYLOAD, path);
+		if (parent != NULL) {
+			/* The parent's mtime moved, and with it the grandparent listing. */
+			WCHAR *grandparent = scp_cache_parent(parent);
+			scp_cache_remove_key(cache, SCPFS_CACHE_STAT, parent);
+			if (grandparent != NULL)
+				scp_cache_remove_key(cache, SCPFS_CACHE_LIST, grandparent);
+			free(grandparent);
+		}
 	}
-	memcpy(parent, path, parent_length * sizeof(WCHAR));
-	parent[parent_length] = L'\0';
-	scp_cache_remove_key(cache, SCPFS_CACHE_LIST, parent, false);
+	if (kind & SCPFS_CACHE_CHANGE_SUBTREE) {
+		SCPFS_CACHE_ENTRY *entry = cache->most_recent;
+		while (entry != NULL) {
+			SCPFS_CACHE_ENTRY *next = entry->next;
+			if (scp_cache_is_ancestor(path, entry->path))
+				scp_cache_remove_entry(cache, entry, false);
+			entry = next;
+		}
+	}
 	free(parent);
+	ReleaseSRWLockExclusive(&cache->lock);
 }
 
 void scp_cache_invalidate_all(SCPFS_CACHE *cache)
 {
 	if (cache == NULL)
 		return;
+	AcquireSRWLockExclusive(&cache->lock);
 	cache->counters.invalidations++;
+	cache->sequence++;
+	cache->floor = cache->sequence;
 	while (cache->most_recent != NULL)
 		scp_cache_remove_entry(cache, cache->most_recent, false);
+	ReleaseSRWLockExclusive(&cache->lock);
 }
 
-void scp_cache_record_monitor_bypass(SCPFS_CACHE *cache)
-{
-	if (cache != NULL)
-		cache->counters.monitor_bypass++;
-}
-
-void scp_cache_record_payload_hit(SCPFS_CACHE *cache)
-{
-	if (cache != NULL)
-		cache->counters.payload_hit++;
-}
-
-void scp_cache_record_payload_miss(SCPFS_CACHE *cache)
-{
-	if (cache != NULL)
-		cache->counters.payload_miss++;
-}
-
-void scp_cache_get_counters(const SCPFS_CACHE *cache,
+void scp_cache_get_counters(SCPFS_CACHE *cache,
 	SCPFS_CACHE_COUNTERS *counters_out)
 {
 	if (counters_out == NULL)
 		return;
-	if (cache != NULL)
-		*counters_out = cache->counters;
-	else
-		memset(counters_out, 0, sizeof(*counters_out));
+	memset(counters_out, 0, sizeof(*counters_out));
+	if (cache == NULL)
+		return;
+	AcquireSRWLockExclusive(&cache->lock);
+	*counters_out = cache->counters;
+	ReleaseSRWLockExclusive(&cache->lock);
 }
