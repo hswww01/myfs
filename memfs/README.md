@@ -6,7 +6,7 @@ A high-performance volatile Windows memory file system written in C17 on top of 
 
 - Pure C17, CMake, Ninja, clang-cl and vcpkg.
 - Native WinFsp API; no FUSE layer.
-- Case-sensitive lookup with case-preserved names; entries that differ only by case can coexist.
+- Case-insensitive, case-preserving names (NTFS semantics).
 - Adaptive directory index: intrusive treap plus a lazy open-addressing hash for large directories.
 - Create/open/read/write/truncate/rename/move/delete and directory enumeration.
 - Sparse file storage with 4 KiB logical pages.
@@ -21,7 +21,7 @@ All file-system contents are volatile. Unmounting or terminating the process los
 
 ## Filename comparison
 
-Names use exact, case-sensitive UTF-16 code-unit comparison throughout lookup, collision checks, directory ordering, wildcard filtering, rename and deletion. For example, `Readme.txt` and `README.TXT` are separate entries, and a lookup using another spelling does not resolve either one. Names are case-preserved, and Unicode names are compared as supplied without case folding or normalization.
+Names are case-insensitive and case-preserving, like NTFS: lookup, collision checks, directory ordering, wildcard filtering, rename and deletion compare UTF-16 code units after the system upcase mapping (`RtlUpcaseUnicodeChar`). `Readme.txt` and `README.TXT` name the same entry, which keeps the spelling it was created with; a case-only rename changes that spelling. There is no Unicode normalization.
 
 Case sensitivity is selected when WinFsp creates a volume, so an already-mounted instance keeps its existing behavior. Validate a rebuilt version on a newly mounted, unused volume; do not stop a live volatile volume unless its contents may be discarded.
 

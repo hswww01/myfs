@@ -78,8 +78,9 @@ static bool memfs_name_matches_pattern(
 	candidate.MaximumLength = candidate.Length;
 	candidate.Buffer = (PWSTR)name;
 
+	/* Names are case-insensitive, so are directory patterns. */
 	return FALSE != g_name_expression_match(
-		&expression, &candidate, FALSE, NULL);
+		&expression, &candidate, TRUE, NULL);
 }
 
 #if defined(MEMFS_WINFSP_TESTING)
@@ -790,7 +791,7 @@ static void memfs_winfsp_init_volume_params(FSP_FSCTL_VOLUME_PARAMS* volume_para
 	volume_params->VolumeCreationTime = memfs_now();
 	volume_params->VolumeSerialNumber = (uint32_t)(volume_params->VolumeCreationTime / 10000000ULL);
 	volume_params->FileInfoTimeout = 1000;
-	volume_params->CaseSensitiveSearch = 1;
+	volume_params->CaseSensitiveSearch = 0;
 	volume_params->CasePreservedNames = 1;
 	volume_params->UnicodeOnDisk = 1;
 	volume_params->PersistentAcls = 1;

@@ -89,23 +89,24 @@ try {
     New-Item -ItemType Directory -Path "$Drive\dir" | Out-Null
     $stage = "tiny-text-write"
     [IO.File]::WriteAllText("$Drive\hello.txt", "hello memfs")
-    [IO.File]::WriteAllText("$Drive\HELLO.TXT", "upper-case twin")
-    if ([IO.File]::ReadAllText("$Drive\hello.txt") -ne "hello memfs" -or
-        [IO.File]::ReadAllText("$Drive\HELLO.TXT") -ne "upper-case twin") {
-        throw 'case-distinct text readback mismatch'
+    # Names are case-insensitive and case-preserving, like NTFS.
+    [IO.File]::WriteAllText("$Drive\HELLO.TXT", "same file")
+    if ([IO.File]::ReadAllText("$Drive\hello.txt") -ne "same file") {
+        throw 'another spelling did not open the same file'
     }
     $rootNames = @(Get-ChildItem -LiteralPath "$Drive\" | Select-Object -ExpandProperty Name)
-    if ($rootNames -cnotcontains 'hello.txt' -or $rootNames -cnotcontains 'HELLO.TXT') {
-        throw 'case-distinct files were not both enumerated'
+    if ($rootNames -cnotcontains 'hello.txt' -or $rootNames -ccontains 'HELLO.TXT') {
+        throw 'the original spelling was not preserved'
     }
-    if (Test-Path -LiteralPath "$Drive\HeLLo.TxT") {
-        throw 'wrong-case path unexpectedly resolved'
+    if (-not (Test-Path -LiteralPath "$Drive\HeLLo.TxT")) {
+        throw 'wrong-case path did not resolve'
     }
-    Remove-Item -LiteralPath "$Drive\HELLO.TXT"
-    if (-not (Test-Path -LiteralPath "$Drive\hello.txt") -or
-        (Test-Path -LiteralPath "$Drive\HELLO.TXT")) {
-        throw 'deleting one case-distinct file changed the other entry'
+    Rename-Item -LiteralPath "$Drive\hello.txt" -NewName 'Hello.txt'
+    if (@(Get-ChildItem -LiteralPath "$Drive\" -Filter 'hello.*' | Select-Object -ExpandProperty Name) -cnotcontains 'Hello.txt') {
+        throw 'case-only rename did not change the stored spelling'
     }
+    Rename-Item -LiteralPath "$Drive\Hello.txt" -NewName 'hello.txt'
+    [IO.File]::WriteAllText("$Drive\hello.txt", "hello memfs")
 
     # Exercise real multi-page storage, not only tiny-file endpoints.
     $stage = "paged-write-read"
@@ -160,8 +161,8 @@ try {
 
     $stage = "rename-move"
     Rename-Item -LiteralPath "$Drive\hello.txt" -NewName "Hello.txt"
-    if ((Test-Path -LiteralPath "$Drive\hello.txt") -or
-        -not (Test-Path -LiteralPath "$Drive\Hello.txt")) {
+    $spellings = @(Get-ChildItem -LiteralPath "$Drive\" -Filter 'hello.txt' | Select-Object -ExpandProperty Name)
+    if ($spellings.Count -ne 1 -or $spellings[0] -cne 'Hello.txt') {
         throw 'case-only rename did not preserve exact spelling'
     }
     Rename-Item -LiteralPath "$Drive\Hello.txt" -NewName "renamed.txt"
@@ -170,8 +171,8 @@ try {
     $names = @(Get-ChildItem "$Drive\dir" | Sort-Object Name | Select-Object -ExpandProperty Name)
     if (($names -join ',') -ne 'data.bin,moved.txt,sparse.bin') { throw "directory mismatch: $($names -join ',')" }
     $stage = "wildcard-enumeration"
-    $wrongCaseFiltered = @(Get-ChildItem -LiteralPath "$Drive\dir" -Filter '*.TXT' | Select-Object -ExpandProperty Name)
-    if ($wrongCaseFiltered.Count -ne 0) { throw 'wrong-case wildcard unexpectedly matched an entry' }
+    $otherCaseFiltered = @(Get-ChildItem -LiteralPath "$Drive\dir" -Filter '*.TXT' | Select-Object -ExpandProperty Name)
+    if (($otherCaseFiltered -join ',') -cne 'moved.txt') { throw 'case-insensitive wildcard did not match' }
     $filtered = @(Get-ChildItem -LiteralPath "$Drive\dir" -Filter '*.txt' | Select-Object -ExpandProperty Name)
     if (($filtered -join ',') -ne 'moved.txt') { throw 'wildcard directory mismatch for exact-case pattern' }
     $stage = "delete-files"

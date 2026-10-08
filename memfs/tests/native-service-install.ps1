@@ -108,20 +108,17 @@ if (-not $logAcl.AreAccessRulesProtected) {
 		throw "Mismatched install changed or stopped the existing service."
 	}
 
-	# Exercise case-sensitive files through the actual mounted drive.
+	# Exercise case-insensitive, case-preserving names through the mounted drive.
 	[IO.File]::WriteAllText("$Drive\Case.txt", "upper spelling")
 	[IO.File]::WriteAllText("$Drive\case.txt", "lower spelling")
-	if ([IO.File]::ReadAllText("$Drive\Case.txt") -ne "upper spelling" -or
-		[IO.File]::ReadAllText("$Drive\case.txt") -ne "lower spelling") {
-		throw "Case-distinct files did not retain separate contents."
+	if ([IO.File]::ReadAllText("$Drive\CASE.TXT") -ne "lower spelling") {
+		throw "Another spelling did not reach the same file."
 	}
-	if ([IO.File]::Exists("$Drive\CASE.TXT")) { throw "Wrong-case lookup unexpectedly resolved a file." }
-	Remove-Item -LiteralPath "$Drive\case.txt"
-	if ([IO.File]::Exists("$Drive\case.txt") -or
-		[IO.File]::ReadAllText("$Drive\Case.txt") -ne "upper spelling") {
-		throw "Deleting one case-distinct file changed the other entry."
+	if ((Get-ChildItem -LiteralPath "$Drive\" -Filter "case.txt").Name -cne "Case.txt") {
+		throw "The original spelling was not preserved."
 	}
-	Remove-Item -LiteralPath "$Drive\Case.txt"
+	Remove-Item -LiteralPath "$Drive\CASE.txt"
+	if ([IO.File]::Exists("$Drive\Case.txt")) { throw "Delete by another spelling left the file." }
 
 	# Verify SCM STOP and START leave the isolated service usable before native uninstall.
 	& sc.exe stop $serviceName | Out-Null

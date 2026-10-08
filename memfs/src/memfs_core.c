@@ -2457,21 +2457,63 @@ static MemfsResult memfs_default_security(MemfsAllocator* allocator, MemfsSecuri
 	return result;
 }
 
+/*
+ * Names are case-insensitive and case-preserving, like NTFS: lookup,
+ * collision checks, ordering and hashing all use the system upcase mapping
+ * (RtlUpcaseUnicodeChar, the table NTFS and FsRtl use) on UTF-16 code units.
+ */
+static wchar_t g_memfs_upcase[65536];
+static INIT_ONCE g_memfs_upcase_once = INIT_ONCE_STATIC_INIT;
+
+typedef WCHAR (NTAPI* MemfsRtlUpcaseUnicodeCharFn)(WCHAR);
+
+static BOOL CALLBACK memfs_upcase_init(PINIT_ONCE once, PVOID parameter, PVOID* context) {
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	MemfsRtlUpcaseUnicodeCharFn upcase = NULL;
+	uint32_t c;
+
+	(void)once;
+	(void)parameter;
+	(void)context;
+	if (ntdll != NULL)
+		upcase = (MemfsRtlUpcaseUnicodeCharFn)(void*)GetProcAddress(ntdll, "RtlUpcaseUnicodeChar");
+	for (c = 0; c < 65536U; c++) {
+		wchar_t value = (wchar_t)c;
+		if (upcase != NULL)
+			value = upcase(value);
+		else if (c >= L'a' && c <= L'z')
+			value = (wchar_t)(c - L'a' + L'A');
+		g_memfs_upcase[c] = value;
+	}
+	return TRUE;
+}
+
+static void memfs_upcase_ensure(void) {
+	(void)InitOnceExecuteOnce(&g_memfs_upcase_once, memfs_upcase_init, NULL, NULL);
+}
+
 static int memfs_name_compare(const wchar_t* left, const wchar_t* right) {
-	while (*left != L'\0' && *left == *right) {
+	uint16_t a;
+	uint16_t b;
+
+	for (;;) {
+		a = (uint16_t)g_memfs_upcase[(uint16_t)*left];
+		b = (uint16_t)g_memfs_upcase[(uint16_t)*right];
+		if (a != b || *left == L'\0' || *right == L'\0')
+			break;
 		left++;
 		right++;
 	}
-	if (*left == *right)
+	if (a == b)
 		return 0;
-	return (uint16_t)*left < (uint16_t)*right ? -1 : 1;
+	return a < b ? -1 : 1;
 }
 
 static uint32_t memfs_name_hash(const wchar_t* name) {
 	uint32_t hash = 2166136261U;
 
 	while (*name) {
-		uint32_t c = (uint16_t)*name++;
+		uint32_t c = (uint16_t)g_memfs_upcase[(uint16_t)*name++];
 		hash ^= c;
 		hash *= 16777619U;
 	}
@@ -3091,6 +3133,8 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 		options->capacity > INT64_MAX) {
 		return MEMFS_ERR_INVALID;
 	}
+	/* Every name comparison below depends on the upcase table. */
+	memfs_upcase_ensure();
 
 	if (options->encryption_key && options->encryption_key_size != MEMFS_ENCRYPTION_KEY_SIZE) {
 		return MEMFS_ERR_INVALID;

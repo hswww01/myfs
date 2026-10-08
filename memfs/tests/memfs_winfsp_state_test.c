@@ -136,7 +136,7 @@ cleanup:
     memfs_destroy(store);
 }
 
-static void test_case_sensitive_directory_info(void) {
+static void test_case_insensitive_directory_info(void) {
     Memfs* store = NULL;
     MemfsNode* upper = NULL;
     MemfsNode* lower = NULL;
@@ -157,8 +157,8 @@ static void test_case_sensitive_directory_info(void) {
     CHECK(memfs_node_create(store, store->root, L"Case.txt", false,
         FILE_ATTRIBUTE_NORMAL, NULL, 0, &upper) == MEMFS_OK);
     CHECK(memfs_node_create(store, store->root, L"case.txt", false,
-        FILE_ATTRIBUTE_NORMAL, NULL, 0, &lower) == MEMFS_OK);
-    if (upper == NULL || lower == NULL)
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &lower) == MEMFS_ERR_EXISTS);
+    if (upper == NULL)
         goto cleanup;
 
     instance.store = store;
@@ -172,15 +172,16 @@ static void test_case_sensitive_directory_info(void) {
         CHECK(memcmp(dir_info->FileNameBuf, L"Case.txt",
             wcslen(L"Case.txt") * sizeof(WCHAR)) == 0);
 
-    status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
-        L"case.txt", dir_info);
-    CHECK(NT_SUCCESS(status));
-    if (NT_SUCCESS(status))
-        CHECK(memcmp(dir_info->FileNameBuf, L"case.txt",
-            wcslen(L"case.txt") * sizeof(WCHAR)) == 0);
-
+    /* Another spelling finds the entry and reports its stored name. */
     status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
         L"CASE.TXT", dir_info);
+    CHECK(NT_SUCCESS(status));
+    if (NT_SUCCESS(status))
+        CHECK(memcmp(dir_info->FileNameBuf, L"Case.txt",
+            wcslen(L"Case.txt") * sizeof(WCHAR)) == 0);
+
+    status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
+        L"Other.txt", dir_info);
     CHECK(status == STATUS_OBJECT_NAME_NOT_FOUND);
 
 cleanup:
@@ -209,7 +210,7 @@ static void test_volume_reports(void) {
 
     memfs_winfsp_test_volume_params(&params);
     CHECK(params.MaxComponentLength == MEMFS_MAX_NAME);
-    CHECK(params.CaseSensitiveSearch && params.CasePreservedNames);
+    CHECK(!params.CaseSensitiveSearch && params.CasePreservedNames);
     CHECK(params.SectorSize == MEMFS_ALLOCATION_UNIT);
 
     CHECK(memfs_create(capacity, L"FIXED", &store) == MEMFS_OK);
@@ -368,16 +369,16 @@ int main(int argc, char** argv) {
     CHECK(memfs_winfsp_test_name_matches_pattern(NULL, L"anything.bin"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"*", L"anything.bin"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.TXT"));
-    CHECK(!memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.txt"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.txt"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"file1.dat"));
-    CHECK(!memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"FILE1.DAT"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"FILE1.DAT"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"foo*", L"foobar"));
-    CHECK(!memfs_winfsp_test_name_matches_pattern(L"foo*", L"Foobar"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"foo*", L"Foobar"));
     CHECK(!memfs_winfsp_test_name_matches_pattern(L"*.txt", L"image.bin"));
     CHECK(!memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"file12.dat"));
 
     test_security_snapshot_guards();
-    test_case_sensitive_directory_info();
+    test_case_insensitive_directory_info();
     test_volume_reports();
     test_archive_attributes();
     test_unlinked_directory_child();
