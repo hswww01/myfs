@@ -146,7 +146,11 @@ def main():
 
         random_data = os.urandom(2 * 1024**2)
         tail = folder / 'tail.bin'
-        tail.write_bytes(random_data)
+        # Data is write-back cached; close alone does not reach the container.
+        with open(tail, 'wb') as f:
+            f.write(random_data)
+            f.flush()
+            os.fsync(f.fileno())
         assert hashlib.sha256(tail.read_bytes()).digest() == hashlib.sha256(random_data).digest()
         metrics['logical_sparse_size'] = sparse.stat().st_size
         metrics['eof_with_tail'] = container.stat().st_size

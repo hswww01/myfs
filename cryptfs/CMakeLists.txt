@@ -122,6 +122,11 @@ target_include_directories(cryptfs SYSTEM PRIVATE "${WINFSP_INCLUDE_DIR}")
 target_compile_definitions(cryptfs PRIVATE
 	_CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE WINFSP_STATIC CRYPTFS_WINFSP_STATIC=1)
 target_link_libraries(cryptfs PRIVATE cryptfs_core bcrypt advapi32 shell32 credui netapi32 rpcrt4 secur32 shlwapi version)
+# Unlock validates the namespace recursively (depth up to 64, ~8 KiB per
+# level plus block buffers); keep ample headroom over the 1 MiB default.
+if(MSVC)
+	target_link_options(cryptfs PRIVATE /STACK:8388608)
+endif()
 
 add_executable(cryptfs_static_import_test tests/cryptfs_static_import_test.c)
 add_executable(cryptfs_resource_test tests/cryptfs_resource_test.c)
@@ -176,6 +181,9 @@ if(BUILD_TESTING)
 		target_link_libraries(cryptfs_store_test PRIVATE unofficial-sodium::sodium zstd::libzstd bcrypt advapi32)
 		if(MSVC)
 			target_compile_options(cryptfs_store_test PRIVATE /W4 /utf-8 /permissive-)
+		endif()
+		if(MSVC)
+			target_link_options(cryptfs_store_test PRIVATE /STACK:8388608)
 		endif()
 		add_test(NAME cryptfs_store_test COMMAND cryptfs_store_test)
 		set_tests_properties(cryptfs_store_test PROPERTIES TIMEOUT 300)

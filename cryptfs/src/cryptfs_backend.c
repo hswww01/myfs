@@ -270,7 +270,14 @@ static VOID fs_Cleanup(FSP_FILE_SYSTEM *fs, PVOID context, PWSTR name, ULONG fla
 	(void)name;
 	if (node == NULL) return;
 	/* A deleted file needs no timestamp transaction first. */
-	if ((flags & FspCleanupDelete) && cf_node_unlink(backend->store, node) == CF_OK) return;
+	if ((flags & FspCleanupDelete) && cf_node_unlink(backend->store, node) == CF_OK) {
+		/* With the Cache Manager the final Close can arrive much later, and
+		 * only Close reclaims an unlinked inode; release its data now. */
+		if (cf_node_info(backend->store, node, &info) == CF_OK &&
+			!(info.attributes & FILE_ATTRIBUTE_DIRECTORY) && info.size != 0)
+			(void)cf_node_resize(backend->store, node, 0, false);
+		return;
+	}
 	if (cf_node_info(backend->store, node, &info) != CF_OK) return;
 	attributes = info.attributes;
 	if (flags & FspCleanupSetArchiveBit) attributes |= FILE_ATTRIBUTE_ARCHIVE;
@@ -449,7 +456,27 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID context,
 	size_t batch = length / sizeof(FSP_FSCTL_DIR_INFO) + 1;
 	WCHAR resume[CF_NAME_MAX + 1];
 	PCWSTR after = marker;
+	CF_INFO parent;
 	*transferred = 0;
+	/* Subdirectories list "." and ".." first, as NTFS does. */
+	if (cf_node_parent_info(backend->store, context, &parent) == CF_OK &&
+		(marker == NULL || wcscmp(marker, L".") == 0 || wcscmp(marker, L"..") == 0)) {
+		CF_DIRENT dot;
+		memset(&dot, 0, sizeof(dot));
+		if (marker == NULL && cryptfs_pattern_match(pattern, L".") &&
+			cf_node_info(backend->store, context, &dot.info) == CF_OK) {
+			wcscpy_s(dot.name, _countof(dot.name), L".");
+			if (cryptfs_add_dir_info(backend->store, &dot, buffer, length, transferred) != STATUS_SUCCESS)
+				return STATUS_SUCCESS;
+		}
+		if ((marker == NULL || wcscmp(marker, L".") == 0) && cryptfs_pattern_match(pattern, L"..")) {
+			dot.info = parent;
+			wcscpy_s(dot.name, _countof(dot.name), L"..");
+			if (cryptfs_add_dir_info(backend->store, &dot, buffer, length, transferred) != STATUS_SUCCESS)
+				return STATUS_SUCCESS;
+		}
+		after = NULL;
+	}
 	for (;;) {
 		CF_DIRENT *entries = NULL;
 		size_t count = 0, i;
@@ -544,7 +571,10 @@ NTSTATUS cryptfs_backend_create(CF_STORE *store, CRYPTFS_BACKEND **backend_out)
 	/* The WinFsp FSD measures components in WCHARs despite fsctl.h's "bytes". */
 	params.MaxComponentLength = CF_NAME_MAX;
 	params.VolumeSerialNumber = 0x43524653u;
-	params.FileInfoTimeout = 250;
+	/* One exclusive writer owns the container, so cached metadata never goes
+	 * stale; an infinite timeout also enables the Cache Manager for file data
+	 * (reads served from memory, lazy writes coalesced into large writes). */
+	params.FileInfoTimeout = INFINITE;
 	params.CaseSensitiveSearch = 1;
 	params.CasePreservedNames = 1;
 	params.UnicodeOnDisk = 1;

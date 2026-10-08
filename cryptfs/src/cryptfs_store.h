@@ -69,6 +69,8 @@ CF_RESULT cf_node_list(CF_STORE *, CF_NODE *, CF_DIRENT **entries, size_t *count
 /* Lists at most max_entries children strictly after marker (NULL: from the start). */
 CF_RESULT cf_node_list_after(CF_STORE *, CF_NODE *, const wchar_t *marker,
     size_t max_entries, CF_DIRENT **entries, size_t *count, bool *more);
+/* Parent directory info; CF_NOT_FOUND for the root or an unlinked node. */
+CF_RESULT cf_node_parent_info(CF_STORE *, CF_NODE *, CF_INFO *info);
 /* Exact-name child lookup through the sorted directory index. */
 CF_RESULT cf_node_child_info(CF_STORE *, CF_NODE *, const wchar_t *name, CF_DIRENT *entry);
 void cf_list_free(CF_DIRENT *entries, size_t count);

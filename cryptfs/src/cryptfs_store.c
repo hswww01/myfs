@@ -47,6 +47,8 @@ struct CF_MAP_PAGE {
     CF_PAGE *page;
     CF_MAP_PAGE *next;
     uint32_t count;
+    /* Entry positions changed since owners were last derived (RAM only). */
+    bool owners_dirty;
     CF_BLOCK *blocks[CF_MAP_CAPACITY];
 };
 
@@ -1083,64 +1085,6 @@ static uint64_t cf_ceil_blocks(uint64_t size) {
     return size / CF_BLOCK_SIZE + ((size % CF_BLOCK_SIZE) != 0);
 }
 
-static bool cf_graph_load_block(CF_GRAPH *g, CF_NODE *node, CF_BLOCK *block) {
-    uint8_t encoded[CF_BLOCK_SIZE];
-    uint8_t decoded[CF_BLOCK_SIZE];
-    uint32_t copied = 0, i;
-    bool ok = false;
-    memset(encoded, 0, sizeof(encoded));
-    memset(decoded, 0, sizeof(decoded));
-    if (block->encoded_length == 0 || block->encoded_length > CF_BLOCK_SIZE ||
-        block->fragment_count == 0 || block->fragment_count > CF_MAX_FRAGMENTS ||
-        block->fragment_count != (block->encoded_length + CF_FRAGMENT_CAPACITY - 1u) / CF_FRAGMENT_CAPACITY ||
-        (block->codec != 0 && block->codec != 1))
-        goto done;
-    if (block->codec == 0 && block->encoded_length != CF_BLOCK_SIZE)
-        goto done;
-    for (i = 0; i < block->fragment_count; ++i) {
-        CF_PAGE *page = block->fragments[i];
-        uint8_t disk[CF_PAGE_SIZE];
-        uint8_t payload[CF_PAYLOAD_SIZE];
-        uint64_t record_id = 0;
-        uint32_t expected = block->encoded_length - copied;
-        uint32_t actual = expected > CF_FRAGMENT_CAPACITY ? CF_FRAGMENT_CAPACITY : expected;
-        uint64_t next_slot;
-        if (!page || !cf_graph_read_page(g, page->slot, disk) ||
-            !cf_page_decrypt(g->store, page->slot, disk, CF_RECORD_FRAGMENT,
-                node->id, payload, &record_id) || record_id != node->id ||
-            cf_get_u64(payload + CF_FRAGMENT_FILE_ID) != node->id ||
-            cf_get_u64(payload + CF_FRAGMENT_BLOCK) != block->index ||
-            cf_get_u32(payload + CF_FRAGMENT_SEQUENCE) != i ||
-            cf_get_u32(payload + CF_FRAGMENT_LENGTH) != actual ||
-            !cf_all_zero(payload + CF_FRAGMENT_DATA + actual,
-                CF_PAYLOAD_SIZE - CF_FRAGMENT_DATA - actual)) {
-            cf_wipe(disk, sizeof(disk));
-            cf_wipe(payload, sizeof(payload));
-            goto done;
-        }
-        next_slot = cf_get_u64(payload + CF_FRAGMENT_NEXT);
-        if ((i + 1 == block->fragment_count && next_slot != 0) ||
-            (i + 1 < block->fragment_count &&
-                (!page->owned_head || page->owned_head->slot != next_slot))) {
-            cf_wipe(disk, sizeof(disk));
-            cf_wipe(payload, sizeof(payload));
-            goto done;
-        }
-        memcpy(encoded + copied, payload + CF_FRAGMENT_DATA, actual);
-        copied += actual;
-        cf_wipe(disk, sizeof(disk));
-        cf_wipe(payload, sizeof(payload));
-    }
-    if (copied != block->encoded_length ||
-        !cf_block_decode(encoded, block->encoded_length, block->codec, decoded))
-        goto done;
-    ok = true;
-done:
-    cf_wipe(encoded, sizeof(encoded));
-    cf_wipe(decoded, sizeof(decoded));
-    return ok;
-}
-
 static bool cf_graph_load_maps(CF_GRAPH *g, CF_NODE *node, uint64_t first_slot) {
     CF_MAP_PAGE *previous = NULL;
     uint64_t slot = first_slot;
@@ -1291,7 +1235,10 @@ static bool cf_graph_load_maps(CF_GRAPH *g, CF_NODE *node, uint64_t first_slot) 
                 cf_wipe(frag_disk, sizeof(frag_disk));
                 cf_wipe(frag_payload, sizeof(frag_payload));
             }
-            if (block_index > UINT64_MAX / CF_BLOCK_SIZE || !cf_graph_load_block(g, node, block)) {
+            /* Each fragment above was read and authenticated with its exact
+             * identity, sequence, length and link; decoding the codec frame
+             * happens on read, so unlock no longer decompresses all data. */
+            if (block_index > UINT64_MAX / CF_BLOCK_SIZE) {
                 cf_wipe(disk, sizeof(disk));
                 cf_wipe(payload, sizeof(payload));
                 return false;
@@ -2092,7 +2039,10 @@ static bool cf_tx_commit(CF_TX *tx) {
         goto done;
     }
     cf_crash_after_phase(3);
-    if (!cf_set_eof(s, tx->final_eof) || !cf_flush_file(s)) {
+    /* Most transactions rewrite pages in place; resizing and flushing an
+     * unchanged EOF only cost another full FlushFileBuffers. */
+    if (tx->final_eof != s->disk_eof &&
+        (!cf_set_eof(s, tx->final_eof) || !cf_flush_file(s))) {
         tx->failure = CF_IO_ERROR;
         goto done;
     }
@@ -3313,240 +3263,278 @@ static void cf_map_rollback_insert(CF_NODE *node, CF_MAP_PAGE *target,
     (void)position;
 }
 
-static CF_RESULT cf_node_write_block(CF_STORE *s, CF_NODE *node,
-    uint64_t block_index, const uint8_t raw[CF_BLOCK_SIZE], uint64_t size_after) {
-    CF_TX tx;
-    CF_BLOCK *new_block = NULL, *old_block = NULL;
-    CF_MAP_PAGE *target = NULL, *new_map = NULL, *previous = NULL;
-    CF_MAP_PAGE *old_head = NULL, *old_tail = NULL, *old_next = NULL;
-    CF_BLOCK *old_blocks[CF_MAP_CAPACITY + 1] = {0};
-    CF_PAGE *map_page = NULL;
-    uint8_t encoded[CF_BLOCK_SIZE];
-    uint32_t old_count = 0, pos = 0, encoded_length = 0, codec = 0, i;
-    uint64_t old_size = node->size, old_logical = s->logical_used;
-    uint64_t old_created = node->creation_time, old_accessed = node->access_time;
-    uint64_t old_written = node->write_time, old_changed = node->change_time;
-    bool split = false, tx_started = false, map_mutated = false;
-    bool appended_map_after_previous = false;
-    bool committed = false;
-    CF_RESULT result = CF_NO_MEMORY;
-    memset(encoded, 0, sizeof(encoded));
-    if (size_after > s->capacity || size_after < node->size ||
-        size_after - node->size > s->capacity - s->logical_used)
-        return CF_NO_SPACE;
-    if (!cf_block_encode(raw, s->compression_level, encoded,
-        &encoded_length, &codec)) {
-        result = CF_DATA_ERROR;
-        goto done;
-    }
-    new_block = (CF_BLOCK *)calloc(1, sizeof(*new_block));
-    if (!new_block)
-        goto done;
-    new_block->index = block_index;
-    new_block->encoded_length = encoded_length;
-    new_block->codec = codec;
-    new_block->fragment_count = (encoded_length + CF_FRAGMENT_CAPACITY - 1u) /
-        CF_FRAGMENT_CAPACITY;
-    if (new_block->fragment_count == 0 || new_block->fragment_count > CF_MAX_FRAGMENTS) {
-        result = CF_DATA_ERROR;
-        goto done;
-    }
-    if (!cf_tx_begin(s, &tx))
-        goto done;
-    tx_started = true;
-    for (i = 0; i < new_block->fragment_count; ++i) {
-        new_block->fragments[i] = cf_tx_new_page(&tx, CF_RECORD_FRAGMENT, node->id);
-        if (!new_block->fragments[i]) {
-            result = CF_NO_SPACE;
-            goto done;
-        }
-    }
-    old_block = cf_node_find_block(node, block_index, &target, &pos);
-    if (old_block) {
-        old_head = node->maps;
-        old_tail = node->maps_tail;
-        old_count = target->count;
-        old_next = target->next;
-        for (i = 0; i < old_count; ++i)
-            old_blocks[i] = target->blocks[i];
-        target->blocks[pos] = new_block;
-        map_mutated = true;
-    } else {
-        if (!cf_map_insert_block(node, new_block, &target, &new_map, &previous,
-            &pos, old_blocks, &old_count, &old_next, &old_head, &old_tail, &split)) {
-            result = CF_NO_MEMORY;
-            goto done;
-        }
-        if (target)
-            map_mutated = true;
-        if (!target) {
-            map_page = cf_tx_new_page(&tx, CF_RECORD_MAP, node->id);
-            if (!map_page) {
-                result = CF_NO_SPACE;
-                goto done;
+/*
+ * A write stages many blocks into one transaction. Each stage records exactly
+ * what it changed in RAM so a failed batch is undone newest-first, and so the
+ * committed pages can be registered once the single commit is durable.
+ */
+typedef struct CF_BLOCK_STAGE {
+    CF_BLOCK *new_block;
+    CF_BLOCK *old_block;
+    CF_MAP_PAGE *target;
+    CF_MAP_PAGE *new_map;
+    CF_MAP_PAGE *previous;
+    CF_MAP_PAGE *old_head;
+    CF_MAP_PAGE *old_tail;
+    CF_MAP_PAGE *old_next;
+    CF_PAGE *map_page;
+    uint32_t old_count;
+    uint32_t pos;
+    bool split;
+    bool map_mutated;
+    CF_BLOCK *old_blocks[CF_MAP_CAPACITY + 1];
+} CF_BLOCK_STAGE;
+
+/* Undoes one stage's RAM changes and frees everything it allocated. */
+static void cf_block_unstage(CF_NODE *node, CF_BLOCK_STAGE *st) {
+    uint32_t i;
+    if (st->map_mutated) {
+        if (st->old_block) {
+            if (st->target) {
+                memcpy(st->target->blocks, st->old_blocks, st->old_count * sizeof(CF_BLOCK *));
+                st->target->count = st->old_count;
+                st->target->next = st->old_next;
             }
-            new_map->page = map_page;
-            map_page->map = new_map;
-            if (previous) {
-                new_map->next = previous->next;
-                previous->next = new_map;
-                appended_map_after_previous = true;
-                if (node->maps_tail == previous)
-                    node->maps_tail = new_map;
-            } else {
-                new_map->next = node->maps;
-                node->maps = new_map;
-                if (!node->maps_tail)
-                    node->maps_tail = new_map;
-            }
-            target = new_map;
-            pos = 0;
-            map_mutated = true;
-        } else if (split) {
-            map_page = cf_tx_new_page(&tx, CF_RECORD_MAP, node->id);
-            if (!map_page) {
-                result = CF_NO_SPACE;
-                goto done;
-            }
-            new_map->page = map_page;
-            map_page->map = new_map;
+            node->maps = st->old_head;
+            node->maps_tail = st->old_tail;
+        } else if (st->target || st->new_map) {
+            cf_map_rollback_insert(node, st->target, st->new_map, st->previous, st->pos,
+                st->old_blocks, st->old_count, st->old_next, st->old_head, st->old_tail,
+                st->split);
         }
     }
-    map_mutated = true;
-    node->size = size_after;
-    node->write_time = node->change_time = cf_now_filetime();
-    s->logical_used += size_after - old_size;
-    for (i = 0; i < new_block->fragment_count; ++i) {
-        if (!cf_tx_add_fragment(&tx, node, new_block, i, encoded)) {
-            result = CF_NO_MEMORY;
-            goto done;
-        }
-    }
-    if (!cf_tx_add_map(&tx, node, target) ||
-        (appended_map_after_previous &&
-            !cf_tx_add_map(&tx, node, previous)) ||
-        (new_map && new_map != target && !cf_tx_add_map(&tx, node, new_map)) ||
-        !cf_tx_add_node(&tx, node)) {
-        result = s->poisoned ? CF_IO_ERROR : CF_NO_MEMORY;
-        goto done;
-    }
-    if (!cf_tx_commit(&tx)) {
-        result = cf_tx_failure_result(&tx, CF_NO_MEMORY);
-        goto done;
-    }
-    committed = true;
-    for (i = 0; i < new_block->fragment_count; ++i) {
-        if (!cf_page_register(s, new_block->fragments[i])) {
-            s->poisoned = true;
-            result = CF_IO_ERROR;
-            goto committed_failure;
-        }
-    }
-    if (map_page && !cf_page_register(s, map_page)) {
-        s->poisoned = true;
-        result = CF_IO_ERROR;
-        goto committed_failure;
-    }
-    if (map_page && (new_map == target || !target))
-        cf_page_set_owner(map_page,
-            previous ? previous->page : node->page,
-            previous ? CF_MAP_NEXT : CF_INODE_MAP_HEAD);
-    if (new_map && new_map != target && target) {
-        cf_page_set_owner(new_map->page, target->page, CF_MAP_NEXT);
-        if (new_map->next)
-            cf_page_set_owner(new_map->next->page, new_map->page, CF_MAP_NEXT);
-    }
-    if (target) {
-        for (i = 0; i < target->count; ++i)
-            cf_page_set_owner(target->blocks[i]->fragments[0], target->page,
-                (uint32_t)(CF_MAP_ENTRIES + (size_t)i * CF_MAP_ENTRY_SIZE +
-                    CF_MAP_ENTRY_FRAGMENT));
-    }
-    if (new_map && (new_map != target || old_count == 0)) {
-        for (i = 0; i < new_map->count; ++i)
-            cf_page_set_owner(new_map->blocks[i]->fragments[0], new_map->page,
-                (uint32_t)(CF_MAP_ENTRIES + (size_t)i * CF_MAP_ENTRY_SIZE +
-                    CF_MAP_ENTRY_FRAGMENT));
-    }
-    for (i = 1; i < new_block->fragment_count; ++i)
-        cf_page_set_owner(new_block->fragments[i], new_block->fragments[i - 1],
-            CF_FRAGMENT_NEXT);
-    if (old_block) {
-        if (old_block->fragment_count)
-            cf_page_unregister_tree(s, old_block->fragments[0]);
-        cf_wipe(old_block, sizeof(*old_block));
-        free(old_block);
-    }
-    new_block = NULL;
-    map_page = NULL;
-    new_map = NULL;
-    result = CF_OK;
-    goto done;
-committed_failure:
-    if (old_block) {
-        if (old_block->fragment_count)
-            cf_page_unregister_tree(s, old_block->fragments[0]);
-        cf_wipe(old_block, sizeof(*old_block));
-        free(old_block);
-        old_block = NULL;
-    }
-    new_block = NULL;
-    map_page = NULL;
-    new_map = NULL;
-done:
-    if (result != CF_OK && !committed && map_mutated) {
-        if (old_block) {
-            if (target)
-                memcpy(target->blocks, old_blocks, old_count * sizeof(CF_BLOCK *));
-            if (target)
-                target->count = old_count;
-            if (target)
-                target->next = old_next;
-            node->maps = old_head;
-            node->maps_tail = old_tail;
-        } else if (target || new_map) {
-            cf_map_rollback_insert(node, target, new_map, previous, pos,
-                old_blocks, old_count, old_next, old_head, old_tail, split);
-        }
-        node->size = old_size;
-        node->creation_time = old_created;
-        node->access_time = old_accessed;
-        node->write_time = old_written;
-        node->change_time = old_changed;
-        s->logical_used = old_logical;
-    }
-    if (new_map && (new_map != target || old_count == 0)) {
-        CF_PAGE *new_map_page = new_map->page;
+    if (st->new_map && (st->new_map != st->target || st->old_count == 0)) {
+        CF_PAGE *new_map_page = st->new_map->page;
         if (new_map_page && !new_map_page->registered) {
-            /* new_map->page and map_page are aliases for this newly allocated
-             * page. Clear the local alias before freeing to avoid a second
-             * free in the standalone map_page cleanup below. */
-            if (map_page == new_map_page)
-                map_page = NULL;
+            if (st->map_page == new_map_page)
+                st->map_page = NULL;
             cf_wipe(new_map_page, sizeof(*new_map_page));
             free(new_map_page);
         }
-        cf_wipe(new_map, sizeof(*new_map));
-        free(new_map);
+        cf_wipe(st->new_map, sizeof(*st->new_map));
+        free(st->new_map);
     }
-    if (map_page && !map_page->registered) {
-        cf_wipe(map_page, sizeof(*map_page));
-        free(map_page);
+    if (st->map_page && !st->map_page->registered) {
+        cf_wipe(st->map_page, sizeof(*st->map_page));
+        free(st->map_page);
     }
-    if (new_block) {
-        for (i = 0; i < new_block->fragment_count; ++i) {
-            CF_PAGE *page = new_block->fragments[i];
+    if (st->new_block) {
+        for (i = 0; i < st->new_block->fragment_count; ++i) {
+            CF_PAGE *page = st->new_block->fragments[i];
             if (page && !page->registered) {
                 cf_wipe(page, sizeof(*page));
                 free(page);
             }
         }
-        cf_wipe(new_block, sizeof(*new_block));
-        free(new_block);
+        cf_wipe(st->new_block, sizeof(*st->new_block));
+        free(st->new_block);
     }
-    if (tx_started)
-        cf_tx_dispose(&tx);
-    cf_wipe(encoded, sizeof(encoded));
+    memset(st, 0, sizeof(*st));
+}
+
+/* Stages one encoded block into tx; on failure this block's changes are undone. */
+static CF_RESULT cf_block_stage(CF_STORE *s, CF_NODE *node, CF_TX *tx,
+    uint64_t block_index, const uint8_t raw[CF_BLOCK_SIZE],
+    uint8_t encoded[CF_BLOCK_SIZE], CF_BLOCK_STAGE *st) {
+    uint32_t encoded_length = 0, codec = 0, i;
+    bool appended_map_after_previous = false;
+    CF_RESULT result = CF_NO_MEMORY;
+    memset(st, 0, sizeof(*st));
+    if (!cf_block_encode(raw, s->compression_level, encoded, &encoded_length, &codec))
+        return CF_DATA_ERROR;
+    st->new_block = (CF_BLOCK *)calloc(1, sizeof(*st->new_block));
+    if (!st->new_block)
+        goto fail;
+    st->new_block->index = block_index;
+    st->new_block->encoded_length = encoded_length;
+    st->new_block->codec = codec;
+    st->new_block->fragment_count = (encoded_length + CF_FRAGMENT_CAPACITY - 1u) /
+        CF_FRAGMENT_CAPACITY;
+    if (st->new_block->fragment_count == 0 || st->new_block->fragment_count > CF_MAX_FRAGMENTS) {
+        result = CF_DATA_ERROR;
+        goto fail;
+    }
+    for (i = 0; i < st->new_block->fragment_count; ++i) {
+        st->new_block->fragments[i] = cf_tx_new_page(tx, CF_RECORD_FRAGMENT, node->id);
+        if (!st->new_block->fragments[i]) {
+            result = CF_NO_SPACE;
+            goto fail;
+        }
+    }
+    st->old_block = cf_node_find_block(node, block_index, &st->target, &st->pos);
+    if (st->old_block) {
+        st->old_head = node->maps;
+        st->old_tail = node->maps_tail;
+        st->old_count = st->target->count;
+        st->old_next = st->target->next;
+        memcpy(st->old_blocks, st->target->blocks, st->old_count * sizeof(CF_BLOCK *));
+        st->target->blocks[st->pos] = st->new_block;
+        st->map_mutated = true;
+    } else {
+        if (!cf_map_insert_block(node, st->new_block, &st->target, &st->new_map,
+            &st->previous, &st->pos, st->old_blocks, &st->old_count, &st->old_next,
+            &st->old_head, &st->old_tail, &st->split)) {
+            result = CF_NO_MEMORY;
+            goto fail;
+        }
+        st->map_mutated = true;
+        if (!st->target) {
+            st->map_page = cf_tx_new_page(tx, CF_RECORD_MAP, node->id);
+            if (!st->map_page) {
+                result = CF_NO_SPACE;
+                goto fail;
+            }
+            st->new_map->page = st->map_page;
+            st->map_page->map = st->new_map;
+            if (st->previous) {
+                st->new_map->next = st->previous->next;
+                st->previous->next = st->new_map;
+                appended_map_after_previous = true;
+                if (node->maps_tail == st->previous)
+                    node->maps_tail = st->new_map;
+            } else {
+                st->new_map->next = node->maps;
+                node->maps = st->new_map;
+                if (!node->maps_tail)
+                    node->maps_tail = st->new_map;
+            }
+            st->target = st->new_map;
+            st->pos = 0;
+        } else if (st->split) {
+            st->map_page = cf_tx_new_page(tx, CF_RECORD_MAP, node->id);
+            if (!st->map_page) {
+                result = CF_NO_SPACE;
+                goto fail;
+            }
+            st->new_map->page = st->map_page;
+            st->map_page->map = st->new_map;
+        }
+    }
+    st->target->owners_dirty = true;
+    if (st->new_map)
+        st->new_map->owners_dirty = true;
+    for (i = 0; i < st->new_block->fragment_count; ++i) {
+        if (!cf_tx_add_fragment(tx, node, st->new_block, i, encoded)) {
+            result = CF_NO_MEMORY;
+            goto fail;
+        }
+    }
+    if (!cf_tx_add_map(tx, node, st->target) ||
+        (appended_map_after_previous && !cf_tx_add_map(tx, node, st->previous)) ||
+        (st->new_map && st->new_map != st->target && !cf_tx_add_map(tx, node, st->new_map))) {
+        result = s->poisoned ? CF_IO_ERROR : CF_NO_MEMORY;
+        goto fail;
+    }
+    return CF_OK;
+fail:
+    cf_block_unstage(node, st);
+    return result;
+}
+
+/* After a durable commit: publish new pages and retire the replaced block. */
+static bool cf_block_finish(CF_STORE *s, CF_BLOCK_STAGE *st) {
+    bool ok = true;
+    uint32_t i;
+    for (i = 0; i < st->new_block->fragment_count; ++i)
+        ok = cf_page_register(s, st->new_block->fragments[i]) && ok;
+    if (st->map_page)
+        ok = cf_page_register(s, st->map_page) && ok;
+    if (st->old_block) {
+        if (st->old_block->fragment_count)
+            cf_page_unregister_tree(s, st->old_block->fragments[0]);
+        cf_wipe(st->old_block, sizeof(*st->old_block));
+        free(st->old_block);
+    }
+    memset(st, 0, sizeof(*st));
+    return ok;
+}
+
+/* Re-derives physical ownership for map links and every map whose entries moved. */
+static void cf_node_refresh_map_owners(CF_NODE *node) {
+    CF_MAP_PAGE *map, *previous = NULL;
+    for (map = node->maps; map; previous = map, map = map->next) {
+        uint32_t i, j;
+        cf_page_set_owner(map->page, previous ? previous->page : node->page,
+            previous ? CF_MAP_NEXT : CF_INODE_MAP_HEAD);
+        if (!map->owners_dirty)
+            continue;
+        for (i = 0; i < map->count; ++i) {
+            CF_BLOCK *block = map->blocks[i];
+            cf_page_set_owner(block->fragments[0], map->page,
+                (uint32_t)(CF_MAP_ENTRIES + (size_t)i * CF_MAP_ENTRY_SIZE + CF_MAP_ENTRY_FRAGMENT));
+            for (j = 1; j < block->fragment_count; ++j)
+                cf_page_set_owner(block->fragments[j], block->fragments[j - 1], CF_FRAGMENT_NEXT);
+        }
+        map->owners_dirty = false;
+    }
+}
+
+/* Worst-case pages one staged block adds: fragments, two maps, the inode. */
+#define CF_STAGE_PAGE_BUDGET (CF_MAX_FRAGMENTS + 3u)
+#define CF_WRITE_BATCH_BLOCKS 128u
+
+typedef struct CF_WRITE_BATCH {
+    CF_TX tx;
+    bool open;
+    uint32_t staged;
+    uint32_t pending_bytes;
+    uint64_t size, logical_used, write_time, change_time;
+    CF_BLOCK_STAGE *stages;
+} CF_WRITE_BATCH;
+
+static void cf_write_batch_abort(CF_STORE *s, CF_NODE *node, CF_WRITE_BATCH *b) {
+    while (b->staged)
+        cf_block_unstage(node, &b->stages[--b->staged]);
+    node->size = b->size;
+    node->write_time = b->write_time;
+    node->change_time = b->change_time;
+    s->logical_used = b->logical_used;
+    cf_tx_dispose(&b->tx);
+    b->open = false;
+    b->pending_bytes = 0;
+}
+
+static CF_RESULT cf_write_batch_begin(CF_STORE *s, CF_NODE *node, CF_WRITE_BATCH *b) {
+    if (!cf_tx_begin(s, &b->tx))
+        return CF_NO_MEMORY;
+    b->open = true;
+    b->staged = 0;
+    b->pending_bytes = 0;
+    b->size = node->size;
+    b->logical_used = s->logical_used;
+    b->write_time = node->write_time;
+    b->change_time = node->change_time;
+    return CF_OK;
+}
+
+/* Commits every staged block with one WAL transaction. */
+static CF_RESULT cf_write_batch_commit(CF_STORE *s, CF_NODE *node, CF_WRITE_BATCH *b) {
+    CF_RESULT result = CF_OK;
+    uint32_t i;
+    bool ok = true;
+    if (!b->open)
+        return CF_OK;
+    if (b->staged == 0) {
+        cf_tx_dispose(&b->tx);
+        b->open = false;
+        return CF_OK;
+    }
+    if (!cf_tx_add_node(&b->tx, node) || !cf_tx_commit(&b->tx)) {
+        result = cf_tx_failure_result(&b->tx, CF_NO_MEMORY);
+        cf_write_batch_abort(s, node, b);
+        return result;
+    }
+    for (i = 0; i < b->staged; ++i)
+        ok = cf_block_finish(s, &b->stages[i]) && ok;
+    cf_node_refresh_map_owners(node);
+    if (!ok) {
+        s->poisoned = true;
+        result = CF_IO_ERROR;
+    }
+    b->staged = 0;
+    b->pending_bytes = 0;
+    cf_tx_dispose(&b->tx);
+    b->open = false;
     return result;
 }
 
@@ -3609,10 +3597,12 @@ done:
 CF_RESULT cf_node_write(CF_STORE *s, CF_NODE *node, const void *buffer,
     uint64_t offset, uint32_t length, bool append, bool constrained,
     uint32_t *transferred) {
-    uint8_t block_bytes[CF_BLOCK_SIZE];
+    uint8_t *block_bytes = NULL, *encoded = NULL;
     uint64_t end, current;
     uint32_t done = 0;
     CF_RESULT result = CF_OK;
+    CF_WRITE_BATCH batch;
+    memset(&batch, 0, sizeof(batch));
     if (transferred)
         *transferred = 0;
     if (!s || !node || !transferred || (!buffer && length))
@@ -3653,44 +3643,98 @@ CF_RESULT cf_node_write(CF_STORE *s, CF_NODE *node, const void *buffer,
         }
         length = (uint32_t)(s->capacity - offset);
     }
+    if (length == 0)
+        goto done;
+    block_bytes = (uint8_t *)malloc(CF_BLOCK_SIZE);
+    encoded = (uint8_t *)malloc(CF_BLOCK_SIZE);
+    batch.stages = (CF_BLOCK_STAGE *)calloc(CF_WRITE_BATCH_BLOCKS, sizeof(*batch.stages));
+    if (!block_bytes || !encoded || !batch.stages) {
+        result = CF_NO_MEMORY;
+        goto done;
+    }
     end = offset + length;
     current = offset;
     while (current < end) {
         uint64_t block_index = current / CF_BLOCK_SIZE;
-        uint64_t block_start = block_index * CF_BLOCK_SIZE;
-        uint32_t in_block = (uint32_t)(current - block_start);
+        uint32_t in_block = (uint32_t)(current % CF_BLOCK_SIZE);
         uint32_t take = (uint32_t)(end - current);
-        CF_BLOCK *existing;
-        CF_RESULT block_result;
         uint64_t size_after;
         if (take > CF_BLOCK_SIZE - in_block)
             take = CF_BLOCK_SIZE - in_block;
-        existing = cf_node_find_block(node, block_index, NULL, NULL);
-        if (existing) {
-            block_result = cf_node_decode_block(s, node, existing, block_bytes);
-            if (block_result != CF_OK) {
-                result = block_result;
+        /* Close the transaction before it could overflow the journal. */
+        if (batch.open && (batch.staged == CF_WRITE_BATCH_BLOCKS ||
+            batch.tx.count + CF_STAGE_PAGE_BUDGET > CF_MAX_TRANSACTION_PAGES)) {
+            uint32_t pending = batch.pending_bytes;
+            result = cf_write_batch_commit(s, node, &batch);
+            if (result != CF_OK)
                 break;
-            }
-        } else {
-            memset(block_bytes, 0, sizeof(block_bytes));
+            done += pending;
         }
-        memcpy(block_bytes + in_block, (const uint8_t *)buffer + done, take);
+        if (!batch.open) {
+            result = cf_write_batch_begin(s, node, &batch);
+            if (result != CF_OK)
+                break;
+        }
+        if (in_block == 0 && take == CF_BLOCK_SIZE) {
+            /* A whole-block overwrite never needs the old contents. */
+            memcpy(block_bytes, (const uint8_t *)buffer + done + batch.pending_bytes, take);
+        } else {
+            CF_BLOCK *existing = cf_node_find_block(node, block_index, NULL, NULL);
+            if (existing) {
+                result = cf_node_decode_block(s, node, existing, block_bytes);
+                if (result != CF_OK)
+                    break;
+            } else {
+                memset(block_bytes, 0, CF_BLOCK_SIZE);
+            }
+            memcpy(block_bytes + in_block, (const uint8_t *)buffer + done + batch.pending_bytes,
+                take);
+        }
         size_after = current + take;
         if (size_after < node->size)
             size_after = node->size;
-        block_result = cf_node_write_block(s, node, block_index, block_bytes, size_after);
-        cf_wipe(block_bytes, sizeof(block_bytes));
-        if (block_result != CF_OK) {
-            result = block_result;
+        if (size_after > s->capacity ||
+            size_after - node->size > s->capacity - s->logical_used) {
+            result = CF_NO_SPACE;
             break;
         }
+        result = cf_block_stage(s, node, &batch.tx, block_index, block_bytes, encoded,
+            &batch.stages[batch.staged]);
+        cf_wipe(block_bytes, CF_BLOCK_SIZE);
+        if (result != CF_OK)
+            break;
+        ++batch.staged;
+        s->logical_used += size_after - node->size;
+        node->size = size_after;
+        /* Paging (constrained) writes come from the lazy writer after the
+         * handle's Cleanup already stamped or explicitly set the times. */
+        if (!constrained)
+            node->write_time = node->change_time = cf_now_filetime();
+        batch.pending_bytes += take;
         current += take;
-        done += take;
     }
+    if (result == CF_OK) {
+        uint32_t pending = batch.pending_bytes;
+        result = cf_write_batch_commit(s, node, &batch);
+        if (result == CF_OK)
+            done += pending;
+    } else if (batch.open) {
+        cf_write_batch_abort(s, node, &batch);
+    }
+    /* Bytes of every committed transaction are reported even on failure. */
     *transferred = done;
 done:
-    cf_wipe(block_bytes, sizeof(block_bytes));
+    if (batch.open)
+        cf_write_batch_abort(s, node, &batch);
+    free(batch.stages);
+    if (block_bytes) {
+        cf_wipe(block_bytes, CF_BLOCK_SIZE);
+        free(block_bytes);
+    }
+    if (encoded) {
+        cf_wipe(encoded, CF_BLOCK_SIZE);
+        free(encoded);
+    }
     ReleaseSRWLockExclusive(&s->lock);
     return result;
 }
@@ -4484,6 +4528,22 @@ CF_RESULT cf_node_list_after(CF_STORE *s, CF_NODE *node, const wchar_t *marker,
     *entries = list;
     *count = total;
 done:
+    ReleaseSRWLockShared(&s->lock);
+    return result;
+}
+
+CF_RESULT cf_node_parent_info(CF_STORE *s, CF_NODE *node, CF_INFO *info) {
+    CF_RESULT result = CF_OK;
+    if (!s || !node || !info)
+        return CF_INVALID;
+    memset(info, 0, sizeof(*info));
+    AcquireSRWLockShared(&s->lock);
+    if (!cf_store_check_node(s, node))
+        result = CF_IO_ERROR;
+    else if (node == s->root || !node->parent)
+        result = CF_NOT_FOUND;
+    else
+        cf_node_fill_info(node->parent, info);
     ReleaseSRWLockShared(&s->lock);
     return result;
 }

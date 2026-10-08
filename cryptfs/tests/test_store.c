@@ -1784,7 +1784,9 @@ test_host_io_transaction_failures(void)
         111111111ULL) == 0);
     CHECK(run_host_io_failure_case(4, CF_TEST_IO_FLUSH, 2, FALSE, TRUE,
         222222222ULL) == 0);
-    CHECK(run_host_io_failure_case(5, CF_TEST_IO_EOF, 1, FALSE, TRUE,
+    /* An in-place inode rewrite keeps EOF, so the home-page flush is the
+     * last durable step before the closing marker. */
+    CHECK(run_host_io_failure_case(5, CF_TEST_IO_FLUSH, 3, FALSE, TRUE,
         222222222ULL) == 0);
     CHECK(run_host_io_failure_case(6, 0, 0, TRUE, TRUE,
         222222222ULL) == 0);
@@ -2017,12 +2019,13 @@ done:
 static int
 test_reclaim_host_io_failures(void)
 {
-    /* First two transaction writes are the committed unlink. Reclamation
-       then writes its journal at #6 and its commit marker at #7. */
+    /* The committed unlink performs five writes and, with EOF unchanged,
+       four flushes. Reclamation then writes its journal at write #6 / flush
+       #5 and its commit marker at write #7 / flush #6. */
     CHECK(run_reclaim_host_io_case(1, CF_TEST_IO_WRITE, 6, FALSE) == 0);
     CHECK(run_reclaim_host_io_case(2, CF_TEST_IO_WRITE, 7, TRUE) == 0);
-    CHECK(run_reclaim_host_io_case(3, CF_TEST_IO_FLUSH, 6, FALSE) == 0);
-    CHECK(run_reclaim_host_io_case(4, CF_TEST_IO_FLUSH, 7, TRUE) == 0);
+    CHECK(run_reclaim_host_io_case(3, CF_TEST_IO_FLUSH, 5, FALSE) == 0);
+    CHECK(run_reclaim_host_io_case(4, CF_TEST_IO_FLUSH, 6, TRUE) == 0);
     return 0;
 }
 
@@ -2227,7 +2230,7 @@ test_compaction_host_io_failures(void)
     CHECK(run_compaction_move_io_case(3, CF_TEST_IO_WRITE, 2, FALSE) == 0);
     CHECK(run_compaction_move_io_case(4, CF_TEST_IO_FLUSH, 2, FALSE) == 0);
     CHECK(run_compaction_move_io_case(5, CF_TEST_IO_WRITE, 3, FALSE) == 0);
-    CHECK(run_compaction_move_io_case(6, CF_TEST_IO_EOF, 1, FALSE) == 0);
+    CHECK(run_compaction_move_io_case(6, CF_TEST_IO_FLUSH, 3, FALSE) == 0);
     CHECK(run_compaction_move_io_case(7, CF_TEST_IO_WRITE, 5, FALSE) == 0);
 
     CHECK(run_compaction_trim_io_case(1, CF_TEST_IO_WRITE, 1, TRUE, CF_MIN_EOF) == 0);
@@ -2587,6 +2590,79 @@ test_background_shrink(void)
     return 0;
 }
 
+/* One write spanning many blocks commits in a few batched transactions. */
+static int
+test_batched_write(void)
+{
+    enum { SPAN = 4 * 1024 * 1024 + 4321, START = 1000 };
+    wchar_t path[MAX_PATH * 2];
+    CF_STORE *store = NULL;
+    CF_NODE *file = NULL;
+    CF_STATS before, after;
+    CF_INFO info;
+    uint8_t *data = (uint8_t *)malloc(SPAN), *check = (uint8_t *)malloc(SPAN + START);
+    uint32_t transferred = 0;
+    size_t i;
+    int rc = 1;
+
+    if (!data || !check)
+        goto done;
+    cf_random(data, SPAN / 2);
+    memset(data + SPAN / 2, 'z', SPAN - SPAN / 2); /* half incompressible, half not */
+    if (_snwprintf_s(path, ARRAYSIZE(path), _TRUNCATE, L"%ls\\cryptfs-batch-%lu.cf",
+        g_directory, (unsigned long)GetCurrentProcessId()) < 0)
+        goto done;
+    DeleteFileW(path);
+    if (open_store(path, TRUE, FALSE, &store) != CF_OK ||
+        cf_node_create(store, L"\\big", FILE_ATTRIBUTE_NORMAL, &file) != CF_OK ||
+        cf_store_stats(store, &before) != CF_OK)
+        goto done;
+    if (cf_node_write(store, file, data, START, SPAN, false, false, &transferred) != CF_OK ||
+        transferred != SPAN || cf_store_stats(store, &after) != CF_OK) {
+        fprintf(stderr, "batched write: write failed transferred=%u\n", transferred);
+        goto done;
+    }
+    /* 66 blocks; per-block commits would need 66 transactions. */
+    if (after.commits - before.commits > 8) {
+        fprintf(stderr, "batched write: %llu commits\n",
+            (unsigned long long)(after.commits - before.commits));
+        goto done;
+    }
+    cf_node_close(store, file); file = NULL;
+    cf_store_close(store); store = NULL;
+    if (open_store(path, FALSE, FALSE, &store) != CF_OK ||
+        cf_node_open(store, L"\\big", &file) != CF_OK ||
+        cf_node_info(store, file, &info) != CF_OK || info.size != (uint64_t)START + SPAN ||
+        cf_node_read(store, file, check, 0, SPAN + START, &transferred) != CF_OK ||
+        transferred != SPAN + START) {
+        fprintf(stderr, "batched write: reopen/read failed\n");
+        goto done;
+    }
+    for (i = 0; i < START; ++i)
+        if (check[i] != 0) goto done;
+    if (memcmp(check + START, data, SPAN) != 0) {
+        fprintf(stderr, "batched write: data mismatch after reopen\n");
+        goto done;
+    }
+    /* Rewriting a straddling range replaces blocks in place within one batch. */
+    memset(data, 0x33, 3 * CF_BLOCK_SIZE);
+    if (cf_node_write(store, file, data, CF_BLOCK_SIZE - 7, 3 * CF_BLOCK_SIZE, false, false,
+        &transferred) != CF_OK || transferred != 3 * CF_BLOCK_SIZE ||
+        cf_node_read(store, file, check, CF_BLOCK_SIZE - 7, 3 * CF_BLOCK_SIZE,
+            &transferred) != CF_OK || memcmp(check, data, 3 * CF_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "batched write: straddling rewrite failed\n");
+        goto done;
+    }
+    rc = 0;
+done:
+    if (file) cf_node_close(store, file);
+    if (store) cf_store_close(store);
+    DeleteFileW(path);
+    free(data);
+    free(check);
+    return rc;
+}
+
 /* Marker-based paging and exact child lookup used by the WinFsp directory callbacks. */
 static int
 test_directory_paging_and_lookup(void)
@@ -2769,6 +2845,9 @@ wmain(int argc, wchar_t **argv)
         return 1;
     printf("stage: background shrink\n"); fflush(stdout);
     if (test_background_shrink() != 0)
+        return 1;
+    printf("stage: batched write\n"); fflush(stdout);
+    if (test_batched_write() != 0)
         return 1;
     printf("stage: directory paging and lookup\n"); fflush(stdout);
     if (test_directory_paging_and_lookup() != 0)
