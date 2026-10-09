@@ -244,14 +244,12 @@ uint64_t memfs_test_capacity_available(Memfs* fs, bool force_refresh) {
 }
 #endif
 
-static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
+/* Growth beyond the reserve, from what the system has free. */
+static uint64_t memfs_auto_system_allowance(Memfs* fs, uint64_t available) {
 	uint64_t system_allowance;
 	uint64_t committed;
 	uint64_t resident;
 	uint64_t allowance;
-
-	if (fs == NULL || !fs->capacity_auto)
-		return 0;
 
 	system_allowance = available > MEMFS_AUTO_HARD_MARGIN_BYTES
 		? available - MEMFS_AUTO_HARD_MARGIN_BYTES
@@ -267,6 +265,19 @@ static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available
 		return 0;
 
 	return allowance;
+}
+
+static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
+	uint64_t reserved;
+	uint64_t allowance;
+
+	if (fs == NULL || !fs->capacity_auto)
+		return 0;
+
+	/* The unused part of the reserve is ours whatever the system has free. */
+	reserved = memfs_allocator_reserve_available(&fs->allocator);
+	allowance = memfs_auto_system_allowance(fs, available);
+	return allowance > UINT64_MAX - reserved ? UINT64_MAX : allowance + reserved;
 }
 
 uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
@@ -3150,6 +3161,12 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	if (!memfs_allocator_init(&fs->allocator, sizeof(MemfsNode), sizeof(MemfsDir), sizeof(MemfsPageGroup))) {
 		memfs_allocator_free_control(fs, sizeof(*fs));
 		return MEMFS_ERR_NO_MEMORY;
+	}
+	if (options->capacity_auto && options->auto_reserve_bytes != 0 &&
+		!memfs_allocator_set_reserve(&fs->allocator, options->auto_reserve_bytes)) {
+		memfs_allocator_destroy(&fs->allocator);
+		memfs_allocator_free_control(fs, sizeof(*fs));
+		return MEMFS_ERR_NO_SPACE;
 	}
 
 	for (uint32_t i = 0; i < MEMFS_COMPRESSION_CONTEXT_LANES; i++) {

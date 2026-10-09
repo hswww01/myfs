@@ -1,4 +1,5 @@
 #include "memfs_core.h"
+#include "memfs_alloc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -184,6 +185,78 @@ static void test_pressure_preserves_data(void) {
     puts("production pressure rejection/rollback/relief PASS");
 }
 
+/* A reserve keeps that much storable while the system reports no free memory,
+ * and is refilled after files are deleted. */
+static void test_reserve_survives_pressure(void) {
+    MockSystem m;
+    Memfs* fs = NULL;
+    MemfsOptions options = {0};
+    MemfsCapacityTestHooks hooks = {mock_available, mock_clock, &m};
+    MemfsNode* file = NULL;
+    const uint64_t reserve = 64ULL * 1024ULL * 1024ULL;
+    const uint32_t chunk = 1024U * 1024U;
+    uint8_t* buffer = NULL;
+    uint32_t transferred = 0;
+    uint64_t before;
+    uint32_t i;
+
+    memset(&m, 0, sizeof(m));
+    m.available = 0; /* the system is out of memory from the start */
+    m.ticks = 1000;
+    memfs_test_capacity_set_hooks(&hooks);
+    options.capacity_auto = true;
+    options.auto_reserve_bytes = reserve;
+    options.volume_label = L"RESERVE";
+    CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+    if (fs == NULL) {
+        memfs_test_capacity_set_hooks(NULL);
+        return;
+    }
+    m.fs = fs;
+    before = memfs_allocator_reserve_available(&fs->allocator);
+    CHECK(before > reserve - 4ULL * 1024ULL * 1024ULL && before <= reserve);
+    CHECK(memfs_free_bytes(fs) >= before);
+
+    buffer = (uint8_t*)memfs_allocator_alloc(&fs->allocator, chunk);
+    CHECK(buffer != NULL);
+    if (buffer == NULL)
+        goto done;
+    memset(buffer, 0xa5, chunk);
+    CHECK(memfs_node_create(fs, fs->root, L"inside.bin", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+    if (file == NULL)
+        goto done;
+    /* Half the reserve fits although the system has nothing free. */
+    for (i = 0; i < 32; i++) {
+        CHECK(memfs_node_write(file, buffer, (uint64_t)i * chunk, chunk, false, false,
+            &transferred) == MEMFS_OK);
+    }
+    CHECK(file->file_size == 32ULL * chunk);
+    CHECK(memfs_allocator_reserve_available(&fs->allocator) < before - 30ULL * chunk);
+    /* Beyond the reserve the system decides, and it has nothing. */
+    {
+        MemfsResult result = MEMFS_OK;
+        for (i = 32; i < 96 && result == MEMFS_OK; i++)
+            result = memfs_node_write(file, buffer, (uint64_t)i * chunk, chunk, false, false,
+                &transferred);
+        CHECK(result == MEMFS_ERR_NO_SPACE);
+        CHECK(file->file_size < 72ULL * chunk);
+    }
+    /* Deleting the data gives the reserve back. */
+    CHECK(memfs_node_unlink(file) == MEMFS_OK);
+    memfs_node_close(file);
+    file = NULL;
+    (void)memfs_allocator_scavenge(&fs->allocator);
+    CHECK(memfs_allocator_reserve_available(&fs->allocator) > before - 8ULL * chunk);
+    puts("reserve under pressure / refill PASS");
+
+done:
+    if (buffer != NULL)
+        memfs_allocator_free(&fs->allocator, buffer, chunk);
+    memfs_destroy(fs);
+    memfs_test_capacity_set_hooks(NULL);
+}
+
 #define READER_COUNT 4
 #define STRESS_VALUE (4ULL * 1024ULL * 1024ULL * 1024ULL)
 typedef struct Stress {
@@ -267,6 +340,7 @@ int main(void) {
     test_hit_expiry_force_and_slow_query();
     test_growth_during_sample_and_free_reallocate();
     test_pressure_preserves_data();
+    test_reserve_survives_pressure();
     test_concurrent_production_snapshot();
     printf("memfs_capacity_snapshot_test: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

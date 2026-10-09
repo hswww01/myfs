@@ -73,6 +73,9 @@ typedef struct MemfsCompressionLane {
 typedef struct MemfsOptions {
 	uint64_t capacity;
 	bool capacity_auto;
+	/* Auto capacity only: system commit held from the start, so this much
+	 * can always be stored; beyond it the volume grows with free memory. */
+	uint64_t auto_reserve_bytes;
 	const wchar_t* volume_label;
 	bool compression_enabled;
 	int compression_level;
@@ -83,6 +86,7 @@ typedef struct MemfsOptions {
 
 #define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
 #define MEMFS_AUTO_SOFT_MARGIN_BYTES (512ULL * 1024ULL * 1024ULL)
+#define MEMFS_AUTO_DEFAULT_RESERVE_BYTES (1024ULL * 1024ULL * 1024ULL)
 
 /*
  * Runtime statistics are a lock-safe aggregate, not a globally atomic instant.

@@ -163,6 +163,15 @@ uint64_t memfs_allocator_committed_bytes(MemfsAllocator* allocator);
 uint64_t memfs_allocator_commit_total_bytes(MemfsAllocator* allocator);
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats);
 uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator);
+/*
+ * Holds `bytes` of system commit for this allocator: memory it has not
+ * committed itself yet stays reserved, so allocations up to that total never
+ * fail for lack of system commit. Call once, right after init. False when
+ * the system cannot back the reserve.
+ */
+bool memfs_allocator_set_reserve(MemfsAllocator* allocator, uint64_t bytes);
+/* Part of the reserve not yet used by the allocator. */
+uint64_t memfs_allocator_reserve_available(MemfsAllocator* allocator);
 
 /*
  * Process-wide control allocation for objects that must exist before their own

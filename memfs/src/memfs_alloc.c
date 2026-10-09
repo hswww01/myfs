@@ -102,6 +102,18 @@ struct MemfsAllocatorState {
     uint64_t region_bytes;
     volatile LONG64 committed_total_bytes;
     volatile LONG64 gross_commit_total_bytes;
+    /*
+     * Commit reserve ("balloon"): address space of reserve_bytes whose
+     * committed prefix holds system commit for this allocator. It shrinks
+     * just before the allocator commits new memory and grows back after
+     * memory is released, so committed_total + reserve_committed stays at
+     * least reserve_bytes. Committed but untouched pages use no RAM.
+     */
+    SRWLOCK reserve_lock;
+    uint8_t* reserve_base;
+    uint64_t reserve_bytes;
+    volatile LONG64 reserve_committed;
+    size_t page_size;
     MemfsPool pools[MEMFS_ALLOC_CLASS_COUNT];
 
     MemfsAreaShard area_shards[MEMFS_POOL_SHARD_COUNT];
@@ -115,17 +127,71 @@ static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
 static INIT_ONCE g_control_allocator_once = INIT_ONCE_STATIC_INIT;
 static MemfsAllocator g_control_allocator;
 
+/* Regrowth below this deficit is skipped to avoid a syscall per free. */
+#define MEMFS_RESERVE_REGROW_SLACK (1024U * 1024U)
+
+/* Resizes the committed prefix of the reserve to `target` (page aligned).
+ * Caller holds reserve_lock. Growth is best effort. */
+static void reserve_resize_locked(MemfsAllocatorState* state, uint64_t target) {
+    uint64_t committed = (uint64_t)state->reserve_committed;
+
+    if (target < committed) {
+        if (memfs_vm_decommit(state->reserve_base + target, (size_t)(committed - target)))
+            InterlockedExchange64(&state->reserve_committed, (LONG64)target);
+    } else if (target > committed) {
+        if (memfs_vm_commit(state->reserve_base + committed, (size_t)(target - committed)))
+            InterlockedExchange64(&state->reserve_committed, (LONG64)target);
+    }
+}
+
+/* The reserve covers whatever part of reserve_bytes the allocator is not
+ * using itself; `pending` is memory about to be committed. */
+static uint64_t reserve_target(MemfsAllocatorState* state, uint64_t pending) {
+    uint64_t used = (uint64_t)InterlockedCompareExchange64(
+        &state->committed_total_bytes, 0, 0) + pending;
+    uint64_t target = state->reserve_bytes > used ? state->reserve_bytes - used : 0;
+    return target & ~((uint64_t)state->page_size - 1U);
+}
+
+/* Called before committing `bytes` of new memory: hand that much of the
+ * reserve back first, so the allocation succeeds even when the system is
+ * otherwise at its commit limit. */
+static void state_prepare_commit(MemfsAllocatorState* state, uint64_t bytes) {
+    if (state == NULL || state->reserve_base == NULL || bytes == 0)
+        return;
+    AcquireSRWLockExclusive(&state->reserve_lock);
+    if ((uint64_t)state->reserve_committed > reserve_target(state, bytes))
+        reserve_resize_locked(state, reserve_target(state, bytes));
+    ReleaseSRWLockExclusive(&state->reserve_lock);
+}
+
+/* Brings the reserve back to its target after commits changed. */
+static void state_settle_reserve(MemfsAllocatorState* state) {
+    uint64_t target;
+
+    if (state == NULL || state->reserve_base == NULL)
+        return;
+    AcquireSRWLockExclusive(&state->reserve_lock);
+    target = reserve_target(state, 0);
+    if ((uint64_t)state->reserve_committed > target ||
+        target - (uint64_t)state->reserve_committed >= MEMFS_RESERVE_REGROW_SLACK)
+        reserve_resize_locked(state, target);
+    ReleaseSRWLockExclusive(&state->reserve_lock);
+}
+
 static void state_add_committed(MemfsAllocatorState* state, uint64_t bytes) {
     if (state == NULL || bytes == 0)
         return;
     InterlockedAdd64(&state->gross_commit_total_bytes, (LONG64)bytes);
     InterlockedAdd64(&state->committed_total_bytes, (LONG64)bytes);
+    state_settle_reserve(state);
 }
 
 static void state_sub_committed(MemfsAllocatorState* state, uint64_t bytes) {
     if (state == NULL || bytes == 0)
         return;
     InterlockedAdd64(&state->committed_total_bytes, -(LONG64)bytes);
+    state_settle_reserve(state);
 }
 
 static uint64_t state_committed_bytes(MemfsAllocatorState* state) {
@@ -352,9 +418,12 @@ static MemfsSlab* slab_create(MemfsPool* pool, MemfsPoolShard* shard) {
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SLAB))
         return NULL;
 
+    state_prepare_commit(pool->state, pool->slab_bytes);
     slab = memfs_vm_reserve_commit(pool->slab_bytes);
-    if (slab == NULL)
+    if (slab == NULL) {
+        state_settle_reserve(pool->state);
         return NULL;
+    }
 
     memset(slab, 0, data_offset);
     slab->owner = pool;
@@ -797,9 +866,12 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes, bool zero_memo
     }
     ReleaseSRWLockExclusive(&shard->lock);
 
+    state_prepare_commit(state, total_size);
     block = memfs_vm_reserve_commit(total_size);
-    if (block == NULL)
+    if (block == NULL) {
+        state_settle_reserve(state);
         return NULL;
+    }
 
     memset(block, 0, header_size);
     block->owner = state;
@@ -1018,6 +1090,8 @@ static MemfsAllocatorState* state_create(void) {
     state->magic = MEMFS_ALLOC_STATE_MAGIC;
     state->class_count = MEMFS_ALLOC_CLASS_COUNT;
     state->allocation_granularity = vm_info.allocation_granularity;
+    state->page_size = vm_info.page_size;
+    InitializeSRWLock(&state->reserve_lock);
     state->region_bytes = memfs_vm_region_bytes(state);
     state->committed_total_bytes = (LONG64)state->region_bytes;
     state->gross_commit_total_bytes = (LONG64)state->region_bytes;
@@ -1055,8 +1129,48 @@ static void state_destroy(MemfsAllocatorState* state) {
         pool_destroy(&state->pools[i]);
 
     area_destroy_all(state);
+    if (state->reserve_base != NULL)
+        memfs_vm_release(state->reserve_base);
     state->magic = 0;
     memfs_vm_release(state);
+}
+
+bool memfs_allocator_set_reserve(MemfsAllocator* allocator, uint64_t bytes) {
+    MemfsAllocatorState* state;
+    uint64_t target;
+
+    if (allocator == NULL || (state = allocator->state) == NULL ||
+        state->reserve_base != NULL)
+        return false;
+    if (bytes == 0)
+        return true;
+    if (bytes > (uint64_t)SIZE_MAX / 2U)
+        return false;
+    bytes = (bytes + state->page_size - 1U) & ~((uint64_t)state->page_size - 1U);
+    state->reserve_base = (uint8_t*)memfs_vm_reserve((size_t)bytes);
+    if (state->reserve_base == NULL)
+        return false;
+    state->reserve_bytes = bytes;
+    AcquireSRWLockExclusive(&state->reserve_lock);
+    target = reserve_target(state, 0);
+    reserve_resize_locked(state, target);
+    ReleaseSRWLockExclusive(&state->reserve_lock);
+    if ((uint64_t)state->reserve_committed != target) {
+        /* The system cannot back the reserve right now. */
+        memfs_vm_release(state->reserve_base);
+        state->reserve_base = NULL;
+        state->reserve_bytes = 0;
+        state->reserve_committed = 0;
+        return false;
+    }
+    return true;
+}
+
+uint64_t memfs_allocator_reserve_available(MemfsAllocator* allocator) {
+    if (allocator == NULL || allocator->state == NULL)
+        return 0;
+    return (uint64_t)InterlockedCompareExchange64(
+        &allocator->state->reserve_committed, 0, 0);
 }
 
 static void* allocator_alloc_internal(

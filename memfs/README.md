@@ -116,6 +116,8 @@ Options:
 ```text
 --mount <path>          Drive letter or directory mount point
 --size <bytes|auto>     Capacity 1..INT64_MAX; K/M/G suffix supported
+--reserve <bytes>       With --size auto: memory held from the start (default 1G, 0 = off)
+--mkdir <path>          Create a directory before mounting (repeatable, nested allowed)
 --label <name>          Volume label
 --threads <n>           Dispatcher threads; 0 = automatic, otherwise 2..64
 --compress              Enable Zstd compression at level 1
@@ -256,7 +258,9 @@ The allocator's public pointer-alignment contract is **at least 8 bytes** for ev
 
 Zero-initialized typed allocations (`node`, `dir`, `page_group`) keep their existing safety contract. A separate `memfs_allocator_alloc_uninit()` fast path is used only where the caller immediately overwrites the complete requested payload (encoded page blobs, copied security descriptors, temporary path buffers and copied names). This avoids redundant memset traffic without exposing stale bytes to code that expects zero-filled objects. The allocator contention benchmark reports both `zero` and `uninit` modes.
 
-`capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
+`capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity.
+
+Auto capacity starts with a **reserve** (`--reserve`, default 1 GiB). At mount the allocator commits that much address space it does not touch: it raises the system commit charge but uses no physical memory. Whenever the allocator commits new backing it first decommits the same amount from the reserve, and it refills the reserve after backing is released, so the volume can always store about the reserve even when other programs have exhausted system memory. Beyond the reserve the volume grows with free system memory as before; the reported free space is the unused reserve plus that system allowance. The mount fails if the system cannot commit the reserve at startup. The reserve guarantees commit, not residency: Windows can still page the data out under pressure. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
 The auto-capacity **growth hot path** keeps a 1 ms cache of the OS available-memory sample. Public allowance/stats APIs remain live queries. One SRW lock protects the complete snapshot (available bytes, gross-commit baseline and timestamp/deadline), including forced refreshes: individually atomic fields with a deadline published last did not prevent mixing an old live snapshot with a new sample. The gross successful-commit counter is captured before the OS query, then all subsequent commitments are debited, even if freed/reallocated regions leave net committed bytes unchanged. The TTL begins before the query; a slow OS call cannot make an old sample look fresh. Near pressure or on a request larger than the allowance, the cache is refreshed after scavenging.
 
