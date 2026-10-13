@@ -1,47 +1,49 @@
 # memfs
 
-A high-performance volatile Windows memory file system written in C17 on top of the native WinFsp API.
+基于原生 WinFsp API、使用 C17 编写的高性能易失性 Windows 内存文件系统。
 
-## Features
+## 功能
 
-- Pure C17, CMake, Ninja, clang-cl and vcpkg.
-- Native WinFsp API; no FUSE layer.
-- Case-insensitive, case-preserving names (NTFS semantics).
-- Adaptive directory index: intrusive treap plus a lazy open-addressing hash for large directories.
-- Create/open/read/write/truncate/rename/move/delete and directory enumeration.
-- Sparse file storage with 4 KiB logical pages.
-- Tiny-file storage with 8-byte plaintext granularity.
-- Optional per-page Zstd compression.
-- Optional per-page authenticated encryption: hardware AES-256-GCM when available, with XChaCha20-Poly1305 fallback.
-- Windows file attributes, timestamps and ACL/security descriptors.
-- WinFsp FINE operation guard so different files can perform I/O concurrently.
-- Thread-safe global capacity and resident-memory accounting.
+- 纯 C17、CMake、Ninja、clang-cl 和 vcpkg。
+- 使用原生 WinFsp API，不经过 FUSE。
+- 文件名按 NTFS 语义比较：不区分大小写，但保留创建时的大小写。
+- 自适应目录索引：基础为侵入式 treap，大目录按需增加开放寻址哈希表。
+- 支持创建、打开、读、写、截断、改名、移动、删除和目录枚举。
+- 稀疏文件使用 4 KiB 逻辑页。
+- 小文件以 8 字节明文粒度存储。
+- 可选的逐页 Zstd 压缩。
+- 可选的逐页认证加密：支持硬件加速时使用 AES-256-GCM，否则回退到 XChaCha20-Poly1305。
+- 支持 Windows 文件属性、时间戳、ACL 和安全描述符。
+- 使用 WinFsp FINE 操作保护，不同文件可并发执行 I/O。
+- 全局容量和驻留内存统计支持线程安全并发访问。
 
-All file-system contents are volatile. Unmounting or terminating the process loses all files.
+文件系统中的全部内容都是易失数据。卸载或终止进程后，文件都会丢失。
 
-## Filename comparison
+## 文件名比较规则
 
-Names are case-insensitive and case-preserving, like NTFS: lookup, collision checks, directory ordering, wildcard filtering, rename and deletion compare UTF-16 code units after the system upcase mapping (`RtlUpcaseUnicodeChar`). `Readme.txt` and `README.TXT` name the same entry, which keeps the spelling it was created with; a case-only rename changes that spelling. There is no Unicode normalization.
+文件名与 NTFS 一样不区分大小写、但保留大小写。查找、冲突检查、目录排序、通配符过滤、改名和删除，会先用系统大写映射（`RtlUpcaseUnicodeChar`）转换 UTF-16 代码单元再比较。`Readme.txt` 和 `README.TXT` 指向同一条目，并保留创建时的拼写；只改变大小写的改名会更新该拼写。不执行 Unicode 规范化。
 
-Case sensitivity is selected when WinFsp creates a volume, so an already-mounted instance keeps its existing behavior. Validate a rebuilt version on a newly mounted, unused volume; do not stop a live volatile volume unless its contents may be discarded.
+大小写行为在 WinFsp 创建卷时确定，已挂载实例会继续使用原有行为。验证重新构建的版本时，应挂载一个新的、未占用的卷；除非允许丢弃卷中数据，否则不要停止正在运行的易失卷。
 
-## Prerequisites
+## 依赖
 
-- Windows 10/11 x64, or Windows 11 ARM64 running the x64 user-mode executable under Windows x64 emulation. 32-bit Windows and Windows 10 ARM64 are not supported.
-- WinFsp Git source tree at `D:\\src\\winfsp`; `scripts\\prepare-winfsp-static.ps1` derives the exact source commit from the installed signed driver and prepares `D:\\src\\winfsp-memfs-static`.
-- Visual Studio C/C++ build tools.
-- LLVM/clang-cl.
-- CMake + Ninja.
-- vcpkg at `D:\vcpkg` for the supplied presets.
+- Windows 10/11 x64，或在 Windows x64 仿真下运行 x64 用户态程序的 Windows 11 ARM64。32 位 Windows 和 Windows 10 ARM64 不支持。
+- WinFsp Git 源码位于 `D:\src\winfsp`。`scripts\prepare-winfsp-static.ps1` 会根据已安装的签名驱动确定准确源码提交，并准备 `D:\src\winfsp-memfs-static`。
+- Visual Studio C/C++ 构建工具。
+- 编译器：LLVM/clang-cl。
+- CMake 和 Ninja。
+- 提供的 presets 使用位于 `D:\vcpkg` 的 vcpkg。
 
-The vcpkg manifest installs `zstd` and `libsodium`. Before the first build, run `scripts\\prepare-winfsp-static.ps1`. It reads the installed signed WinFsp driver's FileVersion, resolves the matching Git commit, creates `D:\\src\\winfsp-memfs-static`, applies the minimal static-user-mode support, and builds Debug/Release static libraries from that exact source version. The supplied presets then link that matching static runtime, so `memfs.exe` does not require `winfsp-x64.dll` at runtime.
+vcpkg manifest 会安装 `zstd` 和 `libsodium`。首次构建前运行 `scripts\prepare-winfsp-static.ps1`。该脚本读取已安装签名 WinFsp 驱动的 FileVersion，解析对应 Git 提交，创建 `D:\src\winfsp-memfs-static`，应用最小静态用户态支持，并从完全匹配的源码版本构建 Debug/Release 静态库。之后 presets 会链接该匹配的静态运行库，所以运行 `memfs.exe` 不需要 `winfsp-x64.dll`。
 
-Both signed WinFsp kernel drivers (`winfsp-x64.sys` and `winfsp-a64.sys`) are embedded into the single x64 `memfs.exe`. CMake requires the two SYS files to come from the same signed WinFsp release and to match the statically linked x64 user-mode runtime. The build additionally validates each SYS PE machine (`AMD64` / `ARM64`), requires a valid Microsoft Windows Hardware Compatibility Publisher Authenticode signature, and requires the two drivers to share the same signer. At runtime memfs uses `IsWow64Process2` to determine the native Windows machine architecture: AMD64 hosts use the x64 SYS, while Windows 11 ARM64 hosts running the x64 EXE under emulation use the ARM64 SYS. Kernel drivers are never emulated. CTest also calls `FspVersion()` from the linked static library, parses the embedded SYS PE headers, reruns the driver provenance gate, and parses the built PE import/delay-import tables, so stale/mismatched WinFsp inputs or a reintroduced `winfsp*.dll` dependency fail verification. If no compatible official WinFsp driver is available, an elevated memfs process installs/starts the matching embedded signed fallback driver and retries `FspFileSystemCreate`.
+匹配版本的签名 WinFsp 内核驱动（`winfsp-x64.sys` 和 `winfsp-a64.sys`）会嵌入单个 x64 `memfs.exe`。CMake 要求两个 SYS 来自同一个已签名 WinFsp 版本，并与静态链接的 x64 用户态运行库匹配。构建还会检查每个 SYS 的 PE 架构（`AMD64` / `ARM64`）、Microsoft Windows Hardware Compatibility Publisher Authenticode 签名有效性，以及两个驱动是否由同一签名者签署。
 
-## Build
+运行时，memfs 使用 `IsWow64Process2` 判断 Windows 原生架构：AMD64 主机使用 x64 SYS；在 x64 仿真下运行 x64 EXE 的 Windows 11 ARM64 主机则使用 ARM64 SYS。内核驱动不会经仿真运行。CTest 也会调用静态库中的 `FspVersion()`，解析嵌入 SYS 的 PE 头，重新检查驱动来源，并解析构建后 PE 的普通导入和延迟导入表；因此，WinFsp 输入过期/不匹配或重新引入 `winfsp*.dll` 依赖都会导致验证失败。若没有兼容的官方 WinFsp 驱动，提升权限运行的 memfs 进程会安装并启动匹配的嵌入签名备用驱动，再重试 `FspFileSystemCreate`。
+
+## 构建
 
 ```powershell
-cd D:\work\fs\memfs
+Set-Location D:\work\fs\memfs
 
 .\scripts\prepare-winfsp-static.ps1
 
@@ -54,98 +56,97 @@ cmake --build --preset x64-release
 ctest --preset x64-release
 ```
 
-## Release package and third-party notices
+## 发布包和第三方声明
 
-Create the current x64 release package with:
+运行以下命令创建当前 x64 发布包：
 
 ```powershell
 .\scripts\package-release.ps1
 ```
 
-The package contains `memfs.exe`, `BUILD_PROVENANCE.json`, `THIRD_PARTY_NOTICES.md`, SHA-256 sums, and the authoritative license texts for WinFsp, libsodium and zstd. Packaging is intentionally strict: the tracked Git tree must be clean, the Release build is rebuilt, the full CTest suite must pass, and the generated provenance is verified before the staging directory is published. `BUILD_PROVENANCE.json` records the exact memfs/WinFsp commits, WinFsp patch diff hash, static-library and SYS hashes, PE architecture/signature evidence, compiler binary/version, vcpkg Git commit/builtin baseline/triplet hash, dependency versions, and final EXE hash.
+发布包包含 `memfs.exe`、`BUILD_PROVENANCE.json`、`THIRD_PARTY_NOTICES.md`、SHA-256 校验和，以及 WinFsp、libsodium 和 zstd 的权威许可证文本。打包门禁刻意采用严格模式：Git 跟踪树必须干净、重新构建 Release、完整 CTest 套件必须通过，并且生成的来源记录必须校验成功，之后才发布暂存目录。
 
-This same x64 package is used on Windows 11 ARM64. Windows runs `memfs.exe` under x64 emulation, while memfs selects the embedded native ARM64 WinFsp kernel driver when a fallback driver is required.
+`BUILD_PROVENANCE.json` 记录确切的 memfs/WinFsp 提交、WinFsp 补丁差异哈希、静态库和 SYS 哈希、PE 架构/签名证据、编译器二进制及版本、vcpkg Git 提交/内置 baseline/triplet 哈希、依赖版本和最终 EXE 哈希。
 
-The current build statically links WinFsp user-mode code. WinFsp's local
-`License.txt` states GPLv3 and its FLOSS special exception explicitly covers
-linking with the platform WinFsp DLLs, not a general static-linking exception.
-Before proprietary distribution, obtain appropriate WinFsp commercial
-permission or otherwise ensure the chosen distribution terms satisfy the
-applicable WinFsp/GPLv3 obligations. See `THIRD_PARTY_NOTICES.md`.
+同一个 x64 包也用于 Windows 11 ARM64：Windows 在 x64 仿真下运行 `memfs.exe`，需要备用驱动时 memfs 会选择嵌入的原生 ARM64 WinFsp 内核驱动。
 
-## Run
+当前构建静态链接 WinFsp 用户态代码。WinFsp 本地 `License.txt` 声明 GPLv3，其 FLOSS 特别例外明确涵盖与平台 WinFsp DLL 链接，并不是对任意静态链接的通用例外。用于专有软件分发前，应获得适当的 WinFsp 商业许可，或确保分发条款符合适用的 WinFsp/GPLv3 要求。详见 `THIRD_PARTY_NOTICES.md`。
 
-Run `memfs.exe` with no arguments, or pass `--gui`, to open the native configuration window. Use **挂载** to start a temporary console-mode mount owned by that window and **卸载临时挂载** to stop only that instance. The **安装并启动服务** and **卸载服务** actions use the selected service name; uninstall requires only that name. Mount settings include capacity, label, dispatcher threads, compression, encryption, debug logging, and runtime statistics. The GUI accepts an environment-variable name for an existing 64-hex key but never asks for or displays the key itself. LocalSystem service installation rejects environment keys; choose **随机临时密钥** or disable encryption for that action.
+## 运行
 
-Basic 512 MiB RAM disk:
+不带参数运行 `memfs.exe`，或传入 `--gui`，即可打开原生配置窗口。点击 **挂载** 会启动由该窗口拥有的临时控制台挂载；点击 **卸载临时挂载** 只停止此实例。**安装并启动服务** 和 **卸载服务** 使用选定的服务名；卸载时只需指定服务名。挂载设置包括容量、卷标、dispatcher 线程数、压缩、加密、调试日志和运行时统计。
+
+GUI 可以接收一个已存在的 64 位十六进制密钥环境变量名，但不会索要或显示密钥内容。LocalSystem 服务安装拒绝使用环境密钥；该操作可选择 **随机临时密钥** 或关闭加密。
+
+基本 512 MiB 内存盘：
 
 ```powershell
 .\build\x64-release\memfs.exe --mount R:
 ```
 
-Custom capacity and label:
+自定义容量和卷标：
 
 ```powershell
 .\build\x64-release\memfs.exe --mount R: --size 1G --label FASTRAM
 ```
 
-Compression:
+启用压缩：
 
 ```powershell
 .\build\x64-release\memfs.exe --mount R: --compress
 .\build\x64-release\memfs.exe --mount R: --compression-level 3
 ```
 
-Encryption with a random process-lifetime key:
+使用进程生命周期内随机密钥加密：
 
 ```powershell
 .\build\x64-release\memfs.exe --mount R: --encrypt
 ```
 
-For a caller-supplied 256-bit key, prefer an environment variable so the key does not appear in the command line:
+使用调用方提供的 256 位密钥时，建议通过环境变量传入，避免密钥出现在命令行：
 
 ```powershell
 $env:MEMFS_KEY = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 .\build\x64-release\memfs.exe --mount R: --compress --key-env MEMFS_KEY
 ```
 
-`--key-hex <64hex>` is also supported for testing, but command-line arguments may be visible to other processes or diagnostic tools.
+测试时也可使用 `--key-hex <64hex>`，但其他进程或诊断工具可能看到命令行参数。
 
-Options:
+参数：
 
 ```text
---mount <path>          Drive letter or directory mount point
---size <bytes|auto>     Capacity 1..INT64_MAX; K/M/G suffix supported
---reserve <bytes>       With --size auto: memory held from the start (default 1G, 0 = off)
---mkdir <path>          Create a directory before mounting (repeatable, nested allowed)
---label <name>          Volume label
---threads <n>           Dispatcher threads; 0 = automatic, otherwise 2..64
---compress              Enable Zstd compression at level 1
---compression-level <n> Enable Zstd level 1..22
---encrypt               Use a random 256-bit key; hardware AES-256-GCM when available, else XChaCha20-Poly1305
---key-hex <64hex>       Use a fixed 256-bit key
---key-env <name>        Read a 64-hex key from an environment variable
---debug                 Enable WinFsp debug logging
---service               Run under the Windows Service Control Manager
---service-name <name>   Service name; default: MemfsC
---log-file <path>       Absolute path for the protected service log
---install               Install and start an automatic LocalSystem service
---uninstall             Bounded-stop and remove only the named service
---uninstall-private-driver  Remove only MemfsC-owned private WinFsp fallback service/files
---stats                 Print a human-readable runtime snapshot at mount and stop
---stats-json            Print stable one-line JSON runtime snapshots at mount and stop
---help
+--mount <path>          盘符或目录挂载点
+--size <bytes|auto>     容量 1..INT64_MAX；支持 K/M/G 后缀
+--reserve <bytes>       配合 --size auto 使用：启动时预留的内存提交额度（默认 1G，0 = 关闭）
+--mkdir <path>          挂载前创建目录（可重复，允许嵌套路径）
+--label <name>          卷标
+--threads <n>           Dispatcher 线程数；0 = 自动，否则为 2..64
+--compress              启用 Zstd 等级 1 压缩
+--compression-level <n> 启用 Zstd 等级 1..22 压缩
+--encrypt               使用随机 256 位密钥；支持时使用硬件 AES-256-GCM，否则使用 XChaCha20-Poly1305
+--key-hex <64hex>       使用固定的 256 位密钥
+--key-env <name>        从环境变量读取 64 位十六进制密钥
+--debug                 启用 WinFsp 调试日志
+--service               在 Windows 服务控制管理器（SCM）下运行
+--service-name <name>   服务名；默认：MemfsC
+--log-file <path>       受保护服务日志的绝对路径
+--install               安装并启动 LocalSystem 自动服务
+--uninstall             在有界等待内停止并仅删除指定服务
+--uninstall-private-driver  仅移除 MemfsC 所拥有的 WinFsp 备用驱动服务/文件
+--stats                 挂载和停止时输出易读的运行时快照
+--stats-json            挂载和停止时输出稳定的单行 JSON 运行时快照
+--help                  显示帮助
 ```
 
-Stop with Ctrl+C.
+按 Ctrl+C 停止。
 
-## Windows Service
+## Windows 服务
 
-The native installer creates a `SERVICE_WIN32_OWN_PROCESS` service named `MemfsC`, configures automatic start and bounded restart recovery, and starts it immediately. The service runs as LocalSystem. Its protected log defaults to `%ProgramData%\MemfsC\MemfsC.log`; its DACL grants access only to SYSTEM and the installing user's SID. Pass `--log-file` to select another absolute log path. The executable handles STOP and SHUTDOWN controls and stops the WinFsp dispatcher before tearing down the filesystem and allocator.
+原生安装器会创建名为 `MemfsC` 的 `SERVICE_WIN32_OWN_PROCESS` 服务，配置自动启动和有界重启恢复，然后立即启动。服务以 LocalSystem 运行。受保护日志默认位于 `%ProgramData%\MemfsC\MemfsC.log`，其 DACL 只允许 SYSTEM 和安装用户 SID 访问。可通过 `--log-file` 指定其他绝对日志路径。可执行文件处理 STOP 和 SHUTDOWN 控制，并在拆除文件系统和分配器前先停止 WinFsp dispatcher。
 
-Unexpected MemfsC process failures use the configured SCM recovery actions: restart after 1, 5, and 30 seconds, with the failure count reset after 24 hours. Because this is a volatile filesystem, each restart creates a new empty M: volume and recreates configured startup directories such as `tmp`.
+MemfsC 进程意外失败时，SCM 会按设置在 1、5 和 30 秒后重启；失败次数在 24 小时后清零。由于这是易失文件系统，每次重启都会创建新的空 M: 卷，并重新创建诸如 `tmp` 的配置启动目录。
 
-Run these commands from an elevated shell:
+在提升权限的 shell 中运行：
 
 ```powershell
 .\build\x64-release\memfs.exe --install --mount R: --size 512M --label MEMFS
@@ -153,9 +154,9 @@ sc.exe queryex MemfsC
 .\build\x64-release\memfs.exe --uninstall
 ```
 
-Use `--service-name MemfsFrontendTest` to install a separate service for testing; pass the same name to `--uninstall`. Repeating an identical install is idempotent. An install that changes the registered executable or service arguments is rejected. Native install rejects `--key-hex` and `--key-env`, because a LocalSystem service cannot safely inherit a user's key argument or environment; `--encrypt` remains available and generates a fresh key at startup. Manual `--service` mode and the `scripts\memfs-service.ps1` helper remain available for existing SCM workflows.
+测试时可使用 `--service-name MemfsFrontendTest` 安装独立服务，卸载时传入相同名称。重复执行相同配置的安装是幂等的；若可执行文件或服务参数与已注册配置不同，则拒绝安装。原生安装拒绝 `--key-hex` 和 `--key-env`，因为 LocalSystem 服务无法安全继承用户的密钥参数或环境变量；仍可使用 `--encrypt`，它会在每次启动时生成新密钥。现有 SCM 工作流仍可使用手动 `--service` 模式和 `scripts\memfs-service.ps1`。
 
-A helper that still uses `sc.exe` for all service control is included:
+项目仍提供一个使用 `sc.exe` 执行全部服务控制操作的辅助脚本：
 
 ```powershell
 .\scripts\memfs-service.ps1 install -Exe .\build\x64-release\memfs.exe -Mount R: -Size 512M
@@ -166,78 +167,78 @@ A helper that still uses `sc.exe` for all service control is included:
 .\scripts\memfs-service.ps1 purge-driver -Exe .\build\x64-release\memfs.exe
 ```
 
-The service runs as LocalSystem by default. The first driver installation requires administrator rights. If a compatible official WinFsp SxS driver is already installed, memfs reuses it and does not create a parallel driver service. If the driver is missing or unloadable, memfs extracts the embedded signed WinFsp SYS resource, registers it through SCM, starts it, and retries `FspFileSystemCreate`.
+服务默认以 LocalSystem 运行。首次安装驱动需要管理员权限。如果已安装兼容的官方 WinFsp SxS 驱动，memfs 会复用它，不会创建平行驱动服务。如果驱动缺失或无法加载，memfs 会解出内嵌的签名 WinFsp SYS 资源，经 SCM 注册并启动，然后重试 `FspFileSystemCreate`。
 
-Abnormal service recovery is covered by a destructive-but-self-cleaning integration test:
+以下破坏性但会自行清理的集成测试覆盖服务异常恢复：
 
 ```powershell
 .\tests\service-recovery.ps1 -Exe .\build\x64-release\memfs.exe -Drive R: -Size 64M
 ```
 
-The test installs `MemfsC` with the configured SCM restart policy, starts it, writes a sentinel file, forcibly terminates the service process, waits for SCM to restart it with a new PID and remount a fresh volatile filesystem, verifies post-restart I/O, and finally stops/deletes the service. On a machine with official WinFsp installed it also asserts that no private `WinFsp+MemfsC` fallback driver appears.
+测试安装配置好 SCM 重启策略的 `MemfsC`，启动服务并写入标记文件，然后强制结束服务进程。接着等待 SCM 使用新 PID 重启服务、重新挂载空的易失文件系统，验证重启后的 I/O，最后停止并删除服务。若机器已安装官方 WinFsp，测试还会断言没有创建私有 `WinFsp+MemfsC` 备用驱动服务。
 
-If Service initialization fails, `sc.exe query MemfsC` preserves the underlying WinFsp/NTSTATUS value in `SERVICE_EXIT_CODE` instead of exposing only the generic Windows service error 1066.
+服务初始化失败时，`sc.exe query MemfsC` 会在 `SERVICE_EXIT_CODE` 中保留底层 WinFsp/NTSTATUS 值，而不是只显示通用 Windows 服务错误 1066。
 
-### Deployment verification harness
+### 部署验证工具
 
-`scripts\verify-deployment.ps1` provides repeatable deployment checks without silently modifying an official WinFsp installation.
+`scripts\verify-deployment.ps1` 提供可重复的部署检查，不会悄悄修改官方 WinFsp 安装。
 
-On a development machine with official WinFsp already installed:
+在已安装官方 WinFsp 的开发机上：
 
 ```powershell
 .\scripts\verify-deployment.ps1 -Scenario All -Report .agent\deployment.json
 ```
 
-This runs the release deployment gate tests, verifies the no-`MemfsC` service state, mounts a real filesystem through the installed official WinFsp driver, exercises normal file I/O, and confirms that no private `WinFsp+MemfsC` fallback service or `memfs-winfsp-*.sys` file was created.
+该脚本运行 Release 部署门禁测试，验证不存在 `MemfsC` 服务，通过已安装的官方 WinFsp 驱动挂载真实文件系统并执行常规文件 I/O，同时确认没有创建私有 `WinFsp+MemfsC` 备用驱动服务或 `memfs-winfsp-*.sys` 文件。
 
-The embedded private-driver path requires a genuinely clean VM with no official WinFsp SxS driver installed. It is intentionally opt-in:
+内嵌私有驱动路径需要一台真正干净、没有安装官方 WinFsp SxS 驱动的虚拟机，因此必须显式选择：
 
 ```powershell
 .\scripts\verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback -Report C:\temp\memfs-private-fallback.json
 ```
 
-That scenario requires administrator rights, refuses to run if an official WinFsp driver is detected, mounts memfs to force the embedded fallback path, validates that the private driver points only to MemfsC-owned filenames, and removes the private service/files afterward unless `-KeepPrivateDriver` is specified.
+该场景需要管理员权限；若检测到官方 WinFsp 驱动会拒绝运行。它会挂载 memfs 以强制走内嵌备用驱动路径，验证私有驱动只引用 MemfsC 所拥有的文件名，然后移除私有服务和文件，除非指定 `-KeepPrivateDriver`。
 
-## Directory design
+## 目录结构
 
-MemfsDir allocates no hash table for small directories. Every child is stored in an intrusive treap, which is the authoritative ordered index and provides expected O(log n) insertion/deletion/lookup plus naturally sorted enumeration.
+小目录的 MemfsDir 不分配哈希表。每个子项存放于侵入式 treap 中；treap 是权威有序索引，插入/删除/查找的期望复杂度为 O(log n)，并天然支持排序枚举。
 
-At 256 children memfs lazily adds a Robin Hood open-addressing hash accelerator. The hash targets an 85% maximum load, uses backward-shift deletion instead of tombstones, and is discarded again when the directory falls below half the activation threshold. The treap remains authoritative, so a hash allocation failure never corrupts the namespace.
+子项达到 256 个时，memfs 会按需增加 Robin Hood 开放寻址哈希加速器。哈希表目标最大负载率为 85%，删除时使用向后位移而不是墓碑；目录子项降到启动阈值的一半以下时会丢弃该表。treap 始终是权威索引，因此哈希分配失败不会破坏命名空间。
 
-Directory/file metadata is packed aggressively:
+目录/文件元数据采用紧凑布局：
 
-- MemfsNode is 128 bytes on x64 and is compile-time pinned to the allocator's 128-byte class; the previous 136-byte layout rounded up to a 192-byte slab slot, so every live file/directory node now consumes 64 fewer slab bytes (33.3% less node-slot memory).
-- directory state, tiny-file storage and paged-file storage are mutually exclusive and share one pointer-width union;
-- node, optional directory state and name storage are deliberately separate size-class allocations: the 128-byte node already exactly fills its class, so co-allocating a name would push the common object into the 192-byte class and increase physical backing;
-- inherited ACLs are reference-counted and shared;
-- nodes removed from the namespace reuse treap links for the orphan/open-handle list.
-- the WinFsp `IndexNumber` is derived from the stable node address through a per-filesystem seeded 64-bit permutation instead of storing another 8-byte field; it remains stable across rename/unlink while the node is alive.
+- x64 上 MemfsNode 为 128 字节，并在编译期固定到分配器的 128 字节等级。旧的 136 字节布局会被提升到 192 字节 slab 槽位；现在每个活动文件/目录节点节省 64 字节 slab 空间（节点槽内存减少 33.3%）。
+- 目录状态、小文件存储和分页文件存储互斥，复用一个指针宽度的 union。
+- 节点、可选目录状态和名称使用独立的 size-class 分配：128 字节节点刚好占满所在等级，与名称合并会把常见对象推到 192 字节等级，增加物理内存占用。
+- 继承的 ACL 使用引用计数共享。
+- 从命名空间移除的节点会复用 treap 链接，进入孤儿/打开句柄链表。
+- WinFsp `IndexNumber` 通过每个文件系统独立播种的 64 位置换函数，从稳定节点地址派生；不再单独占用 8 字节。节点存活期间，该值在改名/unlink 前后保持稳定。
 
-Local A/B benchmark with 50,000 files in one directory:
+当前构建在单个目录中创建 50,000 个文件的本机 A/B 基准：
 
-| metric | 26638fb baseline | current |
+| 指标 | 基线 26638fb | 当前 |
 |---|---:|---:|
-| create 50k | ~32.9-33.8 ms | ~21.9-23.7 ms |
-| lookup 50k | ~11.6-13.7 ms | ~6.9-9.8 ms |
-| enumerate 50k | ~1.35-1.91 ms | ~0.6-1.6 ms |
-| process private-memory delta / entry | ~457-458 B | ~220 B |
-| hash slots at 50k | 131,072 | 65,536 |
+| 创建 50k | ~32.9–33.8 ms | ~21.9–23.7 ms |
+| 查找 50k | ~11.6–13.7 ms | ~6.9–9.8 ms |
+| 枚举 50k | ~1.35–1.91 ms | ~0.6–1.6 ms |
+| 每条目进程私有内存增量 | ~457–458 B | ~220 B |
+| 50k 条目时哈希槽位数 | 131,072 | 65,536 |
 
-The current test suite also removes half of a large Robin Hood table, validates positive/negative lookups, reinserts new names and re-enumerates the ordered treap to exercise backward-shift deletion.
+当前测试套件还会删除大型 Robin Hood 表的一半条目、检查正/负查找、重新插入名称，并重新枚举有序 treap，以覆盖向后位移删除。
 
-## File storage
+## 文件存储
 
-Windows-visible AllocationSize, internal quota accounting and actual RAM residency are intentionally separate.
+Windows 可见的 AllocationSize、内部配额统计和实际 RAM 驻留量是不同指标，刻意分别处理。
 
-### Tiny files
+### 小文件
 
-Files up to 4 KiB use an encoded small representation. Plaintext capacity uses exact 1/2/4/8-byte tiny classes and then 8-byte granularity. Uncompressed/unencrypted data up to 8 bytes is stored directly inside the inode union, so it performs no additional heap allocation at all.
+不超过 4 KiB 的文件使用编码后的小型表示。明文容量使用精确的 1/2/4/8 字节小等级，此后按 8 字节粒度增长。未压缩、未加密且不超过 8 字节的数据直接存放在 inode union 中，不产生额外堆分配。
 
-The WinFsp volume still uses 512-byte sectors, therefore the AllocationSize reported to Windows is rounded to 512 bytes. Internally, quota accounting is byte-granular: a 1-byte file consumes 1 byte of configured memfs capacity, not 512 bytes.
+WinFsp 卷仍使用 512 字节扇区，因此向 Windows 报告的 AllocationSize 会按 512 字节取整。内部配额按字节精确统计：1 字节文件只占 1 字节 memfs 配置容量，不是 512 字节。
 
-Uncompressed/unencrypted local measurements:
+未压缩、未加密的本机测量：
 
-| file size | Windows AllocationSize | internal quota | tracked data resident |
+| 文件大小 | Windows AllocationSize | 内部配额 | 跟踪的数据驻留量 |
 |---:|---:|---:|---:|
 | 1 B | 512 B | 1 B | 0 B |
 | 7 B | 512 B | 7 B | 0 B |
@@ -247,180 +248,179 @@ Uncompressed/unencrypted local measurements:
 | 500 B | 512 B | 500 B | 512 B |
 | 1024 B | 1024 B | 1024 B | 1032 B |
 
-With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 8-byte blob header + 8-byte nonce sequence + 1 byte payload + 16-byte AEAD authentication tag.
+启用加密时，1 字节文件的跟踪编码空间为 33 字节：8 字节 blob 头部 + 8 字节 nonce 序号 + 1 字节负载 + 16 字节 AEAD 认证 tag。
 
-resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
-### Allocator v2 and auto capacity
+`resident_bytes` 跟踪编码数据 blob/页，但刻意不包括宿主分配器记账和命名空间元数据。
 
-The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is one **logical size-class pool** rather than separate node/name/generic pools. Internally, each class uses 16 concurrency lanes to avoid a single hot SRW lock; these lanes partition synchronization/slab ownership only and are not business-type pools or permanent per-thread arenas. The local lane is always the fast path. If it has no free object, an atomic available-lane mask lets the allocator reuse partial free capacity from another lane of the same size class before committing a new slab; when no lane has capacity, the scan is skipped entirely. Empty slabs still return immediately to the VM backend. This keeps the memory semantics of one shared size-class pool without putting every allocation behind one global lock. A three-run A/B benchmark against the former 8-lane layout showed the largest gains at high concurrency: at 16 threads, 64-byte alloc/free throughput improved by about 114% and 4 KiB alloc/free throughput by about 209%, while single-thread throughput stayed effectively flat. The extra allocator-state metadata is about 12 KiB per filesystem.
+### 分配器 v2 与自动容量
 
-The process-wide control allocation used for `Memfs` itself goes through the same size-class/slab/area machinery; only allocator-state bootstrap reaches the VM backend directly. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
+分配器 v2 按大小等级组织，而不是按对象类型组织。节点、目录、页组、名称和通用分配 API 最终都进入相同的取整后大小等级，所以只有一个**逻辑大小等级池**，而不是节点/名称/通用对象分池。
 
-The allocator's public pointer-alignment contract is **at least 8 bytes** for every non-NULL returned allocation. This is intentional: the small-object table includes 8-byte and 24-byte classes to avoid wasting space, so promising 16-byte alignment for every slot would be false unless those classes were padded. Internally the first slab payload and area payload header are aligned more strongly (currently 16 bytes), but callers must rely only on the 8-byte minimum unless a specific API documents more.
+内部每个等级使用 16 个并发 lane，避免单把 SRW 锁成为热点；lane 仅用于拆分同步和 slab 所有权，不是业务对象类型池，也不是永久的每线程 arena。本地 lane 始终是最快路径。若本地 lane 没有空闲对象，分配器会通过原子可用 lane 掩码，优先复用同一大小等级中其他 lane 的部分空闲容量，再提交新 slab；若没有任何 lane 可用则完全跳过扫描。空 slab 仍立即归还 VM 后端。这样既保留单一共享大小等级池的内存语义，又避免所有分配都经过一个全局锁。
 
-Zero-initialized typed allocations (`node`, `dir`, `page_group`) keep their existing safety contract. A separate `memfs_allocator_alloc_uninit()` fast path is used only where the caller immediately overwrites the complete requested payload (encoded page blobs, copied security descriptors, temporary path buffers and copied names). This avoids redundant memset traffic without exposing stale bytes to code that expects zero-filled objects. The allocator contention benchmark reports both `zero` and `uninit` modes.
+与之前的 8-lane 布局进行三轮 A/B 基准后发现，并发越高收益越明显：16 线程下，64 字节分配/释放吞吐提高约 114%，4 KiB 分配/释放吞吐提高约 209%，单线程吞吐基本持平。每个文件系统增加的分配器状态元数据约为 12 KiB。
 
-`capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity.
+`Memfs` 本身使用的进程级控制分配也经过同一套大小等级/slab/area 机制；只有分配器状态的启动引导直接访问 VM 后端。小分配根据对象大小使用自适应 slab（4/8/16/32/64 KiB）；超过小对象阈值的分配使用 area。`reserved_bytes` 仅表示地址空间预留；`committed_bytes` 是操作系统实际提交的内存，`physical_bytes` 是 `committed_bytes` 的别名，不是另一种来源。`live_bytes` 是当前调用方可见、已分配的负载/对象字节数。
 
-Auto capacity starts with a **reserve** (`--reserve`, default 1 GiB). At mount the allocator commits that much address space it does not touch: it raises the system commit charge but uses no physical memory. Whenever the allocator commits new backing it first decommits the same amount from the reserve, and it refills the reserve after backing is released, so the volume can always store about the reserve even when other programs have exhausted system memory. Beyond the reserve the volume grows with free system memory as before; the reported free space is the unused reserve plus that system allowance. The mount fails if the system cannot commit the reserve at startup. The reserve guarantees commit, not residency: Windows can still page the data out under pressure. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
+分配器的公开指针保证是：所有非 NULL 分配至少 8 字节对齐。这是有意规定的：小对象表包含 8 字节和 24 字节等级以减少浪费，若不填充这些等级就承诺所有槽位都 16 字节对齐是不准确的。内部首个 slab 负载和 area 负载头目前有更强的 16 字节对齐，但除非具体 API 另有说明，调用方只能依赖至少 8 字节对齐。
 
-The auto-capacity **growth hot path** keeps a 1 ms cache of the OS available-memory sample. Public allowance/stats APIs remain live queries. One SRW lock protects the complete snapshot (available bytes, gross-commit baseline and timestamp/deadline), including forced refreshes: individually atomic fields with a deadline published last did not prevent mixing an old live snapshot with a new sample. The gross successful-commit counter is captured before the OS query, then all subsequent commitments are debited, even if freed/reallocated regions leave net committed bytes unchanged. The TTL begins before the query; a slow OS call cannot make an old sample look fresh. Near pressure or on a request larger than the allowance, the cache is refreshed after scavenging.
+零初始化的类型化分配（`node`、`dir`、`page_group`）保留原有安全契约。单独的 `memfs_allocator_alloc_uninit()` 快路径只用于调用方马上覆盖全部申请负载的场合（编码页 blob、复制的安全描述符、临时路径缓冲区和复制后的名称）。这样避免重复 memset，又不会让要求零填充对象的代码看到残留数据。分配器竞争基准会分别报告 `zero` 和 `uninit` 模式。
 
-Normal Debug uses the same cache. Only legacy explicit pressure overrides bypass it. `memfs_capacity_snapshot_test` separately compiles the production core with `NDEBUG` plus test-only OS/clock providers, exercising expiry, forced refresh, slow queries, clock failure/rollback, in-query growth, free/reallocate debit, atomic pressure failures, and concurrent publication. These providers are not compiled into the shipping executable. An OS memory sample is an observation, not a reservation against other processes; allocation failures must still be handled.
+`capacity_auto=true` 让 memfs 根据当前系统内存和分配器后备内存推导可写额度，而不是使用固定用户容量。
 
-Runtime diagnostics are opt-in and do not start a sampling thread. `memfs_get_runtime_stats()` returns a **lock-safe approximate aggregate** containing logical used/free bytes, resident bytes, allocator live/reserved/committed/physical bytes, slab/area/cache counts, scavenger totals, and the current auto-capacity allowance plus its 256 MiB hard and 512 MiB soft pressure margins. Allocator shards and scalar counters are sampled sequentially, so under concurrent I/O/allocation the fields can represent slightly different instants; collect stats while the filesystem is quiescent when an exact baseline or exact cross-field equality is required.
+自动容量以**预留额度**（`--reserve`，默认 1 GiB）启动。挂载时分配器会提交相应的地址空间额度但不触碰，因此只增加系统提交量，不占物理内存。每次分配器提交新的后备内存时，会先从预留中释放同等额度；后备内存释放后再补回预留。因此即便其他程序耗尽系统内存，卷仍可使用约等于预留值的提交额度。超出预留后，卷仍像之前一样随系统可用内存增长；报告的可用空间是未使用预留额度加系统允许额度。若启动时系统无法提交预留额度，挂载失败。
 
-For interactive diagnostics:
+预留保证的是内存提交额度，不保证常驻：系统内存压力下 Windows 仍可将数据换出。`memfs_auto_allowance_bytes()` 报告当前允许额度；`used_bytes`、`resident_bytes`、`committed_bytes`、`physical_bytes` 分别表示逻辑配额、驻留负载和分配器物理后备等不同指标。基准会分别报告这些数据，避免把分配器高水位后备内存误认为逻辑文件用量。
+
+自动容量**增长热路径**缓存操作系统可用内存样本 1 ms；公开额度/统计 API 仍执行实时查询。一把 SRW 锁保护完整快照（可用字节、总提交基线和时间戳/截止时间），包括强制刷新。此前尝试将独立原子字段的截止时间最后发布，仍无法阻止将旧实时快照与新样本混合。操作系统查询前先读取总成功提交计数，此后发生的全部提交都会扣减，即便释放后重新分配导致净提交字节数没变。TTL 从查询前开始；慢速 OS 调用不会让旧样本看起来很新。接近压力阈值或请求超过当前额度时，会先清理缓存，再刷新样本。
+
+常规 Debug 使用相同缓存。只有旧式显式压力覆盖会绕过它。`memfs_capacity_snapshot_test` 通过 `NDEBUG` 和仅测试使用的 OS/时钟提供者单独编译生产核心，覆盖过期、强制刷新、慢查询、时钟故障/回拨、查询期间增长、释放后重新分配的扣减、原子压力失败和并发快照发布。这些提供者不会编进交付 EXE。OS 内存样本只是一次观测，不能为其他进程预留资源；仍必须处理分配失败。
+
+运行时诊断默认关闭，不启动采样线程。`memfs_get_runtime_stats()` 返回**由锁保护的近似汇总**，包括逻辑已用/可用字节、驻留字节、分配器 live/reserved/committed/physical 字节、slab/area/cache 数量、清理器累计值，以及当前自动容量额度和 256 MiB 硬压力/512 MiB 软压力余量。
+
+分配器分片和标量计数按顺序采样，因此并发 I/O/分配时各字段可能代表略有差异的时刻。要求精确基线或字段间精确相等时，应在文件系统静止后收集统计信息。
+
+交互式诊断：
 
 ```powershell
 .\build\x64-release\memfs.exe --mount R: --size auto --stats
 .\build\x64-release\memfs.exe --mount R: --size auto --stats-json
 ```
 
-`--stats` prints a stable **format** of `key=value` fields after mount and immediately before shutdown. `--stats-json` suppresses the normal mount banner and emits one JSON object per sample with `type=memfs_stats` and `phase=mounted|stopping`, making redirected stdout suitable for machine parsing. The values follow the same approximate-concurrent semantics described above; the stopping sample is normally quiescent and therefore suitable as an exact cleanup baseline. The API is also available to service/control-plane code without enabling any background sampler.
+`--stats` 在挂载后和关闭前以稳定的 `key=value` 格式打印字段。`--stats-json` 不输出常规挂载横幅，每次采样打印一个 JSON 对象，含 `type=memfs_stats` 和 `phase=mounted|stopping`，便于将标准输出重定向后由程序解析。其值遵循上文所述的并发近似语义；停止阶段的采样通常处于静止状态，可作为精确清理基线。服务/控制面代码也可直接调用该 API，无需启用后台采样器。
 
-### Sparse paged files
+### 稀疏分页文件
 
-Files that grow past 4 KiB, or receive a high-offset write, use sparse 4 KiB logical pages:
+超过 4 KiB 或发生高偏移写入的文件使用 4 KiB 稀疏逻辑页：
 
-- one logical group covers 1 MiB (256 pages);
-- a group has a 256-bit presence bitmap and a compact pointer vector containing only pages that actually exist;
-- top-level group entries are a compact sorted array of {group_index, group*} and are binary-searched;
-- very high sparse offsets therefore do not allocate a giant intermediate pointer array;
-- absent pages read as zero.
+- 每个逻辑组覆盖 1 MiB（256 页）。
+- 每组具有 256 位存在位图和紧凑指针向量，只保存实际存在的页面。
+- 顶层组索引是按 `{group_index, group*}` 排序的紧凑数组，通过二分查找。
+- 因此，高稀疏偏移不会分配巨大的中间指针数组。
+- 不存在的页面读取为零。
 
-Extending an empty file reserves byte-granular memfs quota but allocates no data pages. The aligned 512-byte AllocationSize exists only at the WinFsp reporting boundary.
+扩展空文件会按字节精度预留 memfs 配额，但不分配数据页。512 字节对齐的 AllocationSize 只在向 WinFsp 报告时使用。
 
-Truncation releases encoded pages and empty groups. A file that shrinks below 4 KiB can demote back to the compact tiny representation.
+截断会释放编码页和空页组。文件缩小到 4 KiB 以下时，可以退化回紧凑的小文件表示。
 
-The original whole-file realloc implementation took about 1.4 seconds to append 32 MiB in 64 KiB writes on the current machine. Sparse paged storage reduced the same benchmark to roughly 9 ms.
+本机旧版整文件 realloc 实现以 64 KiB 块追加 32 MiB 约需 1.4 秒。稀疏分页存储将相同基准缩短到约 9 ms。
 
-## Compression
+## 压缩
 
-Compression is optional and local to each tiny blob or 4 KiB page. memfs uses Zstd and keeps the compressed representation only when it saves enough bytes to justify the metadata and CPU cost.
+压缩是可选的，分别应用于每个小文件 blob 或 4 KiB 页面。memfs 使用 Zstd；只有节省的字节足以抵消元数据和 CPU 成本时才保留压缩表示。
 
-Compression is adaptive per file. Repeatedly incompressible pages raise a small score; after the score crosses the skip threshold, paged files only probe one page out of 16 for renewed compressibility. A successful probe lowers the score again. Tiny blobs remain cheap enough to probe on every rewrite.
+压缩按文件自适应。反复遇到不可压缩页会提高一个较小的评分；超过跳过阈值后，分页文件只抽取 16 页中的 1 页重新探测是否恢复可压缩性。探测成功会降低评分。小 blob 的探测成本足够低，因此每次改写仍会尝试。
 
-For 16 MiB of highly compressible repeated data in the current build:
+当前构建对 16 MiB 高度可压缩的重复数据进行测量：
 
-| mode | tracked resident | resident/logical | write time (local run) |
+| 模式 | 跟踪的驻留量 | 驻留/逻辑大小 | 写入耗时（本机运行） |
 |---|---:|---:|---:|
-| raw | 16.03 MiB | 100.195% | ~4.4 ms |
-| Zstd | 108 KiB | 0.659% | ~19-31 ms |
-| encryption only | 16.13 MiB | 100.781% | ~15.6-16.3 ms |
-| Zstd + encryption | 204 KiB | 1.245% | ~11.5-11.7 ms |
+| 原始 | 16.03 MiB | 100.195% | ~4.4 ms |
+| Zstd | 108 KiB | 0.659% | ~19–31 ms |
+| 仅加密 | 16.13 MiB | 100.781% | ~15.6–16.3 ms |
+| Zstd + 加密 | 204 KiB | 1.245% | ~11.5–11.7 ms |
 
-Compression is not enabled by default because truly incompressible workloads would otherwise spend CPU without reducing memory.
+默认不启用压缩，避免不可压缩负载花费 CPU 却没有减少内存占用。
 
-## Encryption
+## 加密
 
-Encryption is optional and local to each non-zero blob/page. The encoding order is:
+加密是可选的，对每个非零 blob/页独立处理。编码顺序如下：
 
-1. optional Zstd compression;
-2. authenticated encryption.
+1. 可选的 Zstd 压缩；
+2. 认证加密。
 
-On CPUs where libsodium reports AES-256-GCM hardware support, new encrypted pages use AES-256-GCM. Otherwise they use XChaCha20-Poly1305. The algorithm is recorded in the page flags and that flag is itself authenticated as AAD, so reads select the decoder from each stored page rather than from the current encoder preference. This also keeps mixed-algorithm pages readable if the preferred encoder changes during a mount.
+若 CPU 支持且 libsodium 检测到 AES-256-GCM 硬件加速，新加密页面使用 AES-256-GCM；否则使用 XChaCha20-Poly1305。算法记录在页面标志中，标志本身也作为 AAD 认证。因此读取时根据每个已存页面的标志选择解码算法，而非依据当前编码器偏好。若挂载期间首选编码算法变化，混合算法的旧页面仍可读。
 
-Every memfs instance creates a random 128-bit mount prefix and keeps the caller/random 256-bit master key for XChaCha. AES-GCM derives a separate mount-specific root key from the master key plus that prefix. Every encoded rewrite then obtains a globally unique monotonically increasing 64-bit sequence. XChaCha combines the 128-bit prefix with the sequence for its 192-bit nonce. AES-GCM uses the sequence in its 96-bit nonce under the independent mount key and derives a new epoch subkey every 2^20 encrypted blobs/pages. Only the 8-byte sequence is stored with each blob/page.
+每个 memfs 实例生成随机 128 位挂载前缀，并保留调用方/随机生成的 256 位 XChaCha 主密钥。AES-GCM 会用主密钥和挂载前缀派生独立的挂载根密钥。每次编码改写都会取得全局唯一、单调递增的 64 位序号。XChaCha 将 128 位前缀与该序号组合成 192 位 nonce。AES-GCM 在独立挂载密钥下使用该序号组成 96 位 nonce，并每处理 `2^20` 个加密 blob/页派生新的 epoch 子密钥。每个 blob/页只保存 8 字节序号。
 
-AEAD additional authenticated data binds ciphertext to the node identity, storage/page index (or tiny-blob sentinel), nonce sequence, plaintext size and all codec/algorithm flags. Normal reads therefore detect ciphertext, metadata or algorithm-selector tampering.
+AEAD 附加认证数据将密文绑定到节点标识、存储/页索引（或 tiny-blob 哨兵）、nonce 序号、明文大小及所有 codec/算法标志。常规读取会检测密文、元数据或算法选择器被篡改。
 
-The master/XChaCha key, derived AES root key, and one filesystem-wide cached current AES epoch key are held in dedicated in-memory fields and locked with `sodium_mlock` on a best-effort basis. The epoch cache is protected by an SRW lock and only retains the newest epoch; old-epoch reads derive a temporary key on demand instead of growing a key cache. Scratch epoch keys and nonce buffers are explicitly zeroed after use, and all retained keys plus the mount nonce prefix are zeroed/unlocked during teardown.
+主/XChaCha 密钥、派生的 AES 根密钥和文件系统范围内缓存的当前 AES epoch 密钥存放在专用内存字段，并尽力使用 `sodium_mlock` 锁定。epoch 缓存由 SRW 锁保护，只保留最新 epoch；读取旧 epoch 时按需派生临时密钥，而不无限增长密钥缓存。临时 epoch 密钥和 nonce 缓冲区用后显式清零；卸载时清零/解锁全部保留密钥及挂载 nonce 前缀。
 
-Encryption protects the stored page representation in the memfs heap. It is not process-memory isolation: plaintext necessarily exists transiently in application I/O buffers and small stack work buffers during reads, writes, compression and decompression.
+加密保护 memfs 堆中保存的页面表示，但不隔离进程内存：读取、写入、压缩和解压期间，明文必然会短暂存在于应用 I/O 缓冲区和较小的栈工作缓冲区。
 
-All-zero pages remain implicit sparse holes and allocate no ciphertext.
+全零页始终视为隐式稀疏空洞，不分配密文。
 
-## Concurrency
+## 并发
 
-memfs uses WinFsp's FINE operation guard. WinFsp protects namespace operations with its shared/exclusive namespace lock, while I/O to different files can execute concurrently. The FSD continues to synchronize operations on each individual file.
+memfs 使用 WinFsp FINE 操作保护。WinFsp 使用共享/独占命名空间锁保护命名空间操作，不同文件的 I/O 可并发执行。FSD 仍负责同步同一文件上的操作。
 
-Cross-file capacity and resident accounting use Interlocked atomics rather than a global filesystem lock. The normal file-data path therefore has no memfs-wide mutex.
+跨文件容量与驻留统计使用 Interlocked 原子操作，而非全局文件系统锁。因此正常文件数据路径没有 memfs 范围的互斥锁。
 
-The core test suite includes concurrent writes to multiple files with compression and encryption enabled.
+核心测试套件包含在启用压缩和加密时对多个文件并发写入的测试。
 
-## Handle lifetime and deletion
+## 句柄生命周期与删除
 
-WinFsp uses the node pointer as `FileContext`. Open/create increments the node's open count. Delete-on-cleanup removes the node from the namespace, but the node remains alive until the final close.
+WinFsp 使用节点指针作为 `FileContext`。Open/Create 会增加节点打开计数。Cleanup 时执行 delete 会将节点从命名空间移除，但节点仍保持存活，直到最后一个句柄关闭。
 
-## Long-run memory drift soak
+## 长时间内存漂移压力测试
 
-`memfs_soak_bench` runs a mixed core workload with compression and encryption enabled. Each cycle covers tiny-file create/read/rename/unlink, a 256 KiB large-file write with truncate/regrow and zero-fill verification, and a 64 MiB high-offset sparse write/read/truncate/regrow. Every sample reports logical/resident bytes, allocator live/reserved/committed/physical bytes, process private bytes, slab/area/cache counts, and the final summary reports linear private/committed drift slopes.
+`memfs_soak_bench` 在启用压缩和加密的情况下运行混合核心负载。每轮包括小文件创建/读取/改名/unlink、256 KiB 大文件写入和截断/扩展并验证零填充，以及在高偏移处对 64 MiB 文件进行稀疏写入/读取/截断/扩展。每次采样报告逻辑/驻留字节、分配器 live/reserved/committed/physical 字节、进程私有字节及 slab/area/cache 数量；最终汇总报告进程私有/提交内存漂移的线性斜率。
 
-The default mode is intentionally short for CI:
+默认模式刻意保持较短，适用于 CI：
 
 ```powershell
 .\build\x64-release\memfs_soak_bench.exe
 .\build\x64-release\memfs_soak_bench.exe --seconds 10 --sample-ms 1000
 ```
 
-Long soak mode is explicit and accepts 10 through 60 minutes:
+长时间压力测试需显式指定，时长可为 10 到 60 分钟：
 
 ```powershell
 .\build\x64-release\memfs_soak_bench.exe --soak 10
 .\build\x64-release\memfs_soak_bench.exe --soak 60 --sample-ms 5000
 ```
 
-Before measurement the benchmark warms all workload shapes and codec/crypto paths. At exit it scavenges allocator caches and requires logical used, resident, allocator live objects/bytes, reserved, committed, physical, slab and area state to return to the post-warmup baseline. The private-byte slope is reported separately because Windows/runtime libraries may retain process-private bookkeeping that is not memfs allocator backing.
+测量前基准会预热所有负载形态以及 codec/密码学路径。退出时会清理分配器缓存，并要求逻辑已用、驻留、分配器 live 对象/字节、reserved、committed、physical、slab 和 area 状态都回到预热后基线。进程私有字节斜率单独报告，因为 Windows/运行库可能保留不属于 memfs 分配器后备内存的进程私有记账。
 
-## Integration test
+## 集成测试
 
-The integration test mounts a real WinFsp drive and exercises normal Windows file APIs, sparse writes, rename/move/enumeration/delete:
+集成测试会挂载真实 WinFsp 盘符，并使用常规 Windows 文件 API 测试稀疏写入、改名/移动/枚举/删除：
 
 ```powershell
 & .\tests\integration.ps1 -Exe .\build\x64-release\memfs.exe -Drive R:
 & .\tests\integration.ps1 -Exe .\build\x64-release\memfs.exe -Drive R: -ExtraArgs @("--compress")
 ```
 
-The current test suite has also been run successfully in plain, compression-only, encryption-only and compression+encryption mount modes.
+当前测试套件也已在纯模式、仅压缩、仅加密、压缩+加密四种挂载配置下成功运行。
 
-## Source layout
+## 源码布局
 
 ```text
 src/
-  main.c            command-line mount process
-  memfs_core.h      tree/storage/codec API and structures
-  memfs_core.c      directory index, sparse data, compression, encryption
-  memfs_winfsp.h    WinFsp adapter API
-  memfs_winfsp.c    WinFsp callbacks
+  main.c            命令行挂载进程
+  memfs_core.h      树/存储/codec API 与结构
+  memfs_core.c      目录索引、稀疏数据、压缩、加密
+  memfs_winfsp.h    WinFsp 适配器 API
+  memfs_winfsp.c    WinFsp 回调
 
 tests/
-  memfs_core_test.c      unit/stress/concurrency/codec tests
-  integration.ps1       real mounted-drive integration test
-  service-recovery.ps1  SCM abnormal-termination restart/remount integration test
+  memfs_core_test.c      单元/压力/并发/codec 测试
+  integration.ps1       真实挂载盘集成测试
+  service-recovery.ps1  SCM 异常终止、重启和重新挂载集成测试
 scripts/
-  prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
-  memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
-  verify-deployment.ps1     repeatable official/no-service/private-fallback deployment harness
+  prepare-winfsp-static.ps1  准备与签名驱动匹配的静态 WinFsp 运行库
+  memfs-service.ps1          sc.exe 的安装/启动/查询/停止/删除包装脚本
+  verify-deployment.ps1      可重复验证官方驱动/无服务/私有备用驱动部署
 ```
 
-## Planned next steps
+## 计划中的后续工作
 
-- Global security-descriptor interning beyond the current parent/inherited ACL sharing.
-- Named streams, reparse points and extended attributes.
-- Persistence/snapshot support.
-- Password-based key derivation if persistent encrypted images are introduced.
-- More rename/delete/open race stress tests.
-- Continue profiling unified size-class shard counts, slab sizing and the slab/area threshold under real workloads; do not introduce object-type-specific physical pools.
+- 在当前父 ACL/继承 ACL 共享之外，增加全局安全描述符驻留池。
+- 命名数据流、重解析点和扩展属性。
+- 持久化/快照支持。
+- 如果引入持久加密镜像，则增加基于密码的密钥派生。
+- 增加改名/删除/打开竞争压力测试。
+- 继续在真实负载下分析统一大小等级的 shard 数量、slab 大小及 slab/area 阈值；不要引入按对象类型拆分的物理池。
 
-## Release-candidate acceptance and portable handoff
+## 发布候选验收与便携式交接
 
-Run `scripts/verify-release-acceptance.ps1` to record a bounded, fail-closed matrix
-for the actual revision; see `docs/RELEASE_ACCEPTANCE.md`. The current CTest
-registration includes 20 cases. The lifecycle regression covers shared opens and
-asynchronous final Close, which WinFsp FINE does not serialize. A separate short
-lifetime lock protects references/orphans without serializing ordinary data I/O.
-Security descriptor replacement and borrowed snapshots have compatible guards.
+运行 `scripts/verify-release-acceptance.ps1`，为当前实际版本生成有界且失败即关闭的验证矩阵，详情见 `docs/RELEASE_ACCEPTANCE.md`。当前 CTest 注册了 20 个用例。生命周期回归覆盖共享打开和异步最终 Close，因为 WinFsp FINE 不会串行化这一过程。单独的短生命周期锁保护引用计数/孤儿节点，不串行化普通数据 I/O。安全描述符替换和借用快照使用兼容的 guard。
 
-After a passing extended report, create a portable kit with:
+扩展验证报告通过后，可创建便携包：
 
 ```powershell
 python .\scripts\package-validation-kit.py --report .agent\<acceptance-run>\acceptance.json
 ```
 
-The generated kit has a strict manifest and can run the matching Release tests
-on another Windows machine without a development environment. Follow
-`docs/PORTABLE_VALIDATION.zh-CN.md`; clean-VM installation, Win11 ARM64 execution,
-actual OS reboot, publisher signing and distribution licensing remain separate
-acceptance gates. The kit does not automatically enable Sandbox, resume or reset
-an existing VM, reboot the host, or certify those unexecuted gates.
+生成包包含严格 manifest，可在没有开发环境的其他 Windows 机器上运行匹配的 Release 测试。请按 `docs/PORTABLE_VALIDATION.zh-CN.md` 操作。干净虚拟机安装、Win11 ARM64 运行、真实操作系统重启、发布者签名和分发许可属于独立验收门槛。便携包不会自动启用 Sandbox、恢复或重置已有虚拟机、重启宿主机，也不会为未执行的门槛签发通过结论。

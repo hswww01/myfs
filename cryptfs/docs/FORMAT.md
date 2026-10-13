@@ -1,275 +1,178 @@
-# CryptFS v1 on-disk format
+# CryptFS v1 磁盘格式
 
-This document fixes the byte layout used by `cryptfs_store.c`. Integers are
-unsigned little-endian unless a field is explicitly signed. No C structure is
-written to disk. Readers reject unknown format versions, nonzero reserved
-bytes, arithmetic overflow, unaligned or out-of-range references, and record
-types that do not match the owning edge.
+本文固定 `cryptfs_store.c` 使用的字节布局。除非字段明确标记为有符号，否则整数均为无符号 little-endian。磁盘中不写入 C 结构体。读取端会拒绝未知格式版本、非零保留字节、算术溢出、未对齐或越界引用，以及与所有者边不匹配的记录类型。
 
-## Fixed front and physical pages
+## 固定前缀与物理页
 
-All offsets are absolute byte offsets from the beginning of the container.
+所有偏移均为相对于容器文件起始位置的绝对字节偏移。
 
-| Region | Start | Length | End (exclusive) |
+| 区域 | 起始偏移 | 长度 | 结束偏移（不含） |
 | --- | ---: | ---: | ---: |
-| Superblock copy 0 | 0 | 4,096 | 4,096 |
-| Superblock copy 1 | 4,096 | 4,096 | 8,192 |
-| State marker copy 0 | 8,192 | 4,096 | 12,288 |
-| State marker copy 1 | 12,288 | 4,096 | 16,384 |
-| Journal | 16,384 | 4,194,304 | 4,210,688 |
-| Fixed root inode page | 4,210,688 | 4,096 | 4,214,784 |
-| Movable home pages | 4,214,784 | 4,096 each | on demand |
+| Superblock 副本 0 | 0 | 4,096 | 4,096 |
+| Superblock 副本 1 | 4,096 | 4,096 | 8,192 |
+| 状态标记副本 0 | 8,192 | 4,096 | 12,288 |
+| 状态标记副本 1 | 12,288 | 4,096 | 16,384 |
+| 日志 | 16,384 | 4,194,304 | 4,210,688 |
+| 固定根 inode 页 | 4,210,688 | 4,096 | 4,214,784 |
+| 可搬迁的正式页 | 4,214,784 | 每页 4,096 | 按需扩展 |
 
-The fixed front therefore ends at 4,214,784 bytes. It is also the minimum
-container EOF. The root page is physical page one of the 4,000,000-page limit;
-there are at most 3,999,999 movable page slots. Non-root pointers are 1-based
-slot numbers. Slot 1 starts at 4,214,784; slot `n` starts at
-`4,214,784 + (n - 1) * 4,096`. A zero pointer is null. The root's special AEAD
-slot identity is `0xffffffffffffffff` and it is never relocated. Container EOF
-must be page aligned and no larger than the end of slot 3,999,999.
+因此固定前缀结束于 4,214,784 字节，这也是容器 EOF 的最小值。根页是 4,000,000 页上限中的物理第一页，最多还可用 3,999,999 个可搬迁页槽位。非根指针使用从 1 开始的槽位编号。槽位 1 从偏移 4,214,784 开始；槽位 `n` 从 `4,214,784 + (n - 1) * 4,096` 开始。指针 0 表示空。根页的特殊 AEAD 槽位标识为 `0xffffffffffffffff`，且永不搬迁。容器 EOF 必须按页对齐，且不得超过槽位 3,999,999 的末尾。
 
-Every home page has a 48-byte public record envelope followed by a fixed
-4,048-byte authenticated ciphertext. The plaintext is always exactly 4,032
-bytes; unused payload bytes are encrypted zeroes. The envelope is:
+每个正式页包含 48 字节公开记录信封，后接固定的 4,048 字节认证密文。明文始终恰好 4,032 字节；未使用的负载字节加密保存为零。信封布局如下：
 
-| Offset | Size | Field |
+| 偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
 | 0 | 4 | ASCII `CFRP` |
-| 4 | 2 | format version, 1 |
-| 6 | 2 | record type: 1 inode, 2 block map, 3 data fragment |
-| 8 | 8 | logical record identity (inode ID for an inode; owning file ID otherwise) |
-| 16 | 8 | reserved, zero |
+| 4 | 2 | 格式版本，1 |
+| 6 | 2 | 记录类型：1 inode、2 块映射、3 数据片段 |
+| 8 | 8 | 逻辑记录标识（inode 记录使用 inode ID；其他记录使用所属文件 ID） |
+| 16 | 8 | 保留，必须为零 |
 | 24 | 24 | XChaCha20-Poly1305 nonce |
-| 48 | 4,048 | ciphertext and 16-byte tag |
+| 48 | 4,048 | 密文和 16 字节 tag |
 
-The page AEAD associated data is the 16-byte container UUID, the 8-byte
-physical slot identity in little-endian form, and all 48 envelope bytes. The
-page is rejected if the envelope type, identity, version, or reserved bytes do
-not agree with the graph edge and decrypted payload. Relocation uses a fresh
-nonce and authenticates the new slot identity. V1 stores no per-record
-monotonic generation or trusted freshness counter; replaying an older valid
-record at the same slot and identity may pass authentication if its current
-graph edges also validate. V1 does not claim record-level rollback detection.
+页面 AEAD 的关联数据由 16 字节容器 UUID、little-endian 的 8 字节物理槽位标识，以及完整的 48 字节信封组成。如果信封类型、标识、版本或保留字节与对象图边或解密后的负载不一致，该页必须拒绝。搬迁时使用新 nonce，并认证新槽位标识。v1 不保存逐记录递增 generation 或可信新鲜度计数器；如果旧记录位于相同槽位和标识，且当前对象图边也有效，重放该旧记录仍可能通过认证。v1 不承诺逐记录回滚检测。
 
-## Superblocks
+## 超级块（Superblock）
 
-The two 4 KiB superblocks are identical immutable copies. Each has this public
-prefix:
+两个 4 KiB superblock 是相同的不可变副本。每个副本有以下公开前缀：
 
-| Offset | Size | Field |
+| 偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
 | 0 | 8 | ASCII `CRYPTFS1` |
-| 8 | 4 | format version, 1 |
-| 12 | 4 | public header length, 152 |
-| 16 | 16 | random container UUID |
-| 32 | 4 | flags; bit 0 means sparse storage is required, all other bits zero |
-| 36 | 4 | reserved, zero |
-| 40 | 8 | logical capacity in bytes |
-| 48 | 8 | Argon2id13 ops limit |
-| 56 | 8 | Argon2id13 memory limit in bytes |
-| 64 | 16 | random password salt |
-| 80 | 24 | XChaCha20-Poly1305 wrapping nonce |
-| 104 | 48 | wrapped 32-byte master key plus 16-byte tag |
-| 152 | 3,944 | reserved, zero |
+| 8 | 4 | 格式版本，1 |
+| 12 | 4 | 公开头部长度，152 |
+| 16 | 16 | 随机容器 UUID |
+| 32 | 4 | 标志；位 0 表示必须使用稀疏存储，其余位必须为零 |
+| 36 | 4 | 保留，必须为零 |
+| 40 | 8 | 逻辑容量，字节 |
+| 48 | 8 | Argon2id13 ops 上限 |
+| 56 | 8 | Argon2id13 内存上限，字节 |
+| 64 | 16 | 随机密码盐 |
+| 80 | 24 | XChaCha20-Poly1305 密钥包装 nonce |
+| 104 | 48 | 包装后的 32 字节主密钥及 16 字节 tag |
+| 152 | 3,944 | 保留，必须为零 |
 
-The password wrapping key is derived from the supplied UTF-8 password and the
-salt. Its AEAD associated data is bytes 0..79 followed by bytes 152..4095;
-the nonce and wrapped-key fields are excluded. Supported Argon2 parameters
-are ops 1..6 and memory 64..512 MiB. New containers use ops 3 and 256 MiB.
-V1 accepts logical capacities from 1 byte through 1 TiB; 1 TiB is the default.
-Both copies must be structurally valid and, if both unwrap successfully, byte
-identical. A malformed copy can be skipped when the other copy unwraps and
-validates. If no structurally valid copy exists, open returns data error; if
-valid copies exist but none unwraps, open returns access denied. A valid copy
-is never rewritten while opening an existing container. This duplication
-protects against a torn/corrupt copy, but cannot detect rollback to an older
-complete container.
+密码包装密钥由输入的 UTF-8 密码和盐派生。AEAD 关联数据为字节 0..79 与字节 152..4095 的拼接；nonce 和包装密钥字段本身不纳入 AAD。支持的 Argon2 参数为 ops 1..6、内存 64..512 MiB；新建容器使用 ops 3 和 256 MiB。v1 逻辑容量范围为 1 字节至 1 TiB，默认 1 TiB。
 
-## Authenticated state markers
+两个副本都必须通过结构校验；如果都能解封，二者必须逐字节相同。如果其中一个损坏而另一个能解封并通过验证，则可跳过损坏副本。若没有结构有效的副本，open 返回数据错误；如果存在结构有效副本但都无法解封，则返回访问拒绝。打开现有容器时绝不重写有效副本。双份副本可抵御单副本撕裂写入/损坏，但无法检测整个容器回滚到更早的完整版本。
 
-Each marker occupies 4,096 bytes. All reserved bytes are zero. The first 112
-bytes are:
+## 认证状态标记
 
-| Offset | Size | Field |
+每个状态标记占 4,096 字节。所有保留字节必须为零。前 112 字节如下：
+
+| 偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | ASCII `CFMARK1` followed by NUL |
-| 8 | 4 | format version, 1 |
-| 12 | 4 | physical marker copy number, 0 or 1 |
-| 16 | 4 | state: 0 EMPTY, 1 COMMITTED |
-| 20 | 4 | reserved, zero |
-| 24 | 8 | monotonically increasing generation |
-| 32 | 4 | encrypted journal byte length; zero for EMPTY |
-| 36 | 4 | reserved, zero |
-| 40 | 8 | final container EOF after this generation |
-| 48 | 32 | unkeyed SHA-256 of the exact encrypted journal bytes; zero for EMPTY |
-| 80 | 32 | HMAC-SHA256 over the container UUID followed by bytes 0..79 |
-| 112 | 3,984 | reserved, zero |
+| 0 | 8 | ASCII `CFMARK1`，后接 NUL |
+| 8 | 4 | 格式版本，1 |
+| 12 | 4 | 物理标记副本编号，0 或 1 |
+| 16 | 4 | 状态：0 EMPTY、1 COMMITTED |
+| 20 | 4 | 保留，必须为零 |
+| 24 | 8 | 单调递增的 generation |
+| 32 | 4 | 加密日志字节长度；EMPTY 时为零 |
+| 36 | 4 | 保留，必须为零 |
+| 40 | 8 | 此 generation 对应的最终容器 EOF |
+| 48 | 32 | 精确加密日志字节的无密钥 SHA-256；EMPTY 时为零 |
+| 80 | 32 | 对容器 UUID 与字节 0..79 拼接值计算的 HMAC-SHA256 |
+| 112 | 3,984 | 保留，必须为零 |
 
-The MAC uses `cf_mac` with the derived header key over UUID concatenated with
-bytes 0..79 (HMAC-SHA256). A marker is eligible only after its
-reserved bytes, copy number, state-dependent fields, EOF, version and MAC all
-validate. Mount selects the eligible marker with the highest generation. Equal
-generation copies are accepted only when their state, length, EOF and journal
-hash agree. An invalid newer marker is ignored as a torn write; the preceding
-eligible marker remains authoritative. A highest EMPTY marker suppresses any
-older COMMITTED marker.
+MAC 使用派生的头部密钥，通过 `cf_mac` 对 UUID 与字节 0..79 拼接值计算（HMAC-SHA256）。保留字节、副本编号、状态相关字段、EOF、版本和 MAC 全部通过验证后，该标记才有资格参与选择。挂载时选择有效标记中 generation 最高者。generation 相同的副本只有在状态、长度、EOF 和日志哈希一致时才可接受。较新的标记无效时视为撕裂写入并忽略，之前的有效标记仍具权威性。最高标记为 EMPTY 时，所有更早的 COMMITTED 标记都不得重放。
 
-New containers start with marker copy 0 EMPTY generation 0. Each transaction
-uses the next generation for COMMITTED and the following generation for
-EMPTY, alternating physical marker copies by generation parity.
+新容器从副本 0、EMPTY、generation 0 开始。每笔事务使用下一个 generation 写 COMMITTED，再使用其后的 generation 写 EMPTY；物理标记副本按 generation 奇偶交替。
 
-## Journal
+## 事务日志
 
-The journal starts at 16,384 and occupies the next 4 MiB. A committed marker's
-length selects the exact encrypted journal prefix; bytes after that prefix are
-irrelevant stale storage. Total transaction journal length is at most 2 MiB.
-The encrypted journal begins with this 40-byte public envelope:
+日志从偏移 16,384 开始，后续 4 MiB 为其区域。COMMITTED 标记中的长度指定加密日志前缀的精确范围；该前缀之后的数据均视为无关的旧内容。单笔事务日志总长度最多 2 MiB。加密日志以 40 字节公开信封开始：
 
-| Offset | Size | Field |
+| 偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | ASCII `CFWAL1` followed by two NUL bytes |
-| 8 | 4 | format version, 1 |
-| 12 | 4 | ciphertext length, including tag |
+| 0 | 8 | ASCII `CFWAL1`，后接两个 NUL |
+| 8 | 4 | 格式版本，1 |
+| 12 | 4 | 密文长度，含 tag |
 | 16 | 24 | XChaCha20-Poly1305 nonce |
-| 40 | variable | ciphertext and 16-byte tag |
+| 40 | 可变 | 密文和 16 字节 tag |
 
-Journal AEAD associated data is the container UUID plus the 40-byte envelope.
-The plaintext is a 32-byte header followed by `page_count` ordered afterimages:
+日志 AEAD 关联数据是容器 UUID 与 40 字节信封。明文以 32 字节头部开始，后接按序排列的 `page_count` 个后像：
 
-| Plain offset | Size | Field |
+| 明文偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | ASCII `CFJNL1` followed by two NUL bytes |
-| 8 | 4 | format version, 1 |
-| 12 | 4 | afterimage count, 0..510 |
+| 0 | 8 | ASCII `CFJNL1`，后接两个 NUL |
+| 8 | 4 | 格式版本，1 |
+| 12 | 4 | 后像数量，0..510 |
 | 16 | 8 | COMMITTED generation |
-| 24 | 8 | final EOF, page aligned and bounded |
-| 32 | repeated | slot number (8 bytes), then complete 4,096-byte afterimage |
+| 24 | 8 | 最终 EOF，必须按页对齐且不越界 |
+| 32 | 重复 | 槽位编号（8 字节），后接完整 4,096 字节后像 |
 
-Zero afterimages are valid only for a pure EOF-trim transaction. Afterimages
-must have unique slots and fit within final EOF. Ordinary slots are
-1..3,999,999. The special slot `0xffffffffffffffff` refers to the fixed root
-page at 4,210,688 and is allowed even though it is not a movable slot.
-The encrypted length must exactly equal `40 + 32 + page_count * 4,104 + 16`.
-The marker SHA-256 covers the exact public envelope and ciphertext. Replay
-copies these already-authenticated afterimages verbatim; it does not encrypt
-them again. Free slots do not need WAL entries because reachability is derived
-from the authenticated graph.
+仅用于 EOF 截短的事务可以有零个后像。后像槽位必须唯一，且位于最终 EOF 范围内。普通槽位范围为 1..3,999,999。特殊槽位 `0xffffffffffffffff` 指固定根页（偏移 4,210,688），虽然根页不是可搬迁槽位，但日志允许引用它。
 
-## Decrypted page payloads
+加密日志长度必须恰好等于 `40 + 32 + page_count * 4,104 + 16`。标记中的 SHA-256 覆盖完整公开信封与密文。重放时原样复制已认证的后像，不再次加密。由于空闲槽位通过认证对象图的可达性推导，WAL 不需要记录空闲槽位。
 
-All page payloads are 4,032 bytes. Fields not listed below are zero and checked.
+## 解密后的页负载
 
-### Inode (type 1)
+每个页面负载长度为 4,032 字节。下表未列出的字段必须为零，且读取时须验证。
 
-| Payload offset | Size | Field |
+### Inode（类型 1）
+
+| 负载偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | inode ID; root is 1 |
-| 8 | 8 | parent inode ID; root is 0 |
-| 16 | 8 | first child inode slot |
-| 24 | 8 | next sibling inode slot |
-| 32 | 8 | first block-map slot |
-| 40 | 8 | root: first orphan inode slot; non-root: next orphan inode slot |
-| 48 | 8 | logical file size |
-| 56 | 8 | creation time, Windows FILETIME ticks |
-| 64 | 8 | access time, Windows FILETIME ticks |
-| 72 | 8 | write time, Windows FILETIME ticks |
-| 80 | 8 | change time, Windows FILETIME ticks |
-| 88 | 4 | Windows attributes |
-| 92 | 2 | UTF-16 code-unit name length, 0..255 |
-| 94 | 2 | flags, zero |
-| 96 | 510 | exact UTF-16LE name bytes; remainder zero |
-| 606 | 2 | zero |
-| 608 | 8 | root only: next inode ID |
-| 616 | 3,416 | zero |
+| 0 | 8 | inode ID；根节点为 1 |
+| 8 | 8 | 父 inode ID；根节点为 0 |
+| 16 | 8 | 首个子 inode 槽位 |
+| 24 | 8 | 下一个兄弟 inode 槽位 |
+| 32 | 8 | 首个块映射槽位 |
+| 40 | 8 | 根节点：首个孤儿 inode 槽位；非根：下一个孤儿 inode 槽位 |
+| 48 | 8 | 逻辑文件大小 |
+| 56 | 8 | 创建时间，Windows FILETIME tick |
+| 64 | 8 | 访问时间，Windows FILETIME tick |
+| 72 | 8 | 写入时间，Windows FILETIME tick |
+| 80 | 8 | 更改时间，Windows FILETIME tick |
+| 88 | 4 | Windows 属性 |
+| 92 | 2 | UTF-16 代码单元名称长度，0..255 |
+| 94 | 2 | 标志，必须为零 |
+| 96 | 510 | 精确 UTF-16LE 名称字节；余下部分为零 |
+| 606 | 2 | 零 |
+| 608 | 8 | 仅根节点：下一个 inode ID |
+| 616 | 3,416 | 零 |
 
-The root has directory attributes, no name, parent, sibling, or map link. Its
-offset 40 field is the head of the orphan chain. For the root only, payload
-offset 608 is a required monotonic `next_inode_id` counter; all live inode IDs
-are less than it. New IDs come from this counter and it increments in the same
-transaction as inode creation. IDs are never reused. Non-root inode payload
-bytes 608..4031 are zero.
-Directory children are singly owned through `first child` then each child's
-`next sibling`; redundant parent IDs must match. Files own a sorted block-map
-chain. Unlinked open nodes are singly owned from root's orphan link then each
-orphan inode's `next orphan`; orphan nodes have no sibling edge. A node cannot
-have both directory and non-directory type, and only directories may have
-children.
+根节点具有目录属性，但名称、父节点、兄弟节点和映射链接均为空。其偏移 40 字段为孤儿链表头。仅根节点的负载偏移 608 是必需的单调 `next_inode_id` 计数器；所有活动 inode ID 都小于它。新 ID 从该计数器取得，并在创建 inode 的同一事务中递增，且永不复用。非根 inode 的负载字节 608..4031 必须为零。
 
-### Block map (type 2)
+目录子项由 `first child` 后接各子项的 `next sibling` 单独拥有；冗余的父 ID 必须匹配。文件拥有排序后的块映射链。已 unlink 但仍打开的节点由根节点孤儿链接及各孤儿 inode 的 `next orphan` 单独拥有；孤儿节点不得保留兄弟链接。一个节点不能同时是目录和非目录，且只有目录节点可拥有子项。
 
-| Payload offset | Size | Field |
+### 块映射（类型 2）
+
+| 负载偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | owning file inode ID |
-| 8 | 8 | next block-map slot |
-| 16 | 2 | entry count, 0..125 |
-| 18 | 6 | zero |
-| 24 | 32 per entry | sorted logical block entries |
+| 0 | 8 | 所属文件 inode ID |
+| 8 | 8 | 下一个块映射槽位 |
+| 16 | 2 | 项数量，0..125 |
+| 18 | 6 | 零 |
+| 24 | 每项 32 | 按序排列的逻辑块项 |
 
-Each 32-byte entry is: logical block index (u64), first fragment slot (u64),
-encoded byte length (u32), codec (u32: 0 raw, 1 zstd), raw byte length (u32,
-exactly 65,536), and fragment count (u32). Entries are strictly increasing
-within and across pages. Empty map pages are invalid. Blocks beyond the file's
-logical EOF are invalid after final truncation.
-When a map-chain link changes, the transaction stores the page containing that
-link together with the referenced new map page. In particular, appending a map
-after a full tail map updates the predecessor's `next block-map slot` and the
-new map page atomically; a remount must never see the new map without its link.
+每个 32 字节项依次包含：逻辑块索引（u64）、首个片段槽位（u64）、编码字节长度（u32）、codec（u32：0 原始、1 zstd）、原始字节长度（u32，必须恰为 65,536）和片段数量（u32）。页内和跨页的项都必须严格递增。空映射页无效。最终截断后，逻辑 EOF 之外的块无效。
 
-### Data fragment (type 3)
+映射链链接改变时，事务必须同时保存包含该链接的页及被引用的新映射页。尤其是满尾映射后追加映射时，必须原子更新前驱页的 `next block-map slot` 和新映射页；重新挂载时绝不能看到新映射页却没有对应链接。
 
-| Payload offset | Size | Field |
+### 数据片段（类型 3）
+
+| 负载偏移 | 大小 | 字段 |
 | ---: | ---: | --- |
-| 0 | 8 | owning file inode ID |
-| 8 | 8 | logical block index |
-| 16 | 8 | next fragment slot |
-| 24 | 4 | zero-based fragment sequence |
-| 28 | 4 | used data bytes, 1..4,000 |
-| 32 | up to 4,000 | encoded block bytes |
-| 32 + used length | remainder | zero |
+| 0 | 8 | 所属文件 inode ID |
+| 8 | 8 | 逻辑块索引 |
+| 16 | 8 | 下一个片段槽位 |
+| 24 | 4 | 从零开始的片段序号 |
+| 28 | 4 | 已用数据字节，1..4,000 |
+| 32 | 最多 4,000 | 编码后的数据块字节 |
+| 32 + 已用长度 | 其余 | 零 |
 
-Fragments form an exact singly owned chain. Sequences start at zero, lengths
-sum to the entry's encoded length, and the final next pointer is zero. The
-complete encoded block is authenticated and decoded (exactly one bounded zstd
-frame for codec 1) before any plaintext from it is returned. Unallocated blocks
-are sparse logical holes and read as zeroes.
+片段组成精确的单一所有者链。序号从零开始，所有片段长度之和必须等于映射项中的编码长度，最后一个片段的 next 指针为零。返回其中任何明文前，必须认证并解码整个编码数据块（codec 1 必须是单个、窗口受限的 zstd frame）。未分配数据块是逻辑稀疏空洞，读取为零。
 
-## Transaction and open ordering
+## 事务与打开顺序
 
-For a transaction, write and flush the complete journal, write and flush the
-alternating COMMITTED marker (the durable commit point), apply afterimages and
-flush, set the final EOF and flush, then write and flush the alternating EMPTY
-marker. An error after COMMITTED poisons the live store until remount. Before
-COMMITTED, home pages and EOF remain untouched.
+每笔事务先写入并刷新完整日志，再写入并刷新交替槽位中的 COMMITTED 标记（持久化提交点），应用后像并刷新，设置最终 EOF 并刷新，最后写入并刷新交替槽位中的 EMPTY 标记。COMMITTED 之后发生错误会使运行中的存储层进入 poisoned 状态，直到重新挂载。COMMITTED 之前正式页和 EOF 均保持不变。
 
-A journal write or its first flush failure is a precommit I/O error: the
-previous EMPTY marker remains authoritative, home pages and EOF are untouched,
-the in-memory operation is rolled back, and the caller receives an I/O error.
-Failure from the first attempt to write the COMMITTED marker onward is treated
-as uncertain and poisons the live store. This includes a reported short marker
-write: the authenticated 112-byte marker prefix could have reached storage even
-when the write call reports failure. A later open validates the selected
-marker, journal, and complete proposed graph before doing any recovery writes.
-An optional sparse-range punch after a committed page move may fail without
-invalidating the move; the host error remains available in store diagnostics.
+日志写入或第一次刷新失败属于提交前 I/O 错误：先前的 EMPTY 标记仍为权威状态，正式页和 EOF 不变，内存操作会回滚，调用方收到 I/O 错误。从首次尝试写 COMMITTED 标记起，所有失败均视为结果不确定，并将运行中的存储层置为 poisoned。这也包括系统报告标记短写的情形：即使写入调用失败，经过认证的 112 字节标记前缀也可能已经到达存储设备。之后重新打开时，必须先验证选中的标记、日志和完整拟议对象图，才能执行任何恢复写入。已提交页面搬迁后的可选稀疏区间打洞即使失败，也不影响搬迁有效性；宿主错误仍可从存储诊断信息中获取。
 
-`CRYPTFS_TESTING` builds expose host-I/O fault seams for write, flush, EOF, and
-hole-punch operations. Each occurrence counter counts calls to its matching
-storage primitive and fails the selected call before invoking the host API. A
-separate short-marker seam writes only the first 112 marker bytes at the next
-marker write, then reports a write error. These test seams do not change the
-v1 on-disk layout and are absent from product builds.
+定义 `CRYPTFS_TESTING` 的构建会开放宿主 I/O 故障注入接口，可针对写入、刷新、EOF 和打洞操作进行测试。每个 occurrence 计数器会统计对应存储原语的调用次数，并在选定调用执行宿主 API 前注入失败。另有独立短标记接口：在下一次标记写入中只写前 112 字节，然后报告写错误。这些测试接口不改变 v1 磁盘布局，产品构建中不存在。
 
-Opening an existing container performs no writes, sparse-control changes,
-truncation or metadata flush. After password unwrap, it validates the selected
-marker and journal. If COMMITTED, a shadow reader overlays afterimages on home
-pages and authenticates every reachable inode, map and fragment, including
-decoding every complete data block. Only after the entire proposed graph passes
-may recovery write afterimages, EOF and EMPTY. With EMPTY, the complete current
-graph is authenticated before enabling writes. A failure during password,
-format, marker, WAL, graph, bounds, AEAD or data validation leaves container
-bytes unchanged.
+打开现有容器时，不得写入、修改稀疏控制、截短文件或刷新元数据。密码解封后，先验证选中的标记和日志。若状态为 COMMITTED，shadow reader 会用日志后像覆盖正式页视图，并认证所有可达 inode、映射和片段，包括解码每个完整数据块。只有整个拟议对象图通过检查后，恢复流程才可写后像、EOF 和 EMPTY。若状态为 EMPTY，则在启用写入前验证当前完整对象图。密码、格式、标记、WAL、对象图、边界、AEAD 或数据验证失败时，容器字节必须保持不变。
 
-New creation uses exclusive create, marks only that new file sparse, writes
-both immutable superblocks, initial root and EMPTY marker, and sets the fixed
-minimum EOF. If initialization fails, only the newly created file may be
-removed. Existing containers are opened exclusively and must already be sparse.
+创建新容器时使用排他创建，仅将新文件设为稀疏文件，写入两个不可变 superblock、初始根节点及 EMPTY 标记，并设置固定最小 EOF。初始化失败时，只允许删除此次新建的文件。打开已有容器时使用排他句柄，并要求该容器已经是稀疏文件。

@@ -1,13 +1,13 @@
-# CryptFS requirements and implementation scope
+# CryptFS 需求与实现范围
 
-Date: 2026-10-03 (Asia/Shanghai).
+日期：2026-10-03（Asia/Shanghai）。
 
-The user requested a new Windows filesystem in `D:\work\fs\cryptfs`, reusing the existing frontend in `D:\work\fs\frontend`. It must encrypt and compress persistent filesystem data inside one container file, allocate sparsely, grow with writes and reclaim storage as files shrink or disappear. The user selected password unlocking and background automatic compaction that also shortens the container file.
+用户要求在 `D:\work\fs\cryptfs` 中实现新的 Windows 文件系统，并复用 `D:\work\fs\frontend` 中的现有前端。文件系统须将持久化数据加密并压缩后存入单个容器文件，采用稀疏分配，随写入扩展，并在文件缩小或删除时回收空间。用户选择密码解锁，以及可同时缩短容器文件的后台自动整理。
 
-The build uses C17 and clang-cl, with external dependencies provided by vcpkg at `D:\vcpkg`. Follow the existing products' static-runtime and operating-system-DLL delivery pattern. Preserve the existing memfs and SCPFS checkouts, credentials and services; use isolated test files and unused drive letters. No commit or push is authorized.
+项目使用 C17 和 clang-cl，外部依赖由 `D:\vcpkg` 中的 vcpkg 提供。交付应遵循现有产品的静态运行库和仅依赖操作系统 DLL 的模式。应保留现有 memfs、SCPFS 检出目录、凭据和服务；测试使用隔离的测试文件和空闲盘符。**此记录编写时未授权提交或推送。**
 
-The reusable frontend owns WinFsp forwarding and mount/dispatcher lifetime. The new backend owns the persistent namespace, data blocks, authenticated container format, allocation, transactions, recovery and compaction. Passwords must not appear in process command lines, logs, service registration or ordinary files. The no-argument configuration interface needs a masked password field and a secret-safe child input path if it uses the existing launcher.
+可复用前端负责 WinFsp 操作转发以及挂载/调度器生命周期。新后端负责持久化命名空间、数据块、认证容器格式、分配、事务、恢复和整理。密码不得出现在进程命令行、日志、服务注册信息或普通文件中。无参数配置界面需要密码遮罩输入框；如果使用现有启动器，还须通过不暴露密码的方式将密码传给子进程。
 
-Because this is a new encrypted persistent format, implementation followed a focused architecture/security decision after the read-only Luna investigation. The disk-format and transaction rules were recorded in ARCHITECTURE.md before backend implementation. Key acceptance gates are authenticated rejection, crash recovery, sparse allocation, compression, background EOF shrink, actual WinFsp CRUD and lifecycle tests, GUI password handling, Debug/Release builds and runtime dependency verification. Final evidence and untested limits are recorded in VALIDATION.md.
+由于这是新的加密持久化格式，后端实现前先根据只读 Luna 调查结果完成了聚焦的架构与安全决策，并将磁盘格式和事务规则记录在 `ARCHITECTURE.md`。主要验收门槛包括认证失败时拒绝读取、崩溃恢复、稀疏分配、压缩、后台 EOF 收缩、真实 WinFsp CRUD 与生命周期测试、GUI 密码处理、Debug/Release 构建，以及运行时依赖验证。最终证据和未测试边界记录在 `VALIDATION.md`。
 
-Service auto-unlock, password changes, cross-platform readers, NTFS feature parity and multi-process container access were not requested. Their inclusion or limits must be explicit in the implementation design and final validation record.
+用户未要求服务自动解锁、密码修改、跨平台读取、NTFS 功能兼容或多进程同时访问容器。设计和最终验证记录必须明确说明这些功能是否实现及其限制。

@@ -1,191 +1,71 @@
-# CryptFS v1 architecture
+# CryptFS v1 架构
 
-Decision recorded 2026-10-03 before implementation. Luna prepared the frontend,
-dependency and persistence briefing; Sol Ultra approved this new persistent
-format, crypto boundary and compaction protocol. This is a Windows-only v1,
-with one exclusive writer per container and case-sensitive UTF-16 names.
+本决策于 2026-10-03、实现开始前记录。Luna 准备了前端、依赖和持久化方案简报；Sol Ultra 批准了这一新的持久化格式、密码学边界和整理协议。本项目 v1 仅支持 Windows；每个容器只允许一个独占写入者，文件名按区分大小写的 UTF-16 比较。
 
-## Public behavior
+## 对外行为
 
-A single NTFS sparse file contains all persistent filesystem state. New files
-and holes read as zeros. Independently compressed 64 KiB logical blocks use
-zstd level 3 by default, falling back to raw data if compression does not save
-space. The container grows on demand; a background worker reclaims free sparse
-ranges and relocates tail pages into lower free slots, then truncates EOF.
-Files, names, directories, sizes, attributes and timestamps are encrypted.
-Windows security descriptors are synthesized for this v1 volume; persistent
-ACLs, reparse points, streams, EA, hard links and service auto-unlock are outside
-v1. Unsupported operations must return an explicit unsupported result.
+所有持久化文件系统状态保存在一个 NTFS 稀疏文件中。新文件和文件空洞读取为零。逻辑数据按独立的 64 KiB 块压缩，默认使用 zstd 等级 3；压缩不能节省空间时保存原始数据。容器按需扩展；后台 worker 会回收空闲稀疏区间，将尾部页面搬到较低的空闲槽位，然后截短 EOF。
 
-The logical capacity defaults to and is capped at 1 TiB. V1 limits are 65,536 namespace nodes,
-depth 64 and 4,000,000 physical pages (about 15.3 GiB). Free volume space considers
-the logical limit, physical page budget and host free space. These are product
-limits, not claims of unlimited storage. The exclusive file handle prevents
-two mounts of the same container. Normal operations and compaction share a lock.
+文件内容、名称、目录、大小、属性和时间戳均加密保存。本版卷会合成 Windows 安全描述符；持久化 ACL、重解析点、数据流、EA、硬链接和服务自动解锁不属于 v1。对不支持的操作必须明确返回“不支持”。
 
-## Cryptography and secret input
+逻辑容量默认为 1 TiB，且不得超过 1 TiB。v1 限制包括 65,536 个命名空间节点、目录深度 64、4,000,000 个物理页（约 15.3 GiB）。卷可用空间由逻辑容量上限、物理页预算和宿主磁盘剩余空间共同决定。这些是产品上限，不代表存储无限。容器以独占句柄打开，避免同一容器被两个挂载同时使用。普通操作与整理共享一把锁。
 
-Use statically linked libsodium and zstd from vcpkg x64-windows-static, static
-CRT, clang-cl C17 and the existing static WinFsp user-mode library. Argon2id13
-derives a wrapping key from UTF-8 password bytes (1..1024, no NUL/CR/LF), a fresh
-16-byte salt, opslimit 3 and memlimit 256 MiB. Readers reject unknown algorithms
-and parameters outside ops 1..6 and memory 64..512 MiB before invoking the KDF.
-A random 32-byte master key is wrapped using XChaCha20-Poly1305; independent
-record, journal and header keys are derived using crypto_kdf.
+## 密码学与密码输入
 
-Every fresh encryption uses a random 24-byte nonce. AAD covers UUID, format,
-record type, logical identity, segment index, physical slot, plaintext length,
-codec and every header field that affects interpretation. Journal replay writes
-authenticated afterimages without encrypting them again. Relocation decrypts
-and authenticates a page and re-encrypts it for the new slot with a fresh nonce.
-Authentication failures return no plaintext. Decoding accepts exactly one zstd
-frame, at most 64 KiB output and a bounded window, with exact length validation.
-Keys, passwords and transient plaintext are explicitly wiped.
+使用 vcpkg `x64-windows-static` 中静态链接的 libsodium 和 zstd、静态 CRT、clang-cl C17，以及现有静态 WinFsp 用户态库。Argon2id13 使用 UTF-8 密码字节（1–1024 字节，不允许 NUL/CR/LF）、新生成的 16 字节盐、opslimit 3 和 memlimit 256 MiB 派生包装密钥。读入容器时，若算法未知，或 KDF 参数超出 ops 1–6、内存 64–512 MiB 的范围，必须在调用 KDF 前拒绝。
 
-Passwords are never command-line arguments, environment variables, plaintext
-configuration files or log output. CLI uses a hidden console prompt or explicit
-stdin input. The shared frontend receives an additive masked-password field
-and an owned, securely wiped stdin blob transported using an inherited pipe
-and an explicit handle allowlist. This v1 GUI offers mount/unmount only; secret
-input cannot use the ShellExecute elevation/relaunch path.
+随机生成 32 字节主密钥，并用 XChaCha20-Poly1305 封装；使用 crypto_kdf 派生相互独立的记录、日志和头部密钥。
 
-## Serialized format and graph
+每次新加密都使用随机 24 字节 nonce。AAD 覆盖 UUID、格式、记录类型、逻辑标识、分段索引、物理槽位、明文长度、codec，以及所有影响头部解释方式的字段。重放日志时，将已认证的后像写回磁盘，不再次加密。搬迁页面时，先解密并认证原页，再以新槽位为上下文、用新 nonce 重新加密。认证失败不得返回明文。解码时只接受一个 zstd frame，输出最多 64 KiB、窗口大小有上限，并严格验证结果长度。密钥、密码和临时明文都必须显式清零。
 
-All disk structures use explicit little-endian serialization, never dumped C
-structs. The fixed front consists of two 4 KiB static superblocks, two 4 KiB
-authenticated state markers, a 4 MiB journal and a fixed 4 KiB root inode.
-Remaining home pages are 4 KiB-aligned encrypted records. The minimum EOF is
-the end of the fixed front. Public superblocks hold magic, version, header
-length, UUID, flags, logical capacity, Argon2id parameters, salt and the wrapped
-master-key envelope. Envelope AAD covers every other public field; reserved
-bytes are zero and checked. Public format/KDF values, container EOF and coarse
-allocation patterns are observable. This version provides authentication but
-does not provide freshness or rollback detection. An older complete valid
-container, or an older authenticated record for the same slot and logical
-identity whose surrounding graph remains valid, can be replayed. Detecting
-that requires an additional trusted freshness mechanism; it is outside v1.
+密码不得进入命令行参数、环境变量、明文配置文件或日志。CLI 使用隐藏的控制台输入，或从 stdin 显式读取。共享前端增加遮罩密码字段，并通过继承管道和明确的句柄白名单传递由前端拥有、会安全清零的 stdin 数据。本版 GUI 只提供挂载/卸载；秘密输入不能走 ShellExecute 提权/重启路径。
 
-Inodes form first-child/next-sibling chains. Each file owns a block-map chain;
-map entries own compressed/raw fragment chains. Every non-root page has exactly
-one physical owner edge, and the graph is acyclic. Redundant parent inode IDs
-are validation fields, not physical ownership edges. Directory lookup and
-sorting use verified RAM indices. Names compare exact UTF-16 code units.
-Rename must prevent moving a directory into its own descendants.
+## 序列化格式与对象图
 
-Open-unlinked inodes are owned by root.orphan_head through independent
-next_orphan pointers: unlink atomically removes the directory sibling edge,
-clears next_sibling and inserts the inode into the orphan chain. The final
-handle closes and frees it. Following a crash, orphan cleanup occurs only after
-full authenticated mount/recovery validation. All indices, lengths, traversals,
-counts, depth, duplicate references and arithmetic have explicit bounds.
+所有磁盘结构均显式按 little-endian 序列化，禁止直接转储 C 结构体。固定前缀包括两个 4 KiB 静态 superblock、两个 4 KiB 认证状态标记、4 MiB 日志，以及固定的 4 KiB 根 inode。其后的正式数据页是按 4 KiB 对齐的加密记录。最小 EOF 为固定前缀末端。
 
-## Transactions and mount recovery
+公开 superblock 保存 magic、版本、头部长度、UUID、标志、逻辑容量、Argon2id 参数、盐以及包装后的主密钥信封。信封 AAD 覆盖其他所有公开字段；保留字节必须为零，并在读取时验证。公开格式/KDF 参数、容器 EOF 和粗略分配模式仍可被观察到。本格式提供认证，但不提供新鲜度或回滚检测。攻击者可以重放一份更早的、完整有效的旧容器；也可能在周边对象图仍然有效时，重放同一槽位、同一逻辑标识所对应的旧认证记录。检测此类回滚需要额外的可信新鲜度机制，不属于 v1。
 
-Journal transactions are bounded to 2 MiB within the fixed 4 MiB region. The
-complete encrypted journal contains home afterimages and the final EOF. State
-markers contain format/slot/state, monotonically increasing generation,
-journal length/hash and keyed authentication. Select the highest valid marker;
-the highest EMPTY means an older COMMITTED marker must not replay.
+inode 通过 first-child/next-sibling 链组织。每个文件拥有一条块映射链；映射项拥有压缩/原始数据片段链。除根页外，每个页面只能有一条物理所有者边，整个对象图不得有环。冗余的父 inode ID 仅供校验，不是物理所有权边。目录查找和排序使用已验证的内存索引。名称比较使用精确的 UTF-16 代码单元。改名不得把目录移动到自己的后代之中。
 
-1. Write the complete encrypted journal; FlushFileBuffers.
-2. Write an alternating COMMITTED marker; flush. This is the commit point.
-3. Apply authenticated home afterimages; flush.
-4. Apply transaction-required truncation (and any immediate punch list); flush.
-5. Write an alternating EMPTY marker; flush. Only then start the next transaction.
+已打开但已 unlink 的 inode 由 `root.orphan_head` 通过独立的 `next_orphan` 指针拥有：unlink 会原子移除目录兄弟链接、清除 `next_sibling` 并将 inode 插入孤儿链。最后一个句柄关闭时释放该 inode。崩溃后，只有在完整认证挂载/恢复校验通过后才清理孤儿。索引、长度、遍历、计数、深度、重复引用和算术运算都必须有明确边界。
 
-Before COMMITTED, old home pages are unchanged. After COMMITTED, recovery is
-idempotent. For a COMMITTED mount, a shadow resolver overlays afterimages on
-home pages and authenticates the entire proposed live graph, including every
-data page, before any replay, punch or truncation. An EMPTY mount authenticates
-the complete current graph before enabling writes. Failed unlock, journal,
-marker, graph, AEAD or bounds checks cause zero container writes. This makes
-unlock O(live pages); large-container unlock latency must be measured and
-reported rather than concealed. A complete authenticated logical block is
-verified before any of its plaintext is returned on reads.
+## 事务与挂载恢复
 
-Large writes commit one 64 KiB block at a time and report accurately completed
-bytes on later failure. Metadata operations must prove their transaction fits
-before modifying persistent state. Delete/truncate commits graph changes;
-free pages are reconstructed from reachability, so large deletes need not list
-all freed slots in one journal. From the first attempted write of the
-COMMITTED marker onward, any unsuccessful transaction has an uncertain
-outcome and poisons further writes until remount. A journal write/flush or
-resource failure before that attempt leaves the previous EMPTY marker and
-old home pages/EOF authoritative; it fails without poisoning the volume.
-Never reuse an unresolved transaction or report false success.
+事务日志位于固定 4 MiB 区域内，单笔事务不得超过 2 MiB。加密日志完整保存正式数据页后像和最终 EOF。状态标记包含格式/槽位/状态、单调递增的 generation、日志长度/哈希及带密钥认证。选择有效标记中 generation 最高者；若最高状态为 EMPTY，则较早的 COMMITTED 标记不得再重放。
 
-Compaction obeys the same commit boundary. Its precommit resource or host-I/O
-failure stops that pass, exposes the error, and leaves foreground operations
-available; a later wake or bounded backoff retries without a busy loop.
-Authenticated-page, owner-link, or graph invariant failure poisons the store.
-An outcome-uncertain failure after COMMITTED-marker attempt also poisons the
-store. A stopped compaction pass must not be reported as completed reclamation.
+1. 写入完整的加密日志并调用 `FlushFileBuffers`。
+2. 写入交替槽位中的 COMMITTED 标记并刷新。此处是提交点。
+3. 应用经过认证的正式数据页后像并刷新。
+4. 执行事务要求的截短（以及任何立即打洞清单）并刷新。
+5. 写入交替槽位中的 EMPTY 标记并刷新。只有之后才能开始下一笔事务。
 
-## Background convergence and reclamation
+写入 COMMITTED 之前，旧正式页保持不变。写入 COMMITTED 之后，恢复操作必须幂等。挂载时若选中 COMMITTED，shadow resolver 会先将日志后像覆盖到正式页视图，并认证完整的拟议活动对象图（包括每个数据页），然后才允许重放、打洞或截短。若选中 EMPTY，必须先认证当前完整对象图，之后才允许写入。解锁、日志、标记、对象图、AEAD 或边界检查失败时，容器不得有任何写入。这使解锁开销为 O(活动页数)；必须测量并如实报告大型容器的解锁延迟。读取时，完整逻辑数据块通过认证后才能返回其中任意明文。
 
-The worker moves at most one live 4 KiB page per step from highest live slot H
-to lower free slot L, updates its unique owner's pointer and re-encrypts owner
-and destination in one WAL transaction. Owner is updated in place, so this
-does not create new tail pages. Root never moves. Each move lowers the highest
-live page or reduces the number of live pages above the current lowest free
-slot; once there are no holes, EOF is minimal for live pages. The worker yields
-the lock between steps. Convergence assumes net-stable foreground storage;
-unbounded incoming growth cannot promise a shrinking EOF.
+大块写入按每个 64 KiB 数据块分别提交；后续失败时须准确报告已经完成的字节数。元数据操作必须先确认事务大小可容纳，再修改持久状态。删除/截断提交对象图变更；空闲页由可达性重建，因此大批删除不必在一笔日志中列出全部被释放的槽位。从首次尝试写 COMMITTED 标记起，若事务未能成功完成，其结果就存在不确定性；存储层必须禁止继续写入，直到重新挂载。若日志写入/刷新或资源分配在该尝试之前失败，则先前的 EMPTY 标记、旧正式页和 EOF 仍为权威状态；该操作失败，但无需将卷标记为 poisoned。不得重用结果未决的事务，也不得报告虚假成功。
 
-Ordinary free-page punching may run after EMPTY, but each step holds the lock,
-rechecks that the slot is still unreachable, and is mutually exclusive with
-allocation. Never queue a bare slot number for later unchecked punching.
-Tail truncation is serialized and durably tracked. Unsupported sparse controls,
-host exhaustion and write/flush failures are reported explicitly. Background
-failure is visible in statistics/logging and stops unsafe writes.
+整理也必须遵守相同的提交边界。提交前发生资源或宿主 I/O 错误时，应停止本轮整理、公开错误，并允许前台操作继续；之后通过下一次唤醒或有上限的退避重试，不能忙循环。页面认证、所有者链接或对象图不变量失败会使存储层进入 poisoned 状态。尝试写 COMMITTED 标记后发生结果不确定的故障，同样会使存储层进入 poisoned 状态。整理 pass 停止时不得报告回收已完成。
 
-## Validation gates
+## 后台收敛与空间回收
 
-Crypto and codec known-answer/bounds tests; wrong password, header/marker/WAL/
-page/tag tamper with byte-for-byte no-write verification; crash at every durable
-transaction phase; sparse large holes; incompressible and compressible blocks;
-rename/delete/open-unlink; timestamp persistence; repeated overwrite and EOF
-shrink; actual WinFsp CRUD/concurrency/remount; GUI secret transport; Debug and
-Release tests; shared frontend memfs/SCPFS regressions; static imports and signed
-driver provenance; final independent storage/security architecture review.
+每一步最多搬迁一个活动的 4 KiB 页面：从最高活动槽位 H 搬到更低的空闲槽位 L，并在一笔 WAL 事务中更新其唯一所有者指针，对所有者页和目标页重新加密。所有者页原位更新，因此不会产生新的尾页。根页永不搬迁。每次搬迁都会降低最高活动页，或减少当前最低空闲槽位以上的活动页数；没有内部空洞后，EOF 即为容纳全部活动页所需的最小值。worker 在每个步骤之间释放锁让出执行机会。收敛依赖前台存储量净增长稳定；若持续无限增长，不能承诺 EOF 会缩小。
 
-Tests prove only their recorded scope. This format is new: backup important
-data until longer operational and power-loss testing establishes confidence.
+写入 EMPTY 后可以对普通空闲页打洞；但每一步都必须持锁，重新确认槽位仍不可达，并与分配操作互斥。不得把裸槽位号放入队列，之后不经检查就打洞。尾部截短必须串行化并具备持久跟踪。稀疏文件控制不受支持、宿主空间耗尽、写入/刷新失败都必须明确报告。后台失败必须体现在统计/日志中，并阻止不安全写入。
 
-## Final review implementation constraints (2026-10-03)
+## 验证门槛
 
-Sol's focused final review requires parser-owned block objects to have one
-cleanup owner even if fragment authentication fails. Precommit RAM rollback
-must never run after a successful WAL commit; failure while publishing page
-registrations poisons the store but must leave it safely disposable. Test-only
-registration failure injection and fragment-tag tampering exercise these
-boundaries under AddressSanitizer.
+加密和 codec 已知答案/边界测试；错误密码、头部/标记/WAL/页面/tag 篡改后逐字节验证容器未写入；覆盖每个持久化事务阶段的崩溃测试；大型稀疏空洞；不可压缩和可压缩数据块；rename/delete/open-unlink；时间戳持久化；反复覆盖和 EOF 收缩；真实 WinFsp CRUD/并发/重新挂载；GUI 密码传输；Debug 与 Release 测试；共享前端的 memfs/SCPFS 回归；静态导入及签名驱动来源验证；最终独立的存储/安全架构审查。
 
-Namespace changes and later orphan reclamation are separate transactions. Once
-unlink or rename commits, its result reports that committed namespace change.
-Reclamation failure is recorded independently; uncertain committed I/O stops
-further writes until remount. A one-shot test-only reclamation failure verifies
-this result contract. These changes do not alter the v1 serialized format.
+测试只能证明记录中明确覆盖的范围。本格式是新的：在更长时间的运行和断电测试建立足够信心前，重要数据应保留独立备份。
 
-Sol accepts a v1 allocation boundary: a non-aligned shrink may require new
-encrypted boundary fragments and can return CF_NO_SPACE when no physical slots
-are available. Such failure preserves the old size, plaintext, map graph and
-container bytes. Shrinking to zero, to a 64 KiB boundary, or unlinking requires
-no new physical page slots and remains available to release space. A test-only
-allocation failure covers the same precommit failure path. Background
-compaction may free slots for a later retry. V1 does not add old-slot reuse for
-partial-block shrink at this milestone.
+## 最终审查的实现约束（2026-10-03）
 
-The final review also requires controlled write, flush, EOF and sparse-punch
-failures. A partial COMMITTED marker write may already leave an authenticated
-marker prefix, so the store poisons from the marker-write attempt, including
-reported short writes. Reclamation failure after namespace commit does not
-change that operation's committed result. Sparse-punch failure is recorded as
-a warning; the unreachable source slot remains safe and later EOF truncation
-can reclaim it. Test-only hooks verify these failure outcomes without altering
-the production format or interrupting existing system volumes.
+Sol 的专项最终审查要求：即使片段认证失败，解析器创建的数据块对象也必须只有一个清理所有者。WAL 提交成功后绝不能再执行提交前内存回滚；页面注册发布失败会使存储层进入 poisoned 状态，但仍必须能够安全释放。通过仅供测试使用的注册失败注入和片段 tag 篡改，在 AddressSanitizer 下验证这些边界。
 
-`cf_store_wait_idle` is a synchronization wait, not a reclamation-success
-certificate. A recoverable background failure leaves the worker idle and
-records a warning/host error; callers use statistics or explicit compact-step
-results to determine whether the desired EOF/reclamation was reached.
+命名空间变更和之后的孤儿回收是两个独立事务。unlink 或 rename 一旦提交，其结果必须报告该命名空间变更已提交。回收失败应独立记录；若已提交 I/O 结果不确定，则在重新挂载前停止后续写入。一次性测试回收失败注入用于验证该结果约定。这些变更不修改 v1 序列化格式。
+
+Sol 接受 v1 的分配边界：非对齐缩小可能需要新的加密边界片段；如果没有空闲物理槽位，可能返回 `CF_NO_SPACE`。此类失败必须保留旧大小、明文、映射图和容器字节。缩小到零、缩小到 64 KiB 边界或 unlink 不需要新的物理页槽位，仍可用于释放空间。仅供测试的分配失败会覆盖相同的提交前错误路径。后台整理可能释放槽位以便稍后重试。此里程碑的 v1 不为部分数据块截断添加旧槽位复用。
+
+最终审查还要求可控注入写入、刷新、EOF 和稀疏打洞故障。COMMITTED 标记可能只写入一部分，但已留下有效认证标记前缀，因此从尝试写标记开始（包括系统报告短写）就必须将存储层置为 poisoned。命名空间提交后的回收失败不得改变该操作已提交的结果。稀疏打洞失败应记录警告；旧源槽位仍不可达，因此安全，后续 EOF 截短仍可回收空间。测试钩子用于验证这些结果，不改动生产格式，也不影响现有系统卷。
+
+`cf_store_wait_idle` 是同步等待，不代表空间回收成功。可恢复的后台故障会让 worker 进入 idle，同时记录警告/宿主错误；调用方应使用统计信息或显式单步整理结果判断 EOF/空间回收是否达到预期。

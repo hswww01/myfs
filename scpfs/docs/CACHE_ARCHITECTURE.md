@@ -1,96 +1,50 @@
-# Session cache and the remote helper
+# 会话缓存与远端 helper
 
-SCPFS mounts are usually far from the server (a 234 ms round trip was the
-reference case). Every SSH exec channel costs several round trips, so the
-design goal is one round trip per operation that cannot be answered locally,
-and zero for everything that can.
+SCPFS 通常远离服务器（参考场景往返延迟 234 ms）。每个 SSH exec 通道都需要多次往返，因此设计目标是：本地无法回答的操作最多一次往返，本地可回答的操作为零次往返。
 
-## Connections
+## SSH 连接
 
-A mount opens two authenticated SSH sessions, in parallel:
+挂载时并行打开两个经过认证的 SSH 会话：
 
-- **Main session.** Resolves the canonical remote root (one exec that runs
-  `realpath` and `stat` together), runs SCP transfers for large files and keeps
-  one long-lived `/bin/sh` channel for every other remote command. Each command
-  runs in a subshell with stdin from `/dev/null`, framed by a per-command random
-  nonce, so it costs one round trip instead of a channel open/exec/close. User
-  inbox commands still get their own exec channel.
-- **Monitor session.** Runs the embedded helper `server/scpfs_watch.py`
-  (standard-library Python 3, Linux inotify, stdio only; no daemon or port). It
-  greets with the root it resolved, and the client only uses it once that root
-  equals the main session's canonical root. Mounting waits up to 8 s for it so
-  the first Explorer burst is already served by the helper.
+- **主会话。** 使用一条 exec 同时运行 `realpath` 和 `stat` 解析规范远端根目录；大文件通过 SCP 传输；其他远端命令共用一个长期 `/bin/sh` 通道。每个命令在子 shell 中运行，stdin 指向 `/dev/null`，并由每条命令独立的随机 nonce 进行帧标记，因此只需一次往返，无须分别打开/执行/关闭通道。用户 inbox 命令仍使用独立 exec 通道。
+- **监控会话。** 运行内嵌 helper `server/scpfs_watch.py`（Python 3 标准库、Linux inotify、仅 stdio，不创建守护进程或端口）。helper 会报告它解析的根目录；只有当该根目录与主会话的规范根目录一致时，客户端才使用此监控会话。挂载最多等待 8 秒，使资源管理器启动后第一批请求也能由 helper 响应。
 
-## Helper protocol (v2)
+## Helper 协议（v2）
 
-Requests are pipelined: callers on any thread queue them, the monitor thread
-writes them in batches and matches the in-order replies. The helper covers a
-path before answering about it: it holds a directory watch on every ancestor
-(and on the directory itself for stats and listings of directories; on the
-inode for hard-linked files). Every later change to an answer is therefore
-reported as an event on the same stream, after the reply.
+请求采用流水线处理：任意线程上的调用方可以排队，监控线程批量写入并按顺序匹配回复。helper 在回答路径请求前会先覆盖该路径：对每个祖先目录建立目录监控；对目录的 stat/listing 监控目录自身；对硬链接文件监控 inode。因此，回答之后该路径的变化会在同一数据流中作为事件报告。
 
-| Request | Purpose |
+| 请求 | 用途 |
 |---|---|
-| `S` | lstat; `N` means absent with the parent covered (cacheable) |
-| `L` | directory listing with an lstat of every entry |
-| `R` | whole content of a regular file up to 8 MiB |
-| `P` | atomic replace through a sibling temporary, up to 8 MiB, with the same expected-snapshot check as the SCP upload |
-| `M`, `K`, `X`, `N` | chmod/utime, mkdir, unlink/rmdir, rename (no-clobber via `renameat2` when not replacing) |
-| `F` | file system capacity |
-| `B` | barrier / heartbeat |
+| `S` | lstat；`N` 表示不存在，但已监控父目录（可缓存） |
+| `L` | 目录列表，并对每个条目执行 lstat |
+| `R` | 读取不超过 8 MiB 的普通文件完整内容 |
+| `P` | 通过同目录临时文件原子替换，不超过 8 MiB；执行与 SCP 上传相同的快照冲突检查 |
+| `M`、`K`、`X`、`N` | chmod/utime、mkdir、unlink/rmdir、rename（不覆盖时可用 `renameat2` 防止替换） |
+| `F` | 文件系统容量 |
+| `B` | barrier / 心跳 |
 
-Events name paths: `C` (content or namespace change), `M` (metadata only),
-`T` (subtree lost: a covered directory was moved or deleted, or its watch was
-evicted) and `R` (queue overflow: everything). Losing a watch never stops the
-helper. Watches are kept in LRU order below half of
-`fs.inotify.max_user_watches` (at most 32768); evicting one reports `T` for it.
-Network and pseudo file systems (NFS, CIFS, 9p, FUSE, proc, ...) are refused.
+事件包含路径：`C`（内容或命名空间变化）、`M`（仅元数据变化）、`T`（监控子树失效：已覆盖目录被移动/删除，或对应 watch 被淘汰）、`R`（队列溢出：全部缓存失效）。watch 丢失不会终止 helper。监控项按 LRU 顺序维持在 `fs.inotify.max_user_watches` 的一半以下（最多 32768）；淘汰监控项时会为其报告 `T`。不支持网络/伪文件系统（NFS、CIFS、9p、FUSE、proc 等）。
 
-`U` answers (symlinked or cross-device ancestors, files over the size limits,
-a file that changed while being read) send the caller to the main session.
-Mutations whose reply is lost report an error instead of falling back, because
-they may already have happened.
+`U` 回复表示调用方应回退到主会话，例如存在符号链接/跨设备祖先、文件超过大小上限，或文件在读取期间发生变化。若变更操作的回复丢失，会报告错误而非回退，因为操作可能已经生效。
 
-## Cache
+## 缓存
 
-`src/scp_cache.c` holds stats (including negative entries), listings (whose
-entries also populate child stats) and clean payload copies, behind its own
-lock. Invalidation is per path:
+`src/scp_cache.c` 在独立锁保护下保存 stat（含负缓存条目）、目录列表（其条目也会填充子项 stat）和干净负载副本。缓存按路径失效：
 
-- `M`: the path's stat and its parent's listing.
-- `C`: also the path's listing and payload, the parent's stat and the
-  grandparent's listing (the parent's mtime moved).
-- `T`: also everything below the path.
+- `M`：失效该路径 stat 和父目录列表。
+- `C`：同时失效该路径列表和负载、父目录 stat、祖父目录列表（因为父目录 mtime 已变化）。
+- `T`：同时失效该路径下的所有条目。
 
-A reconnect, an overflow or an inbox command clears everything. Admission is
-ordered against invalidation by a sequence number: a reply records the cache
-sequence at the moment it is parsed (events before it have been applied), and
-a put is dropped if an invalidation of a related path (same, ancestor or
-descendant) was recorded after that. The last 1024 invalidations are kept for
-this check; older observations are rejected.
+重新连接、队列溢出或 inbox 命令会清空全部缓存。通过序号将缓存准入与失效排序：解析回复时记录当前缓存序号（之前的事件已应用）；若相关路径（自身、祖先或后代）在此之后发生过失效，则丢弃该缓存写入。为此只保留最近 1024 次失效记录；更早的观测一律拒绝准入。
 
-Payloads are reused when the current (cached) stat matches the copy's inode,
-size and mtime. Content events drop the copy; attribute changes do not. Bytes
-from `R` are covered by the helper itself; bytes from an SCP download are kept
-only when the path's stat was cached (covered) when the transfer started.
+若当前（缓存）stat 与副本的 inode、大小和 mtime 匹配，则复用文件内容。内容事件会丢弃副本；属性事件不会。通过 helper 的 `R` 读取的字节本身由 helper 覆盖；SCP 下载的字节只有在传输开始时该路径 stat 已被缓存（即路径受监控）时才准入缓存。
 
-## Concurrency
+## 并发
 
-WinFsp runs four dispatcher threads. Remote lookups (`GetSecurityByName`,
-`Open`'s stat, `ReadDirectory`, `GetDirInfoByName`, volume capacity) and file
-downloads run without the adapter lock. Callbacks that find a conflicting open
-handle wait up to 500 ms for a Cleanup still queued on another thread before
-reporting a sharing violation.
+WinFsp 运行四个 dispatcher 线程。远端查找（`GetSecurityByName`、`Open` 的 stat、`ReadDirectory`、`GetDirInfoByName`、卷容量）以及文件下载都在适配器锁外执行。如果回调发现冲突的打开句柄，会最多等待 500 ms，让另一个线程队列中的 Cleanup 先完成，然后才报告共享冲突。
 
-## Limits
+## 限制
 
-Notifications give eventual invalidation, not a transaction spanning Windows
-and Linux: a change made by another client becomes visible one round trip
-after it happens. inotify does not see every possible mutation (some mmap
-writes, mount replacement). Reads advance the remote atime like any Linux
-reader. Without Python 3 on the server the mount works uncached, at the cost
-of one shell round trip per lookup.
+通知提供最终失效，不是跨 Windows/Linux 的事务：其他客户端进行的修改会在之后的一个往返中对本地可见。inotify 看不到所有可能的修改（例如部分 mmap 写入、挂载替换）。读取会像其他 Linux 读者一样更新远端 atime。服务器没有 Python 3 时，挂载仍能工作，但无法使用缓存，并且每次查找都需要一次 shell 往返。
 
-`SCPFS_TRACE=1` in the environment logs every helper request and shell command
-with its latency to stderr.
+设置环境变量 `SCPFS_TRACE=1` 后，每条 helper 请求和 shell 命令及其延迟都会写到 stderr。

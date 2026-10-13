@@ -1,31 +1,31 @@
-# SCPFS command files
+# SCPFS 命令文件协议
 
-Status: implemented and verified against the isolated real OpenSSH/Linux, WinFsp and SCM fixtures in Debug and Release, plus Close/Rename submissions on the configured production R: service; see `VALIDATION.md` for exact scope and remaining unknowns.
+状态：已实现，并在隔离的真实 OpenSSH/Linux、WinFsp 和 SCM 夹具中通过 Debug/Release 验证；也已在配置的生产 R: 服务上验证 Close/Rename 提交。准确范围和未解决项见 `VALIDATION.md`。
 
-The user specified an exact command-file protocol: the literal basename `.in.txt` triggers on user Close or Rename, runs commands in the uploaded directory, is removed after processing, and writes its result to `.out.txt` in the same directory. Names are case-sensitive; `.IN.TXT` and `job.in.txt` are ordinary files.
+用户指定了精确命令文件协议：仅当用户 Close 或 Rename 的目标文件名精确为 `.in.txt` 时触发；命令在上传目录执行，处理后删除输入，并将结果写入同目录 `.out.txt`。名称区分大小写；`.IN.TXT` 和 `job.in.txt` 均为普通文件。
 
-## Events and ordering
+## 事件与顺序
 
-Ordinary Flush only commits file data. WinFsp's Cleanup callback is treated as the last user-handle close, so `PostCleanupWhenModifiedOnly=0` ensures clean and read-only handles receive it; Cleanup first commits a regular file whose final basename is `.in.txt`, then submits it. The later Close callback is only a fallback when Cleanup never ran. Renaming a regular file to that exact basename commits and renames before submission. No directory scan, polling, startup execution or traversal of renamed directories occurs. A clean/read-only open of an already existing `.in.txt` also qualifies on Cleanup/Close, as the requested trigger is user close itself.
+普通 Flush 只提交文件数据。WinFsp 的 Cleanup 回调被视为用户最后一次关闭句柄，因此设置 `PostCleanupWhenModifiedOnly=0`，使干净/只读句柄也能收到 Cleanup。Cleanup 会先提交最终 basename 为 `.in.txt` 的普通文件，再提交执行。之后的 Close 仅作为 Cleanup 未执行时的备用触发。将普通文件改名为精确 `.in.txt` 时，先提交文件并完成改名，然后才提交执行。不会扫描目录、轮询、启动时执行，也不会递归遍历改名后的目录。若用户打开已存在的 `.in.txt` 后以只读/干净状态关闭，也会在 Cleanup/Close 时触发，因为用户要求的触发条件就是关闭该文件。
 
-Each handle records whether submission was attempted. Rename consumption suppresses later Cleanup/Close triggers and prevents the consumed handle from reuploading the command file. Failed payload commit never executes commands. Backend processing atomically claims the input by moving it to a cryptographically random sibling before execution, so another event cannot submit the same path at the same time. If the input is already absent when a delayed close arrives, that close is a benign no-op.
+每个句柄记录是否已尝试提交执行。Rename 消费命令后会抑制之后的 Cleanup/Close 触发，并防止已消费句柄重新上传该命令文件。内容提交失败时绝不执行命令。后端会先将输入原子移动到一个带密码学随机名称的同级认领文件，再执行脚本，因此其他事件不能同时提交同一路径。延迟 Close 到来时若输入已经不存在，则视为无害空操作。
 
-Clean metadata-only handles own no payload cache. A metadata Close/Cleanup encountering an active payload owner launches nothing and leaves the trigger to that owner's Close; it does not retry later. Other active/unresolved conflicts are recorded as known-not-launched recovery before dispatch. Explicit Rename checks ownership before even a same-path submission. Namespace changes and input consumption invalidate old clean metadata peers, whose later Cleanup/Close cannot execute a newly created script at the old pathname.
+干净的 metadata-only 句柄不拥有内容缓存。它遇到活动 payload 所有者时不会启动命令，而是将触发留给该所有者的 Close；不会稍后重试。其他活动/未解决冲突会在分派前记录为“未启动”的恢复信息。显式 Rename 即使目标与源是同一路径，也会先检查所有权。命名空间变更或输入消费会使旧的干净 metadata 句柄失效；这些句柄之后的 Cleanup/Close 不能在旧路径上执行新创建的脚本。
 
-## Command and result contract
+## 命令与结果约定
 
-Input is UTF-8 POSIX shell text interpreted by `/bin/sh` from a normalized script file, with LF or CRLF and an optional UTF-8 BOM. It is not a configured executable name or a template interpolated by SCPFS. The remote shell runs with the authenticated SSH account's permissions; its working directory is the command file's parent. Input is limited to 1 MiB; invalid UTF-8, NUL or oversized input produces an explanatory result and is consumed without running commands.
+输入是 UTF-8 POSIX shell 文本，由 `/bin/sh` 从规范化脚本文件解释；允许 LF 或 CRLF，并可带 UTF-8 BOM。输入不是配置的可执行文件名，也不是由 SCPFS 插值的模板。远端 shell 使用经 SSH 认证账户的权限；工作目录为命令文件的父目录。输入上限为 1 MiB；无效 UTF-8、NUL 或超限输入会生成说明性结果并被消费，但不会执行。
 
-Standard output and standard error are combined into a private output spool. Successful output is raw command output, without an added exit-code prefix. Captured output is limited to 8 MiB, with a truncation marker where applicable. Publication atomically replaces the sibling `.out.txt`; symlink/special-file targets are rejected. Completed commands, including nonzero exits and timeout, publish output and remove the claimed input. The exit code is logged separately. The default command timeout is 30 seconds, with a bounded kill grace period; the CLI may override it with `--command-timeout-ms` up to 540000 ms (540 seconds).
+标准输出和标准错误合并写入私有输出 spool。成功输出保持原始命令输出，不附加退出码前缀。捕获输出最多 8 MiB，必要时附加截断标记。发布结果时原子替换同级 `.out.txt`；拒绝符号链接/特殊文件目标。包括非零退出码和超时在内的已完成命令都会发布输出并删除已认领输入。退出码单独记录在日志中。默认命令超时为 30 秒，并设有有界的 kill 宽限期；CLI 可用 `--command-timeout-ms` 覆盖，最大 540000 ms（540 秒）。
 
-The configured filesystem root controls path mapping, not a shell security sandbox. The user intentionally supplied shell commands. Processing `.in.txt` is reserved behavior, not ordinary text-file storage.
+配置的文件系统根目录只控制路径映射，不构成 shell 安全沙箱。用户有意提交了 shell 命令。处理 `.in.txt` 是保留行为，不是普通文本文件存储。
 
-## Failure and recovery
+## 故障与恢复
 
-The backend result distinguishes input consumption, completion, output publication and unknown outcome, and returns the retained claim path when available. Network loss after launch can make the command's outcome unknown. SCPFS does not blindly replay commands; the claim/spool and local recovery information are retained for inspection. Exactly-once execution across remote crashes or network partitions is not claimed.
+后端结果会分别表示输入是否消费、命令是否完成、输出是否发布及结果是否未知；可能时还会返回保留的认领文件路径。命令启动后网络断开，会导致执行结果未知。SCPFS 不会盲目重放命令；认领文件、输出 spool 和本地恢复信息会留待检查。不承诺在远端崩溃或网络分区情况下恰好执行一次。
 
-Close cannot return an NTSTATUS, so processing failures are logged with recovery information. Rename can report setup/protocol failure, but a successfully completed command with a nonzero exit is still a consumed submission, with its output and exit code available. Upload success and command exit status remain separate facts.
+Close 无法返回 NTSTATUS，所以处理失败会连同恢复信息记入日志。Rename 可以报告准备/协议失败；但若命令已完成，即使退出码非零，仍算已消费提交，并可查询输出和退出码。文件上传成功与命令退出状态是两个独立事实。
 
-## Required verification
+## 必需验证
 
-Real SSH/WinFsp tests cover direct Close submission, rename into `.in.txt`, no execution during multiple Flush calls, later Close deduplication, parent working directory, combined output, input removal, atomic result replacement, case-mismatched ordinary files, CRLF/BOM handling, nonzero exit and bounded timeout. Unknown-outcome recovery must remain explicit if not tested. Static EXE imports and public-key-only authentication are independent mandatory gates.
+真实 SSH/WinFsp 测试覆盖直接 Close 提交、改名为 `.in.txt`、多次 Flush 不执行、后续 Close 去重、父目录作为工作目录、输出合并、输入删除、结果原子替换、大小写不匹配的普通文件、CRLF/BOM、非零退出码和有界超时。若未知结果恢复路径未测试，必须明确注明。静态 EXE 导入和仅公钥认证是独立的强制门禁。

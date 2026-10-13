@@ -1,52 +1,54 @@
-# CryptFS store review briefing
+# CryptFS 存储层审查简报
 
-## Objective and scope
+## 目标与范围
 
-Focused source review for the store's high-risk persistence paths: crash recovery, resize atomicity, page ownership, orphan cleanup, rename, and compaction. This is not a full project audit. Production files were read-only in this review; only `tests/test_store.c` and this briefing were in scope for edits.
+本次源码审查聚焦存储层高风险持久化路径：崩溃恢复、调整大小的原子性、页面所有权、孤儿清理、改名和整理。本次不是完整项目审计。审查期间生产源码只读；允许修改的范围仅限 `tests/test_store.c` 和本简报。
 
-## Confirmed implementation facts
+## 已确认的实现事实
 
-- `src/cryptfs_store.c::cf_node_resize` now stages an optional partial-block rewrite, inode size/timestamps/logical usage, and map truncation in one `CF_TX`. The boundary block is encoded before the transaction; its new fragment pages are reserved, then the node/map RAM state is changed to assemble the transaction images. `cf_tx_commit` writes and flushes the journal before the COMMITTED marker, then home pages, final EOF, and EMPTY marker.
-- A precommit failure restores the boundary block pointer, map count/next/head/tail, file size/timestamps, and logical usage. Unregistered boundary pages and block state are wiped and freed. On successful commit, new pages are registered and linked into the owner graph before the old boundary block and trimmed pages are unregistered and freed. A post-COMMITTED I/O failure poisons the store; reopening is required to resolve the durable outcome.
-- Tail-map removal with `keep == 0` snapshots the predecessor and serializes its updated `next == 0` link in the same transaction. Rollback restores the old predecessor link. For sequential block writes, the first map reaches its 125-entry capacity before the next map is created, so the 130-to-125 regression exercises that removal path.
-- Appending a new map page now also includes the prior tail map as a transaction afterimage. Without that link update, the new map and inode size could commit while the predecessor's persisted `next` pointer remained zero; reopen then silently treated the appended blocks as sparse. The 130-block tail-value fixture exposed this and is retained alongside the cross-map truncate tests.
-- `cf_page_unregister_tree` in `src/cryptfs_store.c` uses an iterative owner-return traversal rather than recursive descent. It detaches a child before descending, saves the parent pointer before freeing the current page, and returns using that saved pointer. It requires the registered ownership relation to remain an acyclic single-owner tree.
-- `cf_reclaim_orphans` gathers an orphan subtree before committing its unlink from the orphan list, then unregisters physical pages and frees the associated node/map/block objects. If the transaction fails, the prior orphan link and page owner are restored.
-- `cf_node_rename` in `src/cryptfs_store.c` updates namespace links, parent/name metadata, and any replacement target's orphan link in one transaction. It saves and restores sibling links and node metadata on precommit failure. After commit it refreshes physical child-page owners, updates the in-memory child index and subtree depths, and reclaims an unreferenced replacement target.
-- `src/cryptfs_compact.inc::cf_store_compact_locked` moves at most one page per step. It writes the relocated page and rewritten owner page in one transaction, then updates the in-memory slot map and attempts to punch the old hole. Punch failure records the Win32 error and emits a warning while preserving the committed move; when no internal hole remains, a later step performs a zero-image EOF-trim transaction. Worker execution and public compact-step execution serialize through the store's exclusive SRW lock.
+- `src/cryptfs_store.c::cf_node_resize` 现在会在一个 `CF_TX` 中暂存可选的部分数据块重写、inode 大小/时间戳/逻辑用量，以及映射截断。事务开始前先编码边界数据块并预留新片段页，然后更新节点和映射的内存状态以组成事务镜像。`cf_tx_commit` 先写入并刷新日志，再写入 COMMITTED 标记，随后写入正式数据页、最终 EOF 和 EMPTY 标记。
+- 提交前失败会恢复边界数据块指针、映射数量/next/head/tail、文件大小/时间戳和逻辑用量。未注册的边界页面及数据块状态会清零并释放。提交成功后，先注册新页并将其接入所有者图，再注销并释放旧边界数据块和被截掉的页面。COMMITTED 之后发生 I/O 错误会使存储层进入 poisoned 状态；必须重新打开才能确定持久化结果。
+- `keep == 0` 的尾部映射删除会保存前驱，并在同一事务中序列化其更新后的 `next == 0` 链接。回滚会恢复原前驱链接。顺序写入数据块时，第一个映射达到 125 项后才会创建下一个映射，因此 130 到 125 项的回归测试覆盖了该删除路径。
+- 追加新映射页时，现在会将之前的尾映射页作为事务后像一并提交。如果遗漏该链接更新，新映射和 inode 大小可能已经提交，但前驱页上持久化的 `next` 仍为零；重新打开时，新追加的数据块会被错误地视为稀疏区。130 块尾部数据夹具曾暴露此缺陷，现与跨映射截断测试一并保留。
+- `src/cryptfs_store.c` 中的 `cf_page_unregister_tree` 使用迭代式的所有者回溯遍历，而非递归下降。它先分离子节点再向下遍历，在释放当前页前保存父指针，并通过保存的指针返回。该算法要求已注册的所有权关系始终是无环、单一所有者树。
+- `cf_reclaim_orphans` 会先收集孤儿子树，再提交从孤儿链表中解除链接的事务；随后注销物理页，并释放相关节点、映射和数据块对象。事务失败时会恢复旧孤儿链接和页面所有者。
+- `src/cryptfs_store.c` 中的 `cf_node_rename` 会在一个事务中更新命名空间链接、父节点/名称元数据，以及被替换目标的孤儿链接。提交前失败时会恢复兄弟节点链接和节点元数据。提交后会刷新物理子页所有者，更新内存子项索引及子树深度，并回收已无引用的替换目标。
+- `src/cryptfs_compact.inc::cf_store_compact_locked` 每一步最多搬迁一个页面。它在一个事务中写入搬迁后的页面和更新后的所有者页，然后更新内存槽位映射，并尝试打洞释放旧位置。打洞失败会记录 Win32 错误并警告，但保留已经提交的搬迁；当不再有内部空洞后，后续步骤会通过零数据镜像事务截短 EOF。后台 worker 和公开的单步整理操作都通过存储层独占 SRW 锁串行化。
 
-## Regression added
+## 新增回归测试
 
-`tests/test_store.c` adds a child-process resize crash test for phases 1–5. Each phase starts from a flushed file containing a deterministic full 64 KiB block and shrinks it to 1024 bytes. After the child exits at the selected durable phase, the parent remounts:
+`tests/test_store.c` 增加了子进程调整大小崩溃测试，覆盖阶段 1–5。每个阶段都从一个已刷新的文件开始，该文件含确定性生成的完整 64 KiB 数据块，然后将其缩短到 1024 字节。子进程在指定持久化阶段退出后，父进程重新挂载：
 
-- Phase 1 must recover the old 64 KiB size and original tail bytes.
-- Phases 2–5 must recover size 1024; the test regrows to 64 KiB and checks that the truncated tail is zero while the retained prefix is intact.
+- 阶段 1 必须恢复原来的 64 KiB 大小及尾部数据。
+- 阶段 2–5 必须恢复为 1024 字节；测试随后将文件重新扩展到 64 KiB，确认被截断的尾部为零且保留的前缀未变化。
 
-The test is dispatched with the private `--resize-crash` child mode and creates phase-specific containers under the test executable directory. It does not use `%TEMP%`.
+测试通过私有子进程模式 `--resize-crash` 分派，并在测试可执行文件所在目录创建按阶段区分的容器，不使用 `%TEMP%`。
 
-Additional focused tests now cover: a damaged second raw fragment page with exact `CF_DATA_ERROR`, no-write hash, and pristine sparse-container reopen; postcommit page-registration failure while replacing a block followed by poisoned-store close and remount verification of the committed new byte; injected page-allocation failure during a partial shrink with `CF_NO_SPACE`, unchanged size/data/host-file hash and successful remount; aligned truncate-to-zero and unlink while the allocation-failure hook is armed; and reclaim-hook failure after zero-reference unlink or rename-replace, checking successful namespace results and recovery/reclaim on remount. A map-chain truncate crash test covers phases 1–5 while trimming a 130-block file across its two map pages, then checks recovery, regrowth, and zeroed tail. Host-I/O fault cases exercise precommit journal write/flush failure, commit-marker write failure, committed-marker flush failure, EOF failure, and a short authenticated marker prefix; replacement-block write cases check precommit RAM rollback and old-block recovery. Deferred reclaim tests inject journal and marker failures after durable unlink. Compaction tests inject sparse-punch failure and WAL/marker/home-page/EOF failures in both page-move and zero-image EOF-trim transactions; precommit failures must leave the graph/EOF intact and allow a successful retry. Child-process phase 1–5 tests cover open-file unlink, replacement rename, and compaction page moves. These hooks simulate deterministic failures; the allocation hook is not evidence of actual exhaustion at the four-million-page limit.
+新增的其他专项测试覆盖：第二个原始片段页损坏时返回准确的 `CF_DATA_ERROR`、不写入磁盘且稀疏容器哈希保持不变；替换数据块时注入提交后页面注册失败，再关闭 poisoned 存储并重新挂载验证已提交的新字节；部分缩小时注入页面分配失败，要求返回 `CF_NO_SPACE`、保持大小/数据/宿主文件哈希不变并可重新挂载；分配失败钩子启用期间执行对齐的截断至零和 unlink；以及对零引用 unlink 或替换式 rename 注入回收钩子失败，验证命名空间操作结果正确，并在重新挂载后完成恢复/回收。映射链截断崩溃测试覆盖阶段 1–5，截断跨越两个映射页的 130 块文件，然后验证恢复、重新扩展和零填充尾部。
 
-Earlier regressions in the same test file cover constrained writes at EOF, directory basic-info persistence, partial truncate then regrow, rename replacement/open handles, map-chain tail removal/remount, orphan cleanup, malformed authenticated graphs, and WAL/page tampering no-write behavior.
+宿主 I/O 故障用例覆盖提交前日志写入/刷新失败、提交标记写入失败、已写入提交标记后的刷新失败、EOF 操作失败以及认证标记只写入短前缀。替换数据块写入用例检查提交前内存回滚和旧数据块恢复。延迟回收测试会在 unlink 已持久化后注入日志和标记写入失败。整理测试会在页面搬迁和零数据镜像 EOF 截短事务中，分别注入稀疏打洞失败以及 WAL/标记/正式页/EOF 故障；提交前失败必须保持对象图和 EOF 不变，并允许之后重试成功。子进程阶段 1–5 测试覆盖打开文件被 unlink、替换式 rename 和整理页搬迁。上述钩子模拟确定性故障；分配失败钩子不能证明四百万页上限下实际耗尽内存时的行为。
 
-## Validation evidence and limits
+同一测试文件中较早的回归还覆盖：受限写入到 EOF、目录基本信息持久化、部分截断后重新扩展、替换改名和打开句柄、映射链尾部移除及重新挂载、孤儿清理、认证对象图格式错误，以及 WAL/页面篡改时不写入。
 
-- Validation evidence below comes from the coordinated root runs and the project-local logs/results inspected for this briefing; this reviewer did not independently run builds or tests.
-- Debug: all 7/7 CTest cases passed. `cryptfs_store_test` took 216.22 seconds; total was 216.98 seconds. Root reported completion at 13:44:10.
-- Release: all 7/7 CTest cases passed. `cryptfs_store_test` took 79.51 seconds; total was 80.13 seconds.
-- Strict ASan build used `/MT /Zi /Od /W4 /WX`; it completed with `store tests passed` and no ASan errors. Leak detection was disabled, so this does not establish absence of leaks.
-- The final map append-link fix and its 130-block live-tail reopen check are included in the passing suite. The map-chain truncate/reopen regression covers the 130-to-125 boundary. The five resize crash phases and 15 namespace unlink/rename/compaction crash cases are included and passed. Historical sparse-copy fixture, poisoned lookup expectation, double-close cleanup, and append-link defects are resolved history, not current pending failures.
-- Final Release mount/integration result `build/integration/867f16e5b42a4a64b3842a4bbe40737f/result.json` reports `passed: true`, including multi-map resize, sparse allocation, and wrong-password no-write checks. GUI integration `build/gui-integration/6bed43c8dad645c79cccdc537ce50f0e/result.json` reports `passed: true`; its runtime module inventory was inspected, and the owned-window PrintWindow screenshot was inspected by root, all reported PASS.
-- Final Release executable SHA-256: `35DDD40AAF9893C101456A40DF3392C4B4C8F7255DF6E5D94A31766AC038FA75`.
-- Sol completed the final focused architecture acceptance in `docs/ARCHITECTURE_REVIEW.md`, accepting the v1 milestone within its documented validation boundaries. The Release package is at `dist/cryptfs-x64`; its executable identity, static imports, embedded resources, and all manifest payload hashes/sizes were checked by root.
+## 验证证据与限制
 
-## Unknowns and candidate concerns
+- 以下验证信息来自协调执行的根目录测试及本简报中检查过的项目日志/结果；本审查者没有独立运行构建或测试。
+- Debug：CTest 7/7 全部通过。`cryptfs_store_test` 用时 216.22 秒，总耗时 216.98 秒。根任务记录的完成时间为 13:44:10。
+- Release：CTest 7/7 全部通过。`cryptfs_store_test` 用时 79.51 秒，总耗时 80.13 秒。
+- 严格 ASan 构建使用 `/MT /Zi /Od /W4 /WX`；测试完成并显示 `store tests passed`，未报告 ASan 错误。由于关闭了泄漏检测，这不能证明不存在内存泄漏。
+- 最终映射追加链接修复及 130 块实时尾部重新打开检查已纳入通过的测试套件。映射链截断/重新打开回归覆盖 130 到 125 项边界。5 个调整大小崩溃阶段及 15 个命名空间 unlink/rename/整理崩溃用例均已纳入并通过。历史上的稀疏文件拷贝夹具、poisoned 状态查找预期、重复关闭清理和映射追加链接缺陷均已解决，不属于当前待修失败。
+- 最终 Release 挂载/集成结果 `build/integration/867f16e5b42a4a64b3842a4bbe40737f/result.json` 报告 `passed: true`，包括跨映射调整大小、稀疏分配及错误密码不得写入检查。GUI 集成结果 `build/gui-integration/6bed43c8dad645c79cccdc537ce50f0e/result.json` 也报告 `passed: true`；根任务检查了其运行时模块清单及由本进程拥有的窗口 PrintWindow 截图，均报告通过。
+- 最终 Release 可执行文件 SHA-256：`35DDD40AAF9893C101456A40DF3392C4B4C8F7255DF6E5D94A31766AC038FA75`。
+- Sol 已在 `docs/ARCHITECTURE_REVIEW.md` 中完成最终的专项架构验收，在文档所述验证边界内接受 v1 里程碑。Release 包位于 `dist/cryptfs-x64`；根任务检查了可执行文件身份、静态导入、嵌入资源，以及清单中所有文件的哈希和大小。
 
-- Actual power-loss durability, disk-full behavior, and device/filesystem cache guarantees are not established by process-crash or injected-I/O tests.
-- Behavior at the four-million-page limit (4096 bytes per physical page) and 65,536-node scale remains unverified; the allocation hook does not simulate true exhaustion at that limit.
-- Large-container latency and memory/leak behavior remain unmeasured. ASan leak detection was disabled.
-- The documented v1 format does not detect replay of an old valid whole container or an authenticated old record at the same slot and identifier. Rollback freshness is an accepted product boundary, not a passing security test.
-- Physical sparse-space recovery depends on the filesystem's `FSCTL_SET_ZERO_DATA` behavior; the deterministic punch-failure test confirms logical continuation and later trimming, not physical reclamation on every filesystem.
+## 未知项与候选风险
 
-## Escalation decision and outcome
+- 进程崩溃和注入式 I/O 测试不能证明真实断电持久性、磁盘空间耗尽行为，或设备/文件系统缓存的保证。
+- 四百万物理页上限（每页 4096 字节）和 65,536 节点规模下的行为尚未验证；分配故障钩子没有模拟该上限处的真实耗尽。
+- 大容器延迟及内存/泄漏行为仍未测量。ASan 泄漏检测已关闭。
+- v1 格式无法检测整个有效旧容器被回滚，或相同槽位、相同标识的旧认证记录被重放。新鲜度/回滚检测是明确接受的产品边界，不属于已通过的安全测试。
+- 稀疏空间的物理回收依赖文件系统对 `FSCTL_SET_ZERO_DATA` 的处理。确定性打洞失败测试确认逻辑可以继续并在后续截短文件，但不能证明所有文件系统上都能物理回收空间。
 
-The escalation requested review of three persistence boundaries: (1) the resize transaction's staged RAM mutation, WAL image set, rollback, and postcommit ownership release; (2) iterative owner-return destruction plus orphan/rename rebinding and unique ownership; and (3) one-page compaction transactions, owner-pointer rewrites, hole punching, and later zero-image EOF trimming. The final review accepted the implemented invariants and the completed deterministic fault/crash tests without a new blocker. Its source scope, test evidence and remaining untested operating conditions are recorded in `docs/ARCHITECTURE_REVIEW.md`; acceptance does not establish durability under every real storage failure.
+## 升级审查决定与结果
+
+本次升级审查要求检查三个持久化边界：（1）调整大小事务对内存状态的暂存、WAL 镜像集合、回滚及提交后的所有权释放；（2）迭代式所有者回溯销毁，以及孤儿/改名时的所有权重绑定和唯一所有权；（3）单页整理事务、所有者指针重写、打洞，以及后续零数据镜像 EOF 截短。最终审查接受了实现的不变量和已经完成的确定性故障/崩溃测试，没有提出新的阻断项。源码范围、测试证据和仍未测试的运行环境记录在 `docs/ARCHITECTURE_REVIEW.md`。该验收不代表已验证所有真实存储故障情况下的持久性。

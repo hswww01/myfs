@@ -1,71 +1,72 @@
-# Shared filesystem frontend
+# 共享文件系统前端
 
-Decision date: 2026-10-02. Updated: 2026-10-03. Status: shared frontend, native service lifecycle and production SCP runtime accepted for the tested scope.
+决策日期：2026-10-02。更新日期：2026-10-03。状态：在已测试范围内，共享前端、原生服务生命周期和生产 SCP 运行均已验收。
 
-## Objective and confirmed facts
+## 目标与已确认事实
 
-The user requests a shared frontend including WinFsp file-operation dispatch, with separate memory and SCP storage backends. Both programs must create and immediately start an automatic Windows service through their own `--install` command. They must remain static clang-cl C17 executables with only operating-system DLL dependencies. The existing MemfsC service and M: volume must remain running during integration and tests.
+用户要求建立共享前端，其中包括 WinFsp 文件操作分派，并由内存文件系统和 SCP 文件系统分别提供存储后端。两个程序都必须通过自己的 `--install` 命令创建并立即启动自动启动的 Windows 服务。程序必须使用静态 clang-cl C17 构建，且只依赖操作系统 DLL。集成和测试期间，现有 MemfsC 服务与 M: 卷必须保持运行。
 
-The existing memfs callbacks use stable MemfsNode contexts. SCPFS uses per-open descriptors, `UmFileContextIsUserContext2=1`, and exactly one dispatcher worker to preserve close/open ordering. These are backend contracts and must survive the refactor unchanged. Fake WinFsp objects in memfs state tests use `UserContext` directly. A poisoned SCP SSH session currently produces operation errors without stopping its dispatcher; service health therefore needs an explicit transport-failure signal.
+现有 memfs 回调使用稳定的 MemfsNode 上下文。SCPFS 使用每次打开独立的描述符、`UmFileContextIsUserContext2=1`，并且恰好使用一个 dispatcher worker 来维持 close/open 顺序。这些是后端契约，重构不得改变。memfs 状态测试中的模拟 WinFsp 对象直接使用 `UserContext`。当前 SCP SSH 会话进入 poisoned 状态后，会让操作返回错误，但 dispatcher 不会停止；因此服务健康状态需要显式的传输故障信号。
 
-## Accepted boundary
+## 已接受的边界
 
-Build `fs_frontend` as a static library from this directory into both programs. Its versioned, size-checked C header hosts WinFsp creation, mounting, typed callback forwarding, dispatcher status and shutdown, plus SCM controls, logging, native installation and uninstallation. Product CLI parsing and storage operations remain backend-specific. This is an internal frontend contract; it does not introduce a new storage protocol or reinterpret existing file contexts.
+从本目录构建静态库 `fs_frontend` 并链接到两个产品。前端版本化且带大小校验的 C 头文件负责 WinFsp 创建、挂载、类型化回调转发、dispatcher 状态/关闭，以及 SCM 控制、日志和原生安装/卸载。产品专属 CLI 解析和存储操作仍由各自后端负责。这是内部前端契约，不引入新存储协议，也不重新解释现有文件上下文。
 
-Keep `FSP_FILE_SYSTEM.UserContext` equal to the backend's original context. Find a frontend instance through a registry keyed by the WinFsp object. Forward every supported non-null operation with unchanged arguments; preserve unsupported null callbacks and reject nonzero reserved/unknown slots. Never hold the registry lock during a backend callback. Register before dispatcher startup. Stop and join the dispatcher, delete the WinFsp object, and only then unregister, while the backend context remains alive. `DispatcherStopped` may notify the backend observer before publishing the common result and event.
+`FSP_FILE_SYSTEM.UserContext` 必须继续指向后端原始上下文。通过以 WinFsp 对象为键的注册表查找前端实例。支持的非空操作须使用原参数转发；空回调保持“不支持”，非零保留/未知槽位必须拒绝。不得在调用后端回调期间持有注册表锁。dispatcher 启动前完成注册。停止并 join dispatcher、删除 WinFsp 对象后再注销，同时保证后端上下文仍存活。`DispatcherStopped` 可以先通知后端观察者，再发布共享结果和事件。
 
-Copy volume parameters unchanged. Preserve memfs node semantics, guard strategy, worker configuration and callback return behavior. Preserve SCP descriptor semantics, case sensitivity, one-worker constraint, dirty-cache handling and command-trigger rules. Let a product-provided create-failure resolver choose its existing driver recovery statuses and error mappings. The frontend must never stop or replace a loaded driver supporting another volume.
+卷参数原样复制。保留 memfs 节点语义、guard 策略、worker 配置和回调返回行为；保留 SCP 描述符语义、大小写敏感性、单 worker 限制、脏缓存处理和命令触发规则。由产品提供的创建失败解析器决定现有驱动恢复状态和错误映射。前端不得停止或替换仍为其他卷提供服务的已加载驱动。
 
-## Service behavior
+## 服务行为
 
-The shared service host owns SCM registration, status/checkpoints, stop events, final error reporting and protected logs. Its product callback constructs the backend, mounts and starts it, then reports RUNNING. It waits for stop, dispatcher termination and any backend fatal-event signal before orderly destruction. An unexpected dispatcher or transport termination reports a nonzero service failure. There is no in-process reconnect or automatic replay of uploads, namespace mutations or command submissions.
+共享服务宿主负责 SCM 注册、状态/检查点、停止事件、最终错误报告和受保护日志。产品回调负责构造后端、挂载并启动，然后报告 RUNNING。服务宿主等待停止请求、dispatcher 终止以及后端致命事件信号后，再有序销毁对象。dispatcher 或传输意外终止时必须报告非零服务故障。本进程内不自动重连，也不会自动重放上传、命名空间变更或命令提交。
 
-Installation uses the absolute current executable and correctly quoted exact arguments. Create a LocalSystem automatic service, configure delayed automatic startup and bounded SCM recovery, then start it. Existing services are accepted only when the executable, complete arguments, account, automatic-start type and recovery policy match; a different configuration is rejected without stopping or rewriting it. Uninstall verifies the named service is an own-process service registered to the currently executing binary, stops it within a bounded wait, then deletes that registration. It does not remove drivers, cache/recovery data, SSH credentials or another product's service. A moved installation must be uninstalled using its registered executable path.
+安装时使用当前可执行文件的绝对路径及正确引用的完整参数。创建 LocalSystem 自动启动服务，设置延迟自动启动和有界 SCM 恢复动作，然后启动服务。只有当可执行文件、全部参数、账户、启动类型和恢复策略均匹配时，才接受已有服务；配置不同时拒绝操作，不停止或重写服务。卸载前验证指定服务是由当前程序注册的 own-process 服务，在有界等待内停止后再删除注册项。不得删除驱动、缓存/恢复数据、SSH 凭据或其他产品服务。程序移动后必须使用其已注册的可执行文件路径卸载。
 
-Each product resolves an absolute default log path for `--service` as well as `--install`, so existing manual service command lines without `--log-file` remain supported. The shared host requires a protected log and also appends backend stdout/stderr diagnostics there.
+每个产品在 `--service` 和 `--install` 下都会解析绝对默认日志路径，使不带 `--log-file` 的现有手动服务命令仍可使用。共享宿主要求日志路径受保护，并把后端 stdout/stderr 诊断追加到该日志。
 
-## Native configuration window
+## 原生配置窗口
 
-The shared static library also exposes the internal, versioned `fs_frontend_gui.h` API. A product provides its localized field schema and a callback that maps a selected action and a snapshot of field values to existing CLI argument tokens. The common window owns native controls, file and directory pickers, child-process creation, stdout/stderr capture, and action status. Product CLI parsing remains authoritative; the GUI adds no storage or transport behavior.
+共享静态库还提供内部版本化 API `fs_frontend_gui.h`。产品提供本地化字段定义，以及一个回调：将用户选定操作和字段值快照转换成现有 CLI 参数 token。公共窗口拥有原生控件、文件/目录选择器、子进程创建、stdout/stderr 捕获和操作状态。产品 CLI 解析仍是最终依据；GUI 不增加存储或传输逻辑。
 
-An empty command line opens the window, and `--gui` is the explicit route used by the elevation handoff. Service actions requested from a non-elevated window start the same executable with the Windows runas verb, `--gui`, the selected action, and the current form values. The elevated process restores those values into the same schema before running the action. No action starts automatically on ordinary startup, and the GUI never writes field values to persistent configuration. The internal action handoff is issued only in response to a confirmed service button click.
+无参数启动时打开窗口，提权交接时则显式使用 `--gui`。非提权窗口中的服务操作会使用 Windows `runas` 动词启动同一可执行文件，并传入 `--gui`、所选操作和当前表单值。提权后的进程会按照同一字段定义恢复这些值，再执行操作。普通启动不自动执行任何操作，GUI 不会把字段写入持久化配置。只有用户确认点击服务按钮后，才会发出内部操作交接。
 
-Each temporary mount is a hidden child process with captured stdout/stderr and a unique per-session `Local\FSF-GUI-{GUID}` stop event. Stop, Unmount, and closing a busy window signal that event and wait for the child to finish normal cleanup; the UI never forcibly terminates a child. The unmount button is disabled unless this window owns a running mount. A timer reads bounded output chunks and checks process completion without blocking the window. Action timeouts update status but do not abandon or terminate a still-running child. The mounted status appears only after the child emits its successful mount banner. Unmount and service removal use native confirmations with the default button set to No; products may provide a data-loss warning for their temporary volume.
+每个临时挂载都是隐藏子进程，捕获其 stdout/stderr，并拥有唯一的每会话停止事件 `Local\\FSF-GUI-{GUID}`。点击 Stop/Unmount 或关闭仍在忙碌的窗口时，会发出该事件并等待子进程完成正常清理；UI 不会强制终止子进程。只有当前窗口拥有运行中的挂载时才启用卸载按钮。定时器以有界块读取输出并检查子进程完成状态，不阻塞窗口。操作超时只更新状态，不会放弃或终止仍在运行的子进程。只有子进程输出挂载成功提示后，界面才显示已挂载。卸载和删除服务使用原生确认框，默认按钮设为 No；产品可为临时卷提供数据丢失警告。
 
-For stable UI automation, child controls use IDs 1000+i (field inputs), 2000+i (action buttons), 3000+i (browse buttons), 4000 (fallback Stop), 5000 (status), and 5001 (captured output), where i follows schema/action order. The reusable argv builder exposes append, indexed-read, and Windows command-line construction helpers so product tests can verify difficult quoting cases without duplicating the implementation.
+为稳定 UI 自动化，子控件 ID 如下：字段输入框 `1000+i`，操作按钮 `2000+i`，浏览按钮 `3000+i`，备用 Stop 为 `4000`，状态为 `5000`，捕获输出为 `5001`；`i` 按字段/操作定义顺序递增。通用 argv builder 提供追加、按索引读取和构建 Windows 命令行的辅助函数，以便产品测试复杂引用而不重复实现。
 
-GUI acceptance is bounded to native no-argument launch and field validation, actual temporary mounts on unique free drives with graceful child shutdown, action-builder/Windows-argv round-trip tests, Debug and Release suites, static import/module gates, and visual review at supported DPI and window sizes. Existing M: and R: services are not test targets.
+GUI 验收范围包括：无参数原生启动和字段校验、在唯一空闲盘符上实际挂载并由子进程正常关闭、操作构造器/Windows argv 往返测试、Debug 和 Release 测试、静态导入/模块检查，以及支持 DPI 和窗口尺寸下的视觉检查。已有 M: 和 R: 服务不是测试目标。
 
-Memfs native installation rejects `--key-hex` and `--key-env`: a plaintext encryption key must not be persisted in SCM ImagePath, and the installing user's environment is not the LocalSystem environment. Existing encrypted console/manual-service modes remain supported. Protected service credential storage is outside this change.
+memfs 原生安装会拒绝 `--key-hex` 和 `--key-env`：加密密钥明文不得持久化在 SCM ImagePath 中，且安装用户的环境变量不是 LocalSystem 的环境变量。现有加密控制台/手动服务模式继续支持。受保护的服务凭据存储不在本次改动范围内。
 
-SCP production configuration is `root@cn.tqdream.com`, remote `/`, global R:, and command timeout 60000 ms. Resolve the installing user's default identity and known_hosts to explicit absolute paths before installation because LocalSystem has a different home directory. `--install` accepts an omitted identity; the internal `--service` entry requires the captured absolute identity. Preserve host-key verification and public-key-only authentication. Grant mounted-file and log access to SYSTEM and the installing user's validated SID; never grant Everyone access to the authenticated root account. No private-key contents are printed or copied into the service command line.
+SCP 生产配置为 `root@cn.tqdream.com`、远端 `/`、全局盘符 R:、命令超时 60000 ms。由于 LocalSystem 使用不同的用户目录，安装前应将安装用户的默认身份文件和 known_hosts 解析为绝对路径。`--install` 允许省略 identity；内部 `--service` 入口要求使用已捕获的绝对 identity。保留主机密钥验证和仅公钥认证。挂载文件和日志访问权限只授予 SYSTEM 及经校验的安装用户 SID；绝不能把经过认证的 root 账户的挂载权限授予 Everyone。不得打印私钥内容，也不得将其复制到服务命令行。
 
-On the first poisoned SCP session, set a manual-reset failure event and expose its read-only NTSTATUS. A fresh SCM-started process creates a new backend; retained caches are recovery artifacts and are not replayed automatically. Boot ordering is handled by delayed startup and SCM failure actions, not by mutation retries.
+首次 SCP 会话进入 poisoned 状态时，设置手动复位故障事件并暴露只读 NTSTATUS。由 SCM 启动的新进程会创建新后端；保留的缓存只是恢复材料，不会自动重放。启动顺序通过延迟启动和 SCM 恢复动作处理，而不是重试文件修改。
 
-## Alternatives and limits
+## 替代方案与限制
 
-A service-only shared wrapper was rejected by the user's explicit request to share WinFsp operations too. A new universal node/storage abstraction would change working backend ownership and conflict behavior, so this implementation forwards the existing typed WinFsp operations instead. No runtime DLL, driver service rewrite, authentication fallback or remote helper installation is introduced.
+用户明确要求共享 WinFsp 操作，因此拒绝只共享服务包装层的方案。新增通用节点/存储抽象会改变现有后端所有权和冲突行为，所以本实现直接转发现有的类型化 WinFsp 操作。不引入运行时 DLL，不重写驱动服务，不添加认证回退，也不在远端安装 helper。
 
-Acceptance requires both Debug and Release builds and tests, actual isolated WinFsp mounts for each backend, isolated native SCM install/start/stop/uninstall checks, static import/module checks, and actual production SCP native installation plus read-only root access. Test services use unique names and free drive letters. A configured automatic startup type is evidence of configuration, not evidence of a reboot. A focused frontend review is not a full project audit.
+验收需要 Debug/Release 构建和测试、两个后端各自的隔离 WinFsp 实际挂载、隔离的原生 SCM 安装/启动/停止/卸载检查、静态导入/模块检查，以及实际生产 SCP 原生安装加只读根目录访问。测试服务使用唯一名称和空闲盘符。服务启动类型设为自动只证明配置已写入，不代表已经重启验证。专项前端审查不等于完整项目审计。
 
-## Ownership
+## 分工记录
 
-- Design worker: shared header and frontend implementation, narrow SCP backend health signal.
-- SCP worker: SCP adapter, CLI, CMake, service fixture, documentation and package.
-- memfs worker: memfs adapter, CLI, CMake, isolated service tests, documentation and package.
-- Coordinator: architecture decision, integration review, production installation, evidence and limits.
+- 设计任务：共享头文件和前端实现、SCP 后端最小健康信号。
+- SCP 任务：SCP 适配器、CLI、CMake、服务夹具、文档和安装包。
+- memfs 任务：memfs 适配器、CLI、CMake、隔离服务测试、文档和安装包。
+- 协调任务：架构决策、集成审查、生产部署、证据和限制。
 
-The decision follows the compact Luna briefing covering callback ownership, registry lifetime, volume context modes, service status, ACLs and backend poisoning. The separate reviewer slot was unavailable; the coordinator records and enforces this bounded decision, with independent cross-worker review and runtime validation still required.
+本决策依据精简的 Luna 简报，内容涵盖回调所有权、注册表生命周期、卷上下文模式、服务状态、ACL 和后端 poisoned 行为。由于当时无独立审查席位，由协调者记录并落实该限定决策；仍需跨任务独立审查和运行时验证。
 
-## Integration evidence and final DNS boundary
+## 集成证据与最终 DNS 边界
 
-The shared library forwards all 31 operations supported by the reused WinFsp interface. Both product adapters retain their original backend context and file-context modes. Focused independent review and real native SCM fixtures cover actual stdout/stderr logging, identical-install idempotence, mismatched-install rejection, bounded stop/uninstall and preservation of the loaded driver. Memfs Debug and Release each passed 23/23 tests at the earlier backend milestone. SCP final Debug and Release each pass 8/8 with no skips, including the no-argument GUI fixture.
+共享库转发复用的 WinFsp 接口所支持的全部 31 项操作。两个产品适配器都保留原有后端上下文和文件上下文模式。专项独立审查和真实原生 SCM 夹具覆盖实际 stdout/stderr 日志、相同安装的幂等性、不同配置安装的拒绝、有界停止/卸载，以及保留已加载驱动。较早后端里程碑中 memfs Debug 和 Release 各通过 23/23 项测试。SCP 最终 Debug 和 Release 各通过 8/8 项且无跳过，包含无参数 GUI 夹具。
 
-Historical production SCP backend/service acceptance used executable SHA-256 `F20505BE1A4250CD7F43B909FCEA271F6D07232C39CAA3A29AE309F90B385698`; that image remains mapped by the still-running `Scpfs` service, PID 82124. Its original strict SSH/SCP probe and native install/start passed without an explicit identity, and R: remained visible to the installing user. A unique temporary remote directory passed case-sensitive create/read/rename/delete, explicit time update followed by immediate delete, ordinary `.IN.TXT`, and both Close- and Rename-triggered `.in.txt` execution with correct cwd and `.out.txt`; the test files and directory were removed. Separately, the published GUI-enabled SCP executable is SHA-256 `9C2E82DC052228E511C1C17EE44C0311E910A164C194B1BEF2FA8013B741EE2C` (5,355,008 bytes); its final Debug and Release suites each passed 8/8, including actual GUI probe output capture and temporary mount start/graceful-stop. This GUI build was not installed into or restarted as the production service. The existing MemfsC/M: process, PID 68440, was preserved.
+历史 SCP 后端/服务验收使用的可执行文件 SHA-256 为 `F20505BE1A4250CD7F43B909FCEA271F6D07232C39CAA3A29AE309F90B385698`；该文件当时仍由运行中的 `Scpfs` 服务（PID 82124）映射。其严格 SSH/SCP 探测和原生安装/启动在未显式指定 identity 时通过，安装用户可见 R:。唯一远端临时目录通过了区分大小写的创建/读取/改名/删除、显式时间更新后立即删除、普通 `.IN.TXT` 文件，以及在 Close 和 Rename 时触发 `.in.txt` 命令（cwd 与 `.out.txt` 均正确）；测试文件和目录已清理。
 
-The production hostname path exposed an additional dependency: Winsock `getaddrinfo` loads a registered Bonjour namespace-provider DLL on this machine. Direct and delay PE imports and an IP-only module fixture had not detected that runtime load. Replace only hostname resolution with built-in Windows DNSAPI A/AAAA queries and numeric IPv4/IPv6 parsing. Preserve the original SSH hostname for strict host-key checks, use the Windows DNS client/cache/hosts behavior, share a finite deadline with TCP connect, and retain asynchronous query storage until completion even after cancellation. No namespace-provider registry or system installation is changed. The module regression must connect using a hostname, and the final production process must also be inventoried.
+另一个已发布的 GUI 版 SCP 可执行文件 SHA-256 为 `9C2E82DC052228E511C1C17EE44C0311E910A164C194B1BEF2FA8013B741EE2C`（5,355,008 字节）；其最终 Debug/Release 套件各通过 8/8 项，包括真实 GUI 探测输出捕获、临时挂载启动和正常停止。该 GUI 版本未安装到生产服务，也未重启生产服务。现有 MemfsC/M: 进程（PID 68440）保持不变。
 
-The corrected hostname fixture and final production process contain the tested EXE plus Windows DLLs only. The production inventory contains 35 modules, with no Bonjour, WinFsp, libssh2, OpenSSL, zlib or dynamic MSVC runtime DLL. Windows DNSAPI/IP Helper are explicit OS imports. Query lifetime/cancellation and the narrow metadata-only/stale-context ownership change received independent read-only review; exact timestamp and held-metadata rename/recreate regressions are included in the real mount suite. `D:\work\fs\scp\docs\PRODUCTION-SERVICE-ACCEPTANCE.json` and `PRODUCTION-MOUNT-ACCEPTANCE.json` record current hash, SCM/runtime/ACL and filesystem evidence.
+生产主机名解析路径暴露出额外依赖：Winsock `getaddrinfo` 会加载系统注册的 Bonjour namespace provider DLL。即使 PE 的直接导入/延迟导入只包含系统 DLL，且 IP 地址测试夹具也未发现此问题，实际 hostname 路径仍会加载 `mdnsNSP.dll`。因此只替换主机名解析路径，改用 Windows 自带 DNSAPI 的 A/AAAA 查询，并直接解析数字 IPv4/IPv6。严格主机密钥校验仍使用原始配置主机名；使用 Windows DNS 客户端/缓存/hosts 行为；DNS/TCP 共用有限截止时间；即使取消查询，也保留其异步存储直到完成。不修改系统 provider 注册表或安装。模块回归测试必须通过 hostname 连接，最终生产进程也必须重新盘点模块。
 
-The protected service log redirects actual CRT stdout/stderr descriptors after the SCM handshake. It first establishes valid CRT streams on NUL, then duplicates the protected append handle; it checks each initialization and emits verified stdout/stderr markers. Starting `--service` interactively still reports errors to the console. Automatic-start configuration and SCM recovery are validated; no reboot was performed.
+修正后的 hostname 夹具和最终生产进程仅加载测试 EXE 与 Windows DLL。生产模块清单共 35 个模块，不含 Bonjour、WinFsp、libssh2、OpenSSL、zlib 或动态 MSVC 运行库 DLL。Windows DNSAPI/IP Helper 是显式系统导入。查询生命周期/取消和 metadata-only/stale-context 所有权的最小改动经过独立只读审查；时间戳精度及持有 metadata 句柄时 rename/recreate 回归已纳入实际挂载测试。`D:\work\fs\scp\docs\PRODUCTION-SERVICE-ACCEPTANCE.json` 和 `PRODUCTION-MOUNT-ACCEPTANCE.json` 记录当时的哈希、SCM/运行时/ACL 和文件系统证据。
 
+受保护服务日志会在 SCM 握手完成后重定向实际 CRT stdout/stderr 描述符。先在 NUL 上建立有效 CRT 流，再复制受保护的追加句柄；逐项检查初始化结果，并输出已验证的 stdout/stderr 标记。交互式启动 `--service` 时仍向控制台报告错误。自动启动配置和 SCM 恢复动作已经验证，但没有执行重启验证。

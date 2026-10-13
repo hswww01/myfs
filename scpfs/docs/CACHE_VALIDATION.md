@@ -1,20 +1,20 @@
-# Session cache and server notifications: release acceptance
+# 会话缓存与服务器通知：发布验收记录
 
-Date: 2026-10-03 (Asia/Shanghai). **Historical milestone:** this records the earlier `439A...` notification-cache release. The later root `/` cache regression and final `CDA91...` Release with the running R: service are recorded in [CACHE_ACCESS_FIX.md](CACHE_ACCESS_FIX.md). Hashes and service state below belong to this historical milestone. Accepted for the focused source, actual mount, GUI, SCM fixture and production-host temporary-mount scope below. This is not a whole-filesystem conformance or security audit.
+日期：2026-10-03（Asia/Shanghai）。**历史里程碑：**本文记录较早的 `439A...` 通知缓存版本。后续根目录 `/` 缓存回归及运行 R: 服务的最终 `CDA91...` Release 版本见 [CACHE_ACCESS_FIX.md](CACHE_ACCESS_FIX.md)。本文哈希和服务状态属于该历史里程碑。验收仅针对下文所列源码、实际挂载、GUI、SCM 夹具和生产主机临时挂载范围，不是完整 Windows 文件系统一致性或安全审计。
 
-## Current deliverable
+## 当前交付
 
-- Source: `D:\work\fs\scp`.
-- Published executable: `D:\work\fs\scp\dist\scpfs-x64\scpfs.exe`.
-- Release SHA-256: `439A0166B873E14C9A3B6E7AFA9C27DD4918ACC620B8E1A5397E66608FD0ABCD`.
-- Size: 5,388,288 bytes; Windows x64; clang-cl/C17; static CRT, WinFsp, libssh2, OpenSSL and zlib through the existing vcpkg configuration.
-- The previous GUI-only binary is preserved as `scpfs-before-cache-20261003.exe` with SHA-256 `9C2E82DC052228E511C1C17EE44C0311E910A164C194B1BEF2FA8013B741EE2C`. The older `scpfs-before-gui-20261003.exe` remains preserved as well.
-- Command line, GUI and service default: `--cache-max-mib 0`, meaning no payload capacity limit. Caching remains enabled. Positive values 1..16384 MiB apply payload LRU capacity enforcement. The metadata memory/index bound remains 8 MiB / 4096 entries.
-- Cache lifetime is the mount session, with no TTL. The Linux inotify helper is embedded in the EXE and started through a separately authenticated, strictly pinned SSH connection. No remote daemon installation or extra listening port is required; Python 3 is required for monitoring. Unsupported or unavailable monitoring bypasses cache reuse.
+- 源码：`D:\work\fs\scp`。
+- 发布可执行文件：`D:\work\fs\scp\dist\scpfs-x64\scpfs.exe`。
+- Release 版本 SHA-256：`439A0166B873E14C9A3B6E7AFA9C27DD4918ACC620B8E1A5397E66608FD0ABCD`。
+- 文件大小：5,388,288 字节；Windows x64；clang-cl/C17；通过现有 vcpkg 配置静态链接 CRT、WinFsp、libssh2、OpenSSL 和 zlib。
+- 先前 GUI 版本备份为 `scpfs-before-cache-20261003.exe`，SHA-256 为 `9C2E82DC052228E511C1C17EE44C0311E910A164C194B1BEF2FA8013B741EE2C`。更早的 `scpfs-before-gui-20261003.exe` 也仍保留。
+- 命令行、GUI 和服务默认使用 `--cache-max-mib 0`，即不限制负载容量；缓存始终启用。正值 1..16384 MiB 用于限制负载 LRU 容量。元数据内存/索引上限仍为 8 MiB / 4096 项。
+- 缓存生命周期为单次挂载，不设 TTL。Linux inotify helper 内嵌在 EXE 中，并通过单独认证且严格固定主机密钥的 SSH 连接启动。无需在远端安装 daemon 或开放额外监听端口；监控需要 Python 3。监控不支持或不可用时会绕过缓存复用。
 
-## Final build and test evidence
+## 最终构建与测试证据
 
-Both presets use clang-cl and `D:\vcpkg`, triplet `x64-windows-static`. Final commands:
+Debug 和 Release 都使用 clang-cl 与 `D:\vcpkg`，triplet 为 `x64-windows-static`。最终执行命令：
 
 ```powershell
 cmake --build --preset x64-debug
@@ -23,38 +23,38 @@ cmake --build --preset x64-release
 ctest --preset x64-release --output-on-failure
 ```
 
-- Debug: **12/12 passed**, zero skips, 46.41 seconds.
-- Release: **12/12 passed**, zero skips, 45.51 seconds.
-- Original evidence: each build directory's `Testing/Temporary/LastTest.log`; copied release records accompany this document.
+- Debug：**12/12 通过**，零跳过，用时 46.41 秒。
+- Release：**12/12 通过**，零跳过，用时 45.51 秒。
+- 原始证据位于各构建目录的 `Testing/Temporary/LastTest.log`；本历史记录附有 Release 日志副本。
 
-The suites cover CLI defaults/bounds/rejection, exact-case cache keys, stat/list copy isolation, zero/unlimited and positive capacity behavior, provenance validation and epochs, LRU/handle stability, embedded helper bootstrap/protocol/barriers, external writes and metadata changes, rename/delete/hardlinks, old-inode-surviving replacement, unsupported paths, malformed protocol and overflow handling. Actual WinFsp fixtures verify zero/unlimited caching, warm stat/list/payload hits, helper termination/reconnection, external change visibility, CRUD, case sensitivity, timestamps, dirty conflict/recovery and the existing `.in.txt` protocol.
+测试套件覆盖 CLI 默认值/边界/非法值拒绝、缓存键大小写精确比较、stat/list 副本隔离、零值/不限容量和正值容量、来源校验与 epoch、LRU/句柄稳定性、helper 启动/协议/barrier、外部写入和元数据变化、改名/删除/硬链接、旧 inode 存活的替换操作、不支持路径、错误协议帧与溢出处理。真实 WinFsp 夹具验证零值/不限容量缓存、热 stat/list/负载命中、helper 终止/重连、外部变化可见性、CRUD、大小写敏感、时间戳、脏缓存冲突/恢复以及现有 `.in.txt` 协议。
 
-GUI tests verify idle no-argument startup, probe output, forwarded nondefault capacity, actual mount/unmount and zero child exit. The UI was also visually checked with the new default `0` and the label `0=不限`; controls were visible without clipping. SCM tests use unique fixture services, preserve unrelated services and verify nondefault capacity in the registered command line, automatic startup configuration, protected logs, recovery and uninstall.
+GUI 测试验证无参数空闲启动、探测输出、转发非默认容量、真实挂载/卸载和子进程退出码为零。还对默认值 `0` 和标签 `0=不限` 进行了视觉检查，控件可见且未裁切。SCM 测试使用唯一测试服务，保留无关服务，并检查非默认容量进入注册命令行、自动启动配置、受保护日志、恢复策略和卸载行为。
 
-PE tests cover normal and delay imports. GUI, hostname-based mount and the real production-host temporary process inventories contain only the executable and Windows system/WinSxS modules. No third-party DLL is shipped. The signed embedded WinFsp driver provenance remains unchanged.
+PE 测试检查普通和延迟导入。GUI、基于主机名的挂载以及生产主机临时进程模块清单中，仅有程序本身及 Windows 系统/WinSxS 模块；安装包不含第三方 DLL。嵌入签名 WinFsp 驱动的来源验证保持不变。
 
-## Production-host temporary mount
+## 生产主机临时挂载
 
-The final executable above was tested against `root@cn.tqdream.com`, remote root `/`, on the unused temporary drive **V:**. Authentication reused the existing Ed25519 key and strict known-host pin. The capacity option was omitted to prove the new default zero/unlimited. The test supplied its own temporary directory on D: without changing the user's environment or M: contents.
+上文最终可执行文件连接 `root@cn.tqdream.com`、远端根目录 `/`，并挂载到空闲临时盘符 **V:**。认证复用现有 Ed25519 密钥和严格主机密钥固定。省略容量选项以验证新的默认零值/不限容量。测试使用 D: 上自行创建的临时目录，不修改用户环境或 M: 内容。
 
-For a 65,543-byte file in a unique owned directory under `/tmp`, the six observed reads took **390.50, 353.61, 588.51, 185.97, 1.23 and 0.82 ms**. The early reads include monitor startup, admission and metadata validation; the final two illustrate steady cache reuse. These are individual observations, not a throughput or latency guarantee. Teardown recorded 3 payload hits, 2 recorded payload misses, 14 stat hits, 7 invalidations and 28 monitor-bypass observations; bypass operations are accounted separately from normal cache misses.
+对远端 `/tmp` 下唯一测试目录中的 65,543 字节文件，六次读取分别耗时 **390.50、353.61、588.51、185.97、1.23 和 0.82 ms**。前几次包含监控启动、缓存准入和元数据验证；最后两次体现稳定缓存命中。这些是单次测量，不是吞吐量或延迟承诺。停止时记录 3 次负载命中、2 次负载未命中、14 次 stat 命中、7 次失效和 28 次监控绕过；绕过操作与常规缓存未命中分开统计。
 
-An independent SSH write became visible to the mounted client in **644.47 ms** in this run. External rename also became visible. The temporary process's runtime module check passed, it stopped normally, V: was released, and the test removed exactly its owned files and directory. Machine-readable evidence: `PRODUCTION-CACHE-ACCEPTANCE.json`; module paths: `RUNTIME-MODULES-CACHE-PRODUCTION.json`.
+本次运行中，独立 SSH 写入在 **644.47 ms** 后对挂载客户端可见；外部改名也变得可见。临时进程的运行模块检查通过，正常停止并释放 V:，测试只清理自己拥有的文件和目录。机器可读证据：`PRODUCTION-CACHE-ACCEPTANCE.json`；模块路径清单：`RUNTIME-MODULES-CACHE-PRODUCTION.json`。
 
-The existing **Scpfs** service was observed stopped normally by SCM at `2026-10-03T00:48:32Z`, with exit code zero, during development. This cache task did not issue that stop and preserved the stopped state. Its existing delayed automatic LocalSystem/R:/remote-root-`/` configuration and 60000-ms command timeout remain in place; next service start loads the updated canonical EXE. No production-service restart or reboot is claimed by this acceptance.
+开发期间，SCM 曾记录现有 **Scpfs** 服务于 `2026-10-03T00:48:32Z` 正常停止，退出码为零。此次缓存任务没有发起该停止操作，并保留其停止状态。原有延迟自动启动的 LocalSystem/R:/远端根目录 `/` 配置和 60000 ms 命令超时仍保持不变；下次启动服务时会加载更新后的正式 EXE。本验收不声称重启了生产服务或执行过系统重启。
 
-**MemfsC** remained running at PID 68440 throughout the final checks. The memfs release hash remains `3A3F1A5ACE667AA17F70331BD4B1253D37895CDFC3BB5240CF778269A0AD9488`; `memfs_old.exe` remains `4B9110ABE89D1DC05E3AE57DFE53F0E166D4093099F7B5C12154AD2FA242E09B`. This task made no memfs or shared-frontend source changes and did not restart M:.
+最终检查期间 **MemfsC** 一直以 PID 68440 运行。memfs 发布哈希仍为 `3A3F1A5ACE667AA17F70331BD4B1253D37895CDFC3BB5240CF778269A0AD9488`；`memfs_old.exe` 仍为 `4B9110ABE89D1DC05E3AE57DFE53F0E166D4093099F7B5C12154AD2FA242E09B`。本任务未修改 memfs 或共享前端源码，也没有重启 M:。
 
-## Corrections and review boundary
+## 修复内容与审查边界
 
-Actual tests exposed GNU stat's `regular empty file` classification and GNU touch's writable-close notification. Empty regular files now use the normal file path; timestamp restoration uses `touch -c`, with file-only ACCESS metadata notifications and post-restore provenance checks. Copying reusable payloads occurs before opening the restrictive writable working handle.
+实际测试发现 GNU stat 会将空普通文件分类为 `regular empty file`，GNU touch 会产生 writable-close 通知。现在空普通文件走常规文件路径；时间戳恢复使用 `touch -c`，同时采用仅文件访问事件元数据通知和恢复后的来源校验。打开权限受限的可写工作句柄前，会先复制可复用负载。
 
-Focused Sol architecture reviews accepted pre-ensure/content-generation checks, post-fetch barriers, stale-ACK rejection, identity revalidation, canonical-root pinning, borrowed-path lifetime ordering, cache/monitor locking, zero/unlimited capacity and the timestamp-notification refinements. Review decisions and limits are recorded in `CACHE_ARCHITECTURE.md`.
+Sol 的专项架构审查接受了 ensure 前检查/内容 generation 校验、取回后的 barrier、陈旧 ACK 拒绝、身份重验、规范根目录固定、借用路径生命周期顺序、缓存/监控锁、零值/不限容量和时间戳通知修正。审查决定和限制记录于 `CACHE_ARCHITECTURE.md`。
 
-An intermediate GUI test closed the window before its mount child had finished teardown; it now waits for explicit child completion and checks zero exit. An intermediate Release cache run captured empty stderr while using a parent temporary log file on the volatile M: filesystem; an immediate rerun passed, so its original cause was not proved. Test logs are now explicitly on D:, and the cache summary uses the same wide-stream output convention as existing diagnostics. The final full runs above passed after these corrections.
+一个中间 GUI 测试在挂载子进程完成卸载前就关闭窗口；现已等待明确的子进程完成信号并检查退出码为零。一次中间 Release 缓存运行使用了 M: 易失盘上的父临时日志文件，捕获到空 stderr；立即重跑通过，因此最初原因未能证明。测试日志现在明确放在 D:，缓存摘要使用与现有诊断一致的宽字符输出方式。上述最终全套测试均在这些修正后通过。
 
-## Remaining limits
+## 剩余限制
 
-Notifications provide eventual invalidation, not a distributed transaction. Existing open handles retain their snapshots; mutation preflight/conflict checks remain fresh backend operations. Directory/content invalidation is conservative and may clear unrelated clean entries. Monitoring is limited to supported local Linux filesystems and supported non-symlink/same-device paths; inotify does not cover every mmap or mount-replacement case. Metadata bounds can still evict clean entries even when the payload byte limit is unlimited.
+通知提供最终失效，不构成分布式事务。已打开句柄保留自己的快照；修改前检查/冲突检查仍会重新查询后端。目录/内容失效采取保守策略，可能清除无关的干净缓存。监控仅支持本地 Linux 文件系统和受支持的非符号链接/同设备路径；inotify 不覆盖所有 mmap 修改或挂载替换情形。即使负载字节上限不限，元数据上限仍可能淘汰干净条目。
 
-No arbitrary multi-client concurrent-editing guarantee, exhaustive Windows filesystem conformance, large-file throughput benchmark, real reboot or fresh-machine driver installation was tested. No commit or push was performed. The SCP project has no Git repository; the pre-change source snapshot remains under `build/cache-baseline-20261003-075652`.
+本次没有测试任意多客户端并发编辑保证、完整 Windows 文件系统兼容性、大文件吞吐量基准、真实系统重启或新机器驱动安装。本任务未提交或推送。SCP 子目录当时没有独立 Git 仓库；修改前源码快照保存在 `build/cache-baseline-20261003-075652`。

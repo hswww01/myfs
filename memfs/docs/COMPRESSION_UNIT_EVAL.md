@@ -1,45 +1,37 @@
-# Compression Unit Evaluation
+# 压缩单元评估
 
-Date: 2026-09-30
+日期：2026-09-30。
 
-## Goal
+## 目标
 
-Evaluate whether memfs should decouple its 4 KiB logical sparse-page granularity
-from a larger compression unit. This is an experiment only; it does not change
-the on-disk/in-memory storage format.
+评估 memfs 是否应将 4 KiB 逻辑稀疏页粒度与更大的压缩单元解耦。本实验不修改磁盘或内存存储格式。
 
-The benchmark keeps the logical write size at 4 KiB and compares Zstd level 1
-compression units of 4 KiB, 16 KiB, and 64 KiB.
+基准保持逻辑写入大小为 4 KiB，比较 Zstd 等级 1 的 4 KiB、16 KiB 和 64 KiB 压缩单元。
 
-## Benchmark
+## 基准
 
-Target:
+目标：
 
 ```powershell
 cmake --build --preset x64-release --target memfs_compression_unit_bench
 .\build\x64-release\memfs_compression_unit_bench.exe
 ```
 
-Dataset size: 16 MiB.
+数据集大小：16 MiB。
 
-Workloads:
+负载类型：
 
-- `zero`: fully compressible control case;
-- `cross_page`: each 64 KiB region contains sixteen near-identical
-  pseudo-random 4 KiB pages. A 4 KiB page is individually almost
-  incompressible, while a larger unit can discover cross-page redundancy;
-- `random`: incompressible control case.
+- `zero`：完全可压缩的控制样例。
+- `cross_page`：每个 64 KiB 区域包含 16 个近似相同的伪随机 4 KiB 页面。单个 4 KiB 页面几乎不可压缩；较大的单元则可能发现跨页冗余。
+- `random`：不可压缩的控制样例。
 
-The random-rewrite test changes one logical 4 KiB page, but must decode and
-re-encode the entire selected compression unit. Each operation starts from the
-same steady-state encoded dataset so results are not distorted by cumulative
-randomization.
+随机改写测试只修改一个逻辑 4 KiB 页面，但必须解码并重新编码整个选定压缩单元。每次操作都从相同的稳定编码数据集开始，避免累积随机化干扰结果。
 
-The concurrency test uses eight independent Zstd contexts.
+并发测试使用 8 个独立 Zstd 上下文。
 
-## Results
+## 结果
 
-| Pattern | Unit | Stored ratio | Encode MiB/s | 4K rewrite ns | Raw CPU amplification | Encoded write amplification | 8-thread MiB/s |
+| 数据模式 | 单元大小 | 存储比例 | 编码 MiB/s | 4K 改写 ns | 原始 CPU 放大倍数 | 编码写入放大倍数 | 8 线程 MiB/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | zero | 4 KiB | 0.004639 | 3100.9 | 3111.3 | 1x | 1.000x | 31014.1 |
 | zero | 16 KiB | 0.001160 | 7466.9 | 5388.7 | 4x | 1.009x | 63385.2 |
@@ -51,52 +43,33 @@ The concurrency test uses eight independent Zstd contexts.
 | random | 16 KiB | 1.000000 | 1476.3 | 6764.7 | 4x | 4.000x | 9890.0 |
 | random | 64 KiB | 1.000000 | 2492.3 | 9660.2 | 16x | 16.000x | 34616.6 |
 
-These are local microbenchmark numbers, not a promise of end-to-end filesystem
-throughput.
+以上是本机微基准结果，不代表端到端文件系统吞吐量承诺。
 
-## Interpretation
+## 结果分析
 
-A global 64 KiB compression unit is not appropriate.
+不适合全局统一采用 64 KiB 压缩单元。
 
-For cross-page redundant data, 64 KiB is compelling: it reduces stored payload
-from effectively uncompressed to about 6.4% of plaintext, roughly a 15.6x
-payload reduction relative to 4 KiB units. Larger units also amortize Zstd call
-overhead and substantially improve bulk/concurrent compression throughput.
+对跨页冗余数据，64 KiB 单元效果明显：存储负载从近似未压缩降到明文的约 6.4%，相对 4 KiB 单元约减少至 1/15.6。较大单元也摊薄了 Zstd 调用开销，显著提高批量/并发压缩吞吐量。
 
-However, a single random 4 KiB rewrite of a 64 KiB extent requires decoding and
-re-encoding sixteen logical pages. On incompressible data it provides no memory
-benefit and turns one logical 4 KiB write into roughly 16x encoded output.
+但对 64 KiB extent 的一次随机 4 KiB 改写，需要解码并重新编码其中 16 个逻辑页。对不可压缩数据，这不会节省内存，却会把一次逻辑 4 KiB 写放大为约 16 倍编码输出。
 
-## Recommended design
+## 建议设计
 
-Keep `MEMFS_PAGE_SIZE = 4096` and the current sparse allocation bitmap/page
-semantics.
+保留 `MEMFS_PAGE_SIZE = 4096` 和当前稀疏分配位图/页面语义。
 
-If larger compression units are implemented, make them optional adaptive
-compression extents, initially 64 KiB (16 logical pages):
+若实现更大的压缩单元，应将其做成可选的自适应压缩 extent，初始大小可设为 64 KiB（16 个逻辑页）：
 
-1. A sparse hole remains a missing 4 KiB logical page. The larger compression
-   unit must never increase sparse allocation granularity.
-2. A 64 KiB compression extent is only considered after enough pages in the
-   16-page window are present to make coalescing useful.
-3. Probe the whole extent once. Keep it coalesced only when its encoded size
-   beats a minimum ratio threshold (for example <= 75% of the sum of current
-   per-page stored sizes).
-4. A failed larger-unit probe records negative feedback so random data is not
-   repeatedly re-tested.
-5. Track rewrite heat. Repeated partial-page/4 KiB rewrites should split a
-   coalesced extent back into normal 4 KiB page objects instead of paying a
-   permanent 16x CPU amplification.
-6. Sequential/full-extent rewrites may remain coalesced.
-7. Encryption authentication boundaries must remain explicit; a coalesced
-   compression extent needs one well-defined nonce/tag scheme and must not
-   weaken per-file nonce uniqueness.
-8. PageGroup lookup should expose either individual page entries or an extent
-   descriptor without adding another global index.
+1. 稀疏空洞仍表示为缺失的 4 KiB 逻辑页；大压缩单元不得增加稀疏分配粒度。
+2. 只有 16 页窗口内已存在足够多的页面、合并确有收益时，才考虑组成 64 KiB 压缩 extent。
+3. 对整个 extent 探测一次。仅当编码大小低于当前逐页存储大小之和的最低比例阈值（例如不高于 75%）时，才保留合并表示。
+4. 较大单元探测失败后记录负反馈，避免反复对随机数据进行测试。
+5. 跟踪改写热度。反复发生局部页/4 KiB 改写时，应将合并 extent 拆回普通 4 KiB 页对象，避免永久承受 16 倍 CPU 放大。
+6. 顺序写入或整 extent 覆盖可继续使用合并表示。
+7. 必须明确加密认证边界；合并压缩 extent 需有清晰的 nonce/tag 方案，且不得削弱每文件 nonce 唯一性。
+8. PageGroup 查找应能返回单页条目或 extent 描述符，不额外增加全局索引。
 
-## Decision
+## 决策
 
-Do not change the production storage format in this task.
+本次不修改生产存储格式。
 
-The measurements justify a follow-up prototype of adaptive 64 KiB compression
-extents, but they also reject an unconditional 64 KiB compression unit.
+这些测量足以支持后续制作自适应 64 KiB 压缩 extent 原型，但同时否定无条件使用 64 KiB 压缩单元的方案。
