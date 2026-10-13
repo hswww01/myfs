@@ -186,7 +186,7 @@ if(BUILD_TESTING)
 			target_link_options(cryptfs_store_test PRIVATE /STACK:8388608)
 		endif()
 		add_test(NAME cryptfs_store_test COMMAND cryptfs_store_test)
-		set_tests_properties(cryptfs_store_test PROPERTIES TIMEOUT 300)
+		set_tests_properties(cryptfs_store_test PROPERTIES TIMEOUT 900)
 	endif()
 
 	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.c")

@@ -245,26 +245,12 @@ uint64_t memfs_test_capacity_available(Memfs* fs, bool force_refresh) {
 #endif
 
 /* Growth beyond the reserve, from what the system has free. */
-static uint64_t memfs_auto_system_allowance(Memfs* fs, uint64_t available) {
-	uint64_t system_allowance;
-	uint64_t committed;
-	uint64_t resident;
-	uint64_t allowance;
-
-	system_allowance = available > MEMFS_AUTO_HARD_MARGIN_BYTES
+static uint64_t memfs_auto_system_allowance(uint64_t available) {
+	/* The OS reports remaining available memory, so existing allocator backing
+	 * and resident file data are already accounted for in this sample. */
+	return available > MEMFS_AUTO_HARD_MARGIN_BYTES
 		? available - MEMFS_AUTO_HARD_MARGIN_BYTES
 		: 0;
-	committed = memfs_committed_bytes(fs);
-	resident = memfs_resident_bytes(fs);
-
-	if (committed > system_allowance)
-		return 0;
-
-	allowance = system_allowance - committed;
-	if (resident > allowance)
-		return 0;
-
-	return allowance;
 }
 
 static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
@@ -276,7 +262,7 @@ static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available
 
 	/* The unused part of the reserve is ours whatever the system has free. */
 	reserved = memfs_allocator_reserve_available(&fs->allocator);
-	allowance = memfs_auto_system_allowance(fs, available);
+	allowance = memfs_auto_system_allowance(available);
 	return allowance > UINT64_MAX - reserved ? UINT64_MAX : allowance + reserved;
 }
 

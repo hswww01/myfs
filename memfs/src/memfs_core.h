@@ -257,7 +257,6 @@ struct Memfs {
 	// orphan publication/removal; ordinary file data I/O never takes this lock.
 	SRWLOCK lifetime_lock;
 
-	// Namespace and same-file I/O retain their external WinFsp/caller guard.
 	// Cross-file accounting is atomic; handle lifetime is guarded separately.
 	uint64_t capacity;
 	bool capacity_auto;

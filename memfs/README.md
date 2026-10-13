@@ -143,6 +143,8 @@ Stop with Ctrl+C.
 
 The native installer creates a `SERVICE_WIN32_OWN_PROCESS` service named `MemfsC`, configures automatic start and bounded restart recovery, and starts it immediately. The service runs as LocalSystem. Its protected log defaults to `%ProgramData%\MemfsC\MemfsC.log`; its DACL grants access only to SYSTEM and the installing user's SID. Pass `--log-file` to select another absolute log path. The executable handles STOP and SHUTDOWN controls and stops the WinFsp dispatcher before tearing down the filesystem and allocator.
 
+Unexpected MemfsC process failures use the configured SCM recovery actions: restart after 1, 5, and 30 seconds, with the failure count reset after 24 hours. Because this is a volatile filesystem, each restart creates a new empty M: volume and recreates configured startup directories such as `tmp`.
+
 Run these commands from an elevated shell:
 
 ```powershell

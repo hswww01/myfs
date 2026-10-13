@@ -23,6 +23,9 @@ HANDLE memfs_winfsp_dispatcher_stopped_event(MemfsWinFsp* instance);
 bool memfs_winfsp_dispatcher_stopped_normally(const MemfsWinFsp* instance);
 NTSTATUS memfs_winfsp_dispatcher_result(const MemfsWinFsp* instance);
 #if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_write(
+    FSP_FILE_SYSTEM* fs, MemfsNode* node, const void* data, UINT64 offset,
+    ULONG length, ULONG* transferred);
 NTSTATUS memfs_winfsp_test_get_volume_info(
     FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* info);
 void memfs_winfsp_test_volume_params(FSP_FSCTL_VOLUME_PARAMS* params);

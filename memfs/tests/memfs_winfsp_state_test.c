@@ -360,6 +360,151 @@ static void test_unlinked_directory_child(void) {
     CloseHandle(process.hProcess);
 }
 
+typedef struct AliasWriteWorker {
+    FSP_FILE_SYSTEM* fs;
+    MemfsNode* node;
+    HANDLE start;
+    unsigned writer;
+    volatile LONG errors;
+} AliasWriteWorker;
+
+static DWORD WINAPI alias_write_worker(void* opaque) {
+    AliasWriteWorker* worker = opaque;
+    uint8_t page[MEMFS_PAGE_SIZE];
+    if (WaitForSingleObject(worker->start, 10000) != WAIT_OBJECT_0)
+        return 1;
+    for (unsigned round = 0; round < 16; ++round) {
+        for (unsigned slot = 129U + worker->writer; slot < MEMFS_PAGES_PER_GROUP; slot += 4U) {
+            ULONG written = 0;
+            const uint8_t value = (uint8_t)(1U + ((slot + round * 7U) % 251U));
+            memset(page, value, sizeof(page));
+            if (!NT_SUCCESS(memfs_winfsp_test_write(worker->fs, worker->node, page,
+                    (uint64_t)slot * MEMFS_PAGE_SIZE, sizeof(page), &written)) ||
+                written != sizeof(page)) {
+                InterlockedIncrement(&worker->errors);
+                return 2;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Distinct Windows name contexts that resolve to one core node must share the
+ * same storage lock, including insertion into an already populated page group. */
+static void test_same_node_parallel_writes(void) {
+    enum { WORKERS = 4 };
+    MemfsOptions options = {0};
+    Memfs* store = NULL;
+    MemfsNode* node = NULL;
+    MemfsWinFsp instance = {0};
+    FSP_FILE_SYSTEM fs = {0};
+    HANDLE start = NULL, threads[WORKERS] = {0};
+    AliasWriteWorker workers[WORKERS] = {0};
+    uint8_t* initial = NULL, *zero_tail = NULL, *actual = NULL;
+    uint32_t transferred = 0;
+    DWORD created = 0;
+    bool joined = false;
+
+    options.capacity = 64ULL << 20;
+    options.volume_label = L"ALIAS-IO-LOCK";
+    options.compression_enabled = true;
+    options.compression_level = 1;
+    CHECK(memfs_create_ex(&options, &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    fs.UserContext = &instance;
+    InitializeSRWLock(&fs.OpGuardLock);
+    CHECK(memfs_node_create(store, store->root, L"alias-write.bin", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+    if (node == NULL)
+        goto cleanup;
+
+    initial = malloc((size_t)MEMFS_PAGE_GROUP_BYTES);
+    zero_tail = calloc(127U, MEMFS_PAGE_SIZE);
+    actual = malloc((size_t)MEMFS_PAGE_GROUP_BYTES);
+    CHECK(initial != NULL && zero_tail != NULL && actual != NULL);
+    if (initial == NULL || zero_tail == NULL || actual == NULL)
+        goto cleanup;
+    memset(initial, 0x31, (size_t)MEMFS_PAGE_GROUP_BYTES);
+    CHECK(memfs_node_write(node, initial, 0, (uint32_t)MEMFS_PAGE_GROUP_BYTES,
+        false, false, &transferred) == MEMFS_OK);
+    CHECK(transferred == MEMFS_PAGE_GROUP_BYTES);
+    CHECK(memfs_node_write(node, zero_tail, 129ULL * MEMFS_PAGE_SIZE,
+        127U * MEMFS_PAGE_SIZE, false, false, &transferred) == MEMFS_OK);
+    CHECK(transferred == 127U * MEMFS_PAGE_SIZE);
+    CHECK(memfs_node_page_group_count(node) == 1);
+    CHECK(memfs_node_page_group(node, 0)->page_count == 129U);
+
+    start = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(start != NULL);
+    if (start == NULL)
+        goto cleanup;
+    for (DWORD i = 0; i < WORKERS; ++i) {
+        workers[i] = (AliasWriteWorker){&fs, node, start, i, 0};
+        threads[i] = CreateThread(NULL, 0, alias_write_worker, &workers[i], 0, NULL);
+        CHECK(threads[i] != NULL);
+        if (threads[i] == NULL)
+            break;
+        ++created;
+    }
+    if (created != WORKERS) {
+        SetEvent(start);
+        if (created && WaitForMultipleObjects(created, threads, TRUE, 30000) != WAIT_OBJECT_0)
+            ExitProcess(2);
+        goto cleanup;
+    }
+    CHECK(SetEvent(start));
+    if (WaitForMultipleObjects(WORKERS, threads, TRUE, 120000) != WAIT_OBJECT_0)
+        ExitProcess(2);
+    joined = true;
+    for (DWORD i = 0; i < WORKERS; ++i) {
+        DWORD exit_code = 1;
+        CHECK(GetExitCodeThread(threads[i], &exit_code) && exit_code == 0);
+        CHECK(workers[i].errors == 0);
+        CloseHandle(threads[i]);
+        threads[i] = NULL;
+    }
+
+    CHECK(node->file_size == MEMFS_PAGE_GROUP_BYTES);
+    CHECK(memfs_node_page_group(node, 0)->page_count == MEMFS_PAGES_PER_GROUP);
+    CHECK(memfs_node_read(node, actual, 0, (uint32_t)MEMFS_PAGE_GROUP_BYTES,
+        &transferred) == MEMFS_OK);
+    CHECK(transferred == MEMFS_PAGE_GROUP_BYTES);
+    for (unsigned slot = 0; slot < MEMFS_PAGES_PER_GROUP; ++slot) {
+        const uint8_t expected = slot < 129U ? 0x31 :
+            (uint8_t)(1U + ((slot + 15U * 7U) % 251U));
+        for (size_t byte = 0; byte < MEMFS_PAGE_SIZE; ++byte) {
+            if (actual[(size_t)slot * MEMFS_PAGE_SIZE + byte] != expected) {
+                CHECK(0);
+                goto cleanup;
+            }
+        }
+    }
+
+cleanup:
+    if (created && !joined) {
+        SetEvent(start);
+        if (WaitForMultipleObjects(created, threads, TRUE, 30000) != WAIT_OBJECT_0)
+            ExitProcess(2);
+    }
+    for (DWORD i = 0; i < created; ++i) {
+        if (threads[i] != NULL)
+            CloseHandle(threads[i]);
+    }
+    if (start != NULL)
+        CloseHandle(start);
+    free(actual);
+    free(zero_tail);
+    free(initial);
+    if (node != NULL) {
+        if (!node->deleted)
+            (void)memfs_node_unlink(node);
+        memfs_node_close(node);
+    }
+    memfs_destroy(store);
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--unlinked-directory-read") == 0) {
         SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
@@ -382,6 +527,7 @@ int main(int argc, char** argv) {
     test_volume_reports();
     test_archive_attributes();
     test_unlinked_directory_child();
+    test_same_node_parallel_writes();
 
     if (g_failures != 0) {
         fprintf(stderr, "memfs_winfsp_state_test: %d failure(s)\n", g_failures);

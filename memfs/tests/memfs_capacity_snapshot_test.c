@@ -151,6 +151,83 @@ static void test_growth_during_sample_and_free_reallocate(void) {
     puts("snapshot in-query growth and gross-commit debit PASS");
 }
 
+/* OS available memory is the remaining growth allowance: existing allocator
+ * backing and resident file data must not be subtracted from it again. */
+static void test_live_allowance_does_not_double_debit_backing(void) {
+    MockSystem m;
+    Memfs* fs = create_mock_fs(&m);
+    MemfsNode* file = NULL;
+    const uint64_t headroom = 16ULL * 1024ULL * 1024ULL;
+    const uint64_t low_headroom = 4ULL * 1024ULL * 1024ULL;
+    const uint32_t payload_pages = (2U * 1024U * 1024U) / MEMFS_PAGE_SIZE;
+    uint8_t input[MEMFS_PAGE_SIZE], output[MEMFS_PAGE_SIZE];
+    uint64_t committed_before, free_before, free_with_backing;
+    uint32_t transferred = 0;
+    void* backing = NULL;
+    if (!fs) return;
+
+    CHECK(memfs_allocator_reserve_available(&fs->allocator) == 0);
+    m.available = (LONG64)(MEMFS_AUTO_HARD_MARGIN_BYTES + headroom);
+    committed_before = memfs_committed_bytes(fs);
+    free_before = memfs_free_bytes(fs);
+    CHECK(free_before == headroom);
+    backing = memfs_allocator_alloc(&fs->allocator, 1024U * 1024U);
+    CHECK(backing != NULL);
+    if (backing == NULL)
+        goto done;
+    CHECK(memfs_committed_bytes(fs) > committed_before);
+    free_with_backing = memfs_free_bytes(fs);
+    CHECK(free_with_backing == headroom);
+    CHECK(free_with_backing == free_before);
+    memfs_allocator_free(&fs->allocator, backing, 1024U * 1024U);
+    backing = NULL;
+    (void)memfs_allocator_scavenge(&fs->allocator);
+
+    m.available = 4LL * 1024LL * 1024LL * 1024LL;
+    m.ticks += (LONG64)fs->auto_available_cache_interval_qpc + 1;
+    CHECK(memfs_node_create(fs, fs->root, L"allowance.bin", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+    if (file == NULL)
+        goto done;
+    memset(input, 0xa5, sizeof(input));
+    for (uint32_t i = 0; i < payload_pages; ++i) {
+        CHECK(memfs_node_write(file, input, (uint64_t)i * sizeof(input),
+            sizeof(input), false, false, &transferred) == MEMFS_OK);
+        CHECK(transferred == sizeof(input));
+    }
+    CHECK(file->file_size == 2ULL * 1024ULL * 1024ULL);
+    CHECK(memfs_resident_bytes(fs) >= file->file_size);
+
+    /* A small remaining allowance still exists after files occupy RAM. The
+     * former resident-versus-allowance check incorrectly reduced this to zero. */
+    m.available = (LONG64)(MEMFS_AUTO_HARD_MARGIN_BYTES + low_headroom);
+    CHECK(memfs_free_bytes(fs) == low_headroom);
+    for (uint32_t i = 0; i < payload_pages; ++i) {
+        memset(output, 0, sizeof(output));
+        CHECK(memfs_node_read(file, output, (uint64_t)i * sizeof(output),
+            sizeof(output), &transferred) == MEMFS_OK);
+        CHECK(transferred == sizeof(output));
+        CHECK(memcmp(input, output, sizeof(input)) == 0);
+    }
+
+    m.available = (LONG64)MEMFS_AUTO_HARD_MARGIN_BYTES + 1;
+    CHECK(memfs_free_bytes(fs) == 1);
+    m.available = (LONG64)MEMFS_AUTO_HARD_MARGIN_BYTES;
+    CHECK(memfs_free_bytes(fs) == 0);
+    m.available = (LONG64)MEMFS_AUTO_HARD_MARGIN_BYTES - 1;
+    CHECK(memfs_free_bytes(fs) == 0);
+
+done:
+    if (file != NULL) {
+        CHECK(memfs_node_unlink(file) == MEMFS_OK);
+        memfs_node_close(file);
+    }
+    if (backing != NULL)
+        memfs_allocator_free(&fs->allocator, backing, 1024U * 1024U);
+    destroy_mock_fs(&m);
+    puts("live allowance / existing backing / resident payload / margin PASS");
+}
+
 static void test_pressure_preserves_data(void) {
     MockSystem m;
     Memfs* fs = create_mock_fs(&m);
@@ -339,6 +416,7 @@ static void test_concurrent_production_snapshot(void) {
 int main(void) {
     test_hit_expiry_force_and_slow_query();
     test_growth_during_sample_and_free_reallocate();
+    test_live_allowance_does_not_double_debit_backing();
     test_pressure_preserves_data();
     test_reserve_survives_pressure();
     test_concurrent_production_snapshot();

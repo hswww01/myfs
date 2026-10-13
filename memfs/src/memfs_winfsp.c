@@ -9,6 +9,60 @@ static MemfsWinFsp* memfs_instance(FSP_FILE_SYSTEM* file_system) {
 	return (MemfsWinFsp*)fs_frontend_backend_context(file_system);
 }
 
+#define MEMFS_NODE_IO_STRIPE_COUNT 64U
+
+/*
+ * WinFsp keeps file-name contexts distinct when two native extended paths
+ * (for example, "x" and ".\\x") resolve to the same MemfsNode. Its per-name
+ * file resources therefore do not serialize those requests. Hash the stable
+ * node index to a small process-wide lock table: aliases of the same node
+ * share one lock while unrelated files continue to perform I/O concurrently.
+ */
+static SRWLOCK g_memfs_node_io_stripes[MEMFS_NODE_IO_STRIPE_COUNT];
+static INIT_ONCE g_memfs_node_io_stripes_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK memfs_node_io_stripes_initialize(
+	PINIT_ONCE once, PVOID parameter, PVOID* context) {
+	uint32_t index;
+
+	(void)once;
+	(void)parameter;
+	(void)context;
+	for (index = 0; index < MEMFS_NODE_IO_STRIPE_COUNT; ++index)
+		InitializeSRWLock(&g_memfs_node_io_stripes[index]);
+	return TRUE;
+}
+
+static SRWLOCK* memfs_node_io_stripe(MemfsNode* node) {
+	if (node == NULL ||
+		!InitOnceExecuteOnce(&g_memfs_node_io_stripes_once,
+			memfs_node_io_stripes_initialize, NULL, NULL))
+		return NULL;
+	return &g_memfs_node_io_stripes[
+		(uint32_t)memfs_node_index_number(node) &
+		(MEMFS_NODE_IO_STRIPE_COUNT - 1U)];
+}
+
+static SRWLOCK* memfs_node_io_enter(MemfsNode* node, BOOL exclusive) {
+	SRWLOCK* stripe = memfs_node_io_stripe(node);
+	if (stripe == NULL)
+		return NULL;
+	if (exclusive)
+		AcquireSRWLockExclusive(stripe);
+	else
+		AcquireSRWLockShared(stripe);
+	return stripe;
+}
+
+static void memfs_node_io_leave(SRWLOCK* stripe, BOOL exclusive) {
+	if (stripe == NULL)
+		return;
+	if (exclusive)
+		ReleaseSRWLockExclusive(stripe);
+	else
+		ReleaseSRWLockShared(stripe);
+}
+
 typedef BOOLEAN (NTAPI *MemfsRtlIsNameInUnUpcasedExpressionFn)(
 	PUNICODE_STRING Expression,
 	PUNICODE_STRING Name,
@@ -122,6 +176,13 @@ static NTSTATUS memfs_status(MemfsResult result) {
 	}
 }
 
+#if defined(MEMFS_WINFSP_TESTING)
+static NTSTATUS fs_Write(FSP_FILE_SYSTEM* file_system, PVOID file_context,
+	PVOID buffer, UINT64 offset, ULONG length, BOOLEAN write_to_end_of_file,
+	BOOLEAN constrained_io, PULONG bytes_transferred,
+	FSP_FSCTL_FILE_INFO* file_info);
+#endif
+
 static uint32_t memfs_normalize_attributes(MemfsNode* node, uint32_t attributes) {
 	if (memfs_node_is_directory(node)) {
 		attributes |= FILE_ATTRIBUTE_DIRECTORY;
@@ -199,11 +260,20 @@ static BOOLEAN memfs_add_dir_info(MemfsNode* node, const wchar_t* name, void* bu
 								  PULONG bytes_transferred) {
 	uint8_t storage[sizeof(FSP_FSCTL_DIR_INFO) + (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t)];
 	FSP_FSCTL_DIR_INFO* dir_info = (FSP_FSCTL_DIR_INFO*)storage;
-	size_t name_chars = wcslen(name);
-	size_t name_bytes = name_chars * sizeof(wchar_t);
+	size_t name_chars;
+	size_t name_bytes;
+	SRWLOCK* io_stripe;
+	BOOLEAN added;
 
+	if (node == NULL || name == NULL)
+		return FALSE;
+	name_chars = wcslen(name);
 	if (name_chars > MEMFS_MAX_NAME)
 		return FALSE;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL)
+		return FALSE;
+	name_bytes = name_chars * sizeof(wchar_t);
 
 	memset(storage, 0, sizeof(storage));
 	dir_info->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + name_bytes);
@@ -212,7 +282,9 @@ static BOOLEAN memfs_add_dir_info(MemfsNode* node, const wchar_t* name, void* bu
 	if (name_bytes)
 		memcpy(dir_info->FileNameBuf, name, name_bytes);
 
-	return FspFileSystemAddDirInfo(dir_info, buffer, length, bytes_transferred);
+	added = FspFileSystemAddDirInfo(dir_info, buffer, length, bytes_transferred);
+	memfs_node_io_leave(io_stripe, FALSE);
+	return added;
 }
 
 static MemfsResult memfs_get_destination(Memfs* fs, const wchar_t* path, MemfsNode** parent,
@@ -277,6 +349,7 @@ static NTSTATUS fs_Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 
 	MemfsWinFsp* instance = memfs_instance(file_system);
 	MemfsNode* parent;
 	MemfsNode* node;
+	SRWLOCK* io_stripe;
 	wchar_t name[MEMFS_MAX_NAME + 1];
 	bool directory;
 	MemfsResult result;
@@ -295,7 +368,14 @@ static NTSTATUS fs_Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 
 		return memfs_status(result);
 
 	*file_context = node;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL) {
+		memfs_node_close(node);
+		*file_context = NULL;
+		return STATUS_INTERNAL_ERROR;
+	}
 	memfs_fill_file_info(node, file_info);
+	memfs_node_io_leave(io_stripe, FALSE);
 	return STATUS_SUCCESS;
 }
 
@@ -304,6 +384,7 @@ static NTSTATUS fs_Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 cr
 	MemfsWinFsp* instance = memfs_instance(file_system);
 	MemfsNode* node;
 	MemfsResult result;
+	SRWLOCK* io_stripe;
 
 	(void)granted_access;
 
@@ -321,7 +402,14 @@ static NTSTATUS fs_Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 cr
 
 	memfs_node_open(node);
 	*file_context = node;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL) {
+		memfs_node_close(node);
+		*file_context = NULL;
+		return STATUS_INTERNAL_ERROR;
+	}
 	memfs_fill_file_info(node, file_info);
+	memfs_node_io_leave(io_stripe, FALSE);
 	return STATUS_SUCCESS;
 }
 
@@ -329,19 +417,28 @@ static NTSTATUS fs_Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, U
 							 BOOLEAN replace_file_attributes, UINT64 allocation_size, FSP_FSCTL_FILE_INFO* file_info) {
 	MemfsNode* node = file_context;
 	MemfsResult result;
-
+	SRWLOCK* io_stripe;
+	(void)file_system;
 	(void)file_system;
 
-	if (memfs_node_is_directory(node))
-		return STATUS_FILE_IS_A_DIRECTORY;
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
+	io_stripe = memfs_node_io_enter(node, TRUE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
+
+	if (memfs_node_is_directory(node)) {
+		result = MEMFS_ERR_IS_DIRECTORY;
+		goto done;
+	}
 
 	result = memfs_node_set_allocation_size(node, allocation_size);
 	if (result != MEMFS_OK)
-		return memfs_status(result);
+		goto done;
 
 	result = memfs_node_set_file_size(node, 0);
 	if (result != MEMFS_OK)
-		return memfs_status(result);
+		goto done;
 
 	if (replace_file_attributes)
 		node->attributes = file_attributes;
@@ -354,17 +451,23 @@ static NTSTATUS fs_Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, U
 	memfs_node_set_change_time(node, memfs_now());
 
 	memfs_fill_file_info(node, file_info);
-	return STATUS_SUCCESS;
+	done:
+	memfs_node_io_leave(io_stripe, TRUE);
+	return result == MEMFS_OK ? STATUS_SUCCESS : memfs_status(result);
 }
 
 static VOID fs_Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name, ULONG flags) {
 	MemfsNode* node = file_context;
 	uint64_t now;
+	SRWLOCK* io_stripe;
 
 	(void)file_system;
 	(void)file_name;
 
 	if (node == NULL)
+		return;
+	io_stripe = memfs_node_io_enter(node, TRUE);
+	if (io_stripe == NULL)
 		return;
 
 	now = memfs_now();
@@ -381,6 +484,7 @@ static VOID fs_Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR f
 
 	if (flags & FspCleanupDelete)
 		memfs_node_unlink(node);
+	memfs_node_io_leave(io_stripe, TRUE);
 }
 
 static VOID fs_Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
@@ -389,6 +493,13 @@ static VOID fs_Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
 }
 
 #if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_write(
+	FSP_FILE_SYSTEM* fs, MemfsNode* node, const void* data, UINT64 offset,
+	ULONG length, ULONG* transferred) {
+	return fs_Write(fs, node, (PVOID)data, offset, length, FALSE, FALSE,
+		transferred, &(FSP_FSCTL_FILE_INFO){0});
+}
+
 NTSTATUS memfs_winfsp_test_overwrite(
 	FSP_FILE_SYSTEM* fs, MemfsNode* node, UINT32 attributes,
 	BOOLEAN replace_attributes, UINT64 allocation_size,
@@ -408,20 +519,36 @@ static NTSTATUS fs_Read(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID 
 	MemfsNode* node = file_context;
 	MemfsResult result;
 	uint32_t bytes_read = 0;
-
+	NTSTATUS status;
+	SRWLOCK* io_stripe;
+	(void)file_system;
 	(void)file_system;
 
-	if (memfs_node_is_directory(node))
-		return STATUS_FILE_IS_A_DIRECTORY;
-	if (offset >= node->file_size)
-		return STATUS_END_OF_FILE;
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
+
+	if (memfs_node_is_directory(node)) {
+		status = STATUS_FILE_IS_A_DIRECTORY;
+		goto done;
+	}
+	if (offset >= node->file_size) {
+		status = STATUS_END_OF_FILE;
+		goto done;
+	}
 
 	result = memfs_node_read(node, buffer, offset, length, &bytes_read);
-	if (result != MEMFS_OK)
-		return memfs_status(result);
-
-	*bytes_transferred = bytes_read;
-	return STATUS_SUCCESS;
+	if (result == MEMFS_OK) {
+		*bytes_transferred = bytes_read;
+		status = STATUS_SUCCESS;
+	} else {
+		status = memfs_status(result);
+	}
+done:
+	memfs_node_io_leave(io_stripe, FALSE);
+	return status;
 }
 
 static NTSTATUS fs_Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer, UINT64 offset, ULONG length,
@@ -430,33 +557,62 @@ static NTSTATUS fs_Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID
 	MemfsNode* node = file_context;
 	MemfsResult result;
 	uint32_t bytes_written = 0;
-
+	NTSTATUS status;
+	SRWLOCK* io_stripe;
+	(void)file_system;
 	(void)file_system;
 
-	if (memfs_node_is_directory(node))
-		return STATUS_FILE_IS_A_DIRECTORY;
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
+	io_stripe = memfs_node_io_enter(node, TRUE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
+
+	if (memfs_node_is_directory(node)) {
+		status = STATUS_FILE_IS_A_DIRECTORY;
+		goto done;
+	}
 
 	result = memfs_node_write(node, buffer, offset, length, !!write_to_end_of_file, !!constrained_io, &bytes_written);
-	if (result != MEMFS_OK)
-		return memfs_status(result);
-
-	*bytes_transferred = bytes_written;
-	memfs_fill_file_info(node, file_info);
-	return STATUS_SUCCESS;
+	if (result == MEMFS_OK) {
+		*bytes_transferred = bytes_written;
+		memfs_fill_file_info(node, file_info);
+		status = STATUS_SUCCESS;
+	} else {
+		status = memfs_status(result);
+	}
+done:
+	memfs_node_io_leave(io_stripe, TRUE);
+	return status;
 }
 
 static NTSTATUS fs_Flush(FSP_FILE_SYSTEM* file_system, PVOID file_context, FSP_FSCTL_FILE_INFO* file_info) {
+	MemfsNode* node = file_context;
+	SRWLOCK* io_stripe;
 	(void)file_system;
 
-	if (file_context && file_info)
-		memfs_fill_file_info((MemfsNode*)file_context, file_info);
+	if (node && file_info) {
+		io_stripe = memfs_node_io_enter(node, FALSE);
+		if (io_stripe == NULL)
+			return STATUS_INTERNAL_ERROR;
+		memfs_fill_file_info(node, file_info);
+		memfs_node_io_leave(io_stripe, FALSE);
+	}
 
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS fs_GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context, FSP_FSCTL_FILE_INFO* file_info) {
+	MemfsNode* node = file_context;
+	SRWLOCK* io_stripe;
 	(void)file_system;
-	memfs_fill_file_info((MemfsNode*)file_context, file_info);
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
+	memfs_fill_file_info(node, file_info);
+	memfs_node_io_leave(io_stripe, FALSE);
 	return STATUS_SUCCESS;
 }
 
@@ -465,7 +621,13 @@ static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context
 								UINT64 change_time, FSP_FSCTL_FILE_INFO* file_info) {
 	MemfsNode* node = file_context;
 
+	SRWLOCK* io_stripe;
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
 	(void)file_system;
+	io_stripe = memfs_node_io_enter(node, TRUE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
 
 	if (file_attributes != INVALID_FILE_ATTRIBUTES) {
 		if (file_attributes == 0)
@@ -484,6 +646,7 @@ static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context
 		memfs_node_set_change_time(node, change_time);
 
 	memfs_fill_file_info(node, file_info);
+	memfs_node_io_leave(io_stripe, TRUE);
 	return STATUS_SUCCESS;
 }
 
@@ -491,18 +654,29 @@ static NTSTATUS fs_SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 							   BOOLEAN set_allocation_size, FSP_FSCTL_FILE_INFO* file_info) {
 	MemfsNode* node = file_context;
 	MemfsResult result;
-
+	SRWLOCK* io_stripe;
 	(void)file_system;
+	(void)file_system;
+
+	if (node == NULL)
+		return STATUS_INVALID_PARAMETER;
+	io_stripe = memfs_node_io_enter(node, TRUE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
 
 	if (set_allocation_size)
 		result = memfs_node_set_allocation_size(node, new_size);
 	else
 		result = memfs_node_set_file_size(node, new_size);
 
-	if (result != MEMFS_OK)
-		return memfs_status(result);
+	if (result != MEMFS_OK) {
+		NTSTATUS status = memfs_status(result);
+		memfs_node_io_leave(io_stripe, TRUE);
+		return status;
+	}
 
 	memfs_fill_file_info(node, file_info);
+	memfs_node_io_leave(io_stripe, TRUE);
 	return STATUS_SUCCESS;
 }
 
@@ -665,6 +839,7 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	const wchar_t* output_name;
 	size_t name_chars;
 	size_t name_bytes;
+	SRWLOCK* io_stripe;
 
 	if (!memfs_node_is_directory(dir))
 		return STATUS_NOT_A_DIRECTORY;
@@ -684,10 +859,15 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 		return STATUS_OBJECT_NAME_NOT_FOUND;
 
 	(void)instance;
+	io_stripe = memfs_node_io_enter(node, FALSE);
+	if (io_stripe == NULL)
+		return STATUS_INTERNAL_ERROR;
 
 	name_chars = wcslen(output_name);
-	if (name_chars > MEMFS_MAX_NAME)
+	if (name_chars > MEMFS_MAX_NAME) {
+		memfs_node_io_leave(io_stripe, FALSE);
 		return STATUS_OBJECT_NAME_INVALID;
+	}
 
 	name_bytes = name_chars * sizeof(wchar_t);
 	memset(dir_info, 0, sizeof(*dir_info));
@@ -697,6 +877,7 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	if (name_bytes)
 		memcpy(dir_info->FileNameBuf, output_name, name_bytes);
 
+	memfs_node_io_leave(io_stripe, FALSE);
 	return STATUS_SUCCESS;
 }
 
