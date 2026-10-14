@@ -241,7 +241,10 @@ struct MemfsNode {
 	uint8_t deleted : 1;
 	uint8_t paged_storage : 1;
 	uint8_t named_stream : 1;
-	uint8_t reserved_flags : 4;
+	// 最后一次数据修改之后，曾通过 SetBasicInfo 显式设置 LastWriteTime。
+	// 与其他标志位同字节，只在持有本节点 io 锁（独占）时读写；命名流不使用。
+	uint8_t explicit_write_time : 1;
+	uint8_t reserved_flags : 3;
 	int8_t compression_score;
 };
 

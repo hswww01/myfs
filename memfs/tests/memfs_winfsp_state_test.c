@@ -507,6 +507,50 @@ cleanup:
     memfs_destroy(store);
 }
 
+/* 写句柄未关闭时由另一句柄显式设置修改时间（SFTP 服务端 utime 的做法），
+ * 写句柄清理时不得覆盖；之后再有写入或改变大小，清理时恢复自动更新。 */
+static void test_explicit_write_time_survives_cleanup(void) {
+    Memfs* store = NULL;
+    MemfsNode* node = NULL;
+    FSP_FILE_SYSTEM fs = {0};
+    MemfsWinFsp instance = {0};
+    FSP_FSCTL_FILE_INFO info;
+    ULONG transferred = 0;
+    const UINT64 stamp = 133444736200000000ULL;
+
+    CHECK(memfs_create(8ULL << 20, L"WRITETIME", &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    fs.UserContext = &instance;
+    InitializeSRWLock(&fs.OpGuardLock);
+    CHECK(memfs_node_create(store, store->root, L"mtime.bin", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+    if (node != NULL) {
+        CHECK(NT_SUCCESS(memfs_winfsp_test_write(&fs, node, "data", 0, 4, &transferred)) && transferred == 4);
+        CHECK(NT_SUCCESS(memfs_winfsp_test_set_basic_info(&fs, node, stamp, &info)));
+        memfs_winfsp_test_cleanup(&fs, node, FspCleanupSetLastWriteTime | FspCleanupSetChangeTime);
+        CHECK(memfs_node_get_last_write_time(node) == stamp);
+
+        CHECK(NT_SUCCESS(memfs_winfsp_test_write(&fs, node, "more", 4, 4, &transferred)));
+        memfs_winfsp_test_cleanup(&fs, node, FspCleanupSetLastWriteTime);
+        CHECK(memfs_node_get_last_write_time(node) != stamp);
+
+        CHECK(NT_SUCCESS(memfs_winfsp_test_set_basic_info(&fs, node, stamp, &info)));
+        CHECK(NT_SUCCESS(memfs_winfsp_test_set_file_size(&fs, node, 2, &info)));
+        memfs_winfsp_test_cleanup(&fs, node, FspCleanupSetLastWriteTime);
+        CHECK(memfs_node_get_last_write_time(node) != stamp);
+
+        CHECK(NT_SUCCESS(memfs_winfsp_test_set_basic_info(&fs, node, stamp, &info)));
+        CHECK(NT_SUCCESS(memfs_winfsp_test_overwrite(&fs, node, 0, FALSE, 0, &info)));
+        memfs_winfsp_test_cleanup(&fs, node, FspCleanupSetLastWriteTime);
+        CHECK(memfs_node_get_last_write_time(node) != stamp);
+        CHECK(memfs_node_unlink(node) == MEMFS_OK);
+        memfs_node_close(node);
+    }
+    memfs_destroy(store);
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--unlinked-directory-read") == 0) {
         SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
@@ -528,6 +572,7 @@ int main(int argc, char** argv) {
     test_case_insensitive_directory_info();
     test_volume_reports();
     test_archive_attributes();
+    test_explicit_write_time_survives_cleanup();
     test_unlinked_directory_child();
     test_same_node_parallel_writes();
 

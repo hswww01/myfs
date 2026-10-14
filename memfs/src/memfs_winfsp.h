@@ -33,6 +33,10 @@ NTSTATUS memfs_winfsp_test_overwrite(
     FSP_FILE_SYSTEM* fs, MemfsNode* node, UINT32 attributes,
     BOOLEAN replace_attributes, UINT64 allocation_size, FSP_FSCTL_FILE_INFO* info);
 void memfs_winfsp_test_cleanup(FSP_FILE_SYSTEM* fs, MemfsNode* node, ULONG flags);
+NTSTATUS memfs_winfsp_test_set_basic_info(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    UINT64 last_write_time, FSP_FSCTL_FILE_INFO* info);
+NTSTATUS memfs_winfsp_test_set_file_size(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    UINT64 size, FSP_FSCTL_FILE_INFO* info);
 NTSTATUS memfs_winfsp_test_read_directory(
     FSP_FILE_SYSTEM* fs, MemfsNode* directory, PWSTR pattern, PWSTR marker,
     PVOID buffer, ULONG length, PULONG transferred);

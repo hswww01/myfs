@@ -512,6 +512,7 @@ static NTSTATUS fs_Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, U
     metadata->attributes = memfs_normalize_attributes(metadata,
         metadata->attributes | FILE_ATTRIBUTE_ARCHIVE);
 	memfs_node_set_change_time(node, memfs_now());
+	node->explicit_write_time = 0;
 
 	memfs_fill_file_info(node, file_info);
 	done:
@@ -548,7 +549,10 @@ static VOID fs_Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR f
     }
 	if (flags & FspCleanupSetLastAccessTime)
 		memfs_node_set_last_access_time(node, now);
-	if (flags & FspCleanupSetLastWriteTime)
+	/* WinFsp 按句柄记录“有过写入”，即使之后另一个句柄显式设置了修改时间，
+	 * 也会在该句柄清理时要求更新为当前时间。NTFS 保留最后一次写入之后的显式时间，
+	 * 例如 SFTP 服务端在写句柄未关闭时用路径句柄 utime，关闭后时间不应被覆盖。 */
+	if ((flags & FspCleanupSetLastWriteTime) && (node->named_stream || !node->explicit_write_time))
 		memfs_node_set_last_write_time(node, now);
 	if (flags & FspCleanupSetChangeTime)
 		memfs_node_set_change_time(node, now);
@@ -646,6 +650,8 @@ static NTSTATUS fs_Write(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID
 
 	result = memfs_node_write(node, buffer, offset, length, !!write_to_end_of_file, !!constrained_io, &bytes_written);
 	if (result == MEMFS_OK) {
+		if (bytes_written)
+			node->explicit_write_time = 0;
 		*bytes_transferred = bytes_written;
 		memfs_fill_file_info(node, file_info);
 		status = STATUS_SUCCESS;
@@ -711,8 +717,11 @@ static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context
 		memfs_node_set_creation_time(node, creation_time);
 	if (last_access_time)
 		memfs_node_set_last_access_time(node, last_access_time);
-	if (last_write_time)
+	if (last_write_time) {
 		memfs_node_set_last_write_time(node, last_write_time);
+		if (!node->named_stream)
+			node->explicit_write_time = 1;
+	}
 	if (change_time)
 		memfs_node_set_change_time(node, change_time);
 
@@ -745,11 +754,25 @@ static NTSTATUS fs_SetFileSize(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 		memfs_node_io_leave(io_stripe, TRUE);
 		return status;
 	}
+	if (!set_allocation_size)
+		node->explicit_write_time = 0;
 
 	memfs_fill_file_info(node, file_info);
 	memfs_node_io_leave(io_stripe, TRUE);
 	return STATUS_SUCCESS;
 }
+
+#if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_set_basic_info(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+	UINT64 last_write_time, FSP_FSCTL_FILE_INFO* info) {
+	return fs_SetBasicInfo(fs, node, INVALID_FILE_ATTRIBUTES, 0, 0, last_write_time, 0, info);
+}
+
+NTSTATUS memfs_winfsp_test_set_file_size(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+	UINT64 size, FSP_FSCTL_FILE_INFO* info) {
+	return fs_SetFileSize(fs, node, size, FALSE, info);
+}
+#endif
 
 static NTSTATUS fs_CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name) {
 	MemfsWinFsp* instance = memfs_instance(file_system);
