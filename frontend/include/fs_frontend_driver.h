@@ -26,6 +26,21 @@ typedef struct FSF_DRIVER_SPEC {
 	PCWSTR sys_arm64_alt_file;
 } FSF_DRIVER_SPEC;
 
+/*
+ * memfs, scpfs and cryptfs share ONE private WinFsp 2.2 driver: they embed the
+ * same signed SYS and link the same static runtime, whose SxS identity is
+ * FSF_SHARED_DRIVER_IDENT (set when the runtime is built; see
+ * frontend/WinFspPresets.json). Upgrade the SYS for all products together,
+ * and remove the driver only when no product uses it any more.
+ */
+#define FSF_SHARED_DRIVER_IDENT L"FsC"
+#define FSF_SHARED_DRIVER_SERVICE L"WinFsp+FsC"
+#define FSF_SHARED_DRIVER_RUNTIME_DIR L"FsC"
+#define FSF_SHARED_DRIVER_SYS_X64 L"fs-winfsp-x64.sys"
+#define FSF_SHARED_DRIVER_SYS_X64_ALT L"fs-winfsp-x64.alt.sys"
+#define FSF_SHARED_DRIVER_SYS_ARM64 L"fs-winfsp-a64.sys"
+#define FSF_SHARED_DRIVER_SYS_ARM64_ALT L"fs-winfsp-a64.alt.sys"
+
 /* One product per process: the first spec passed initializes the runtime. */
 DWORD fsf_driver_prepare_runtime(const FSF_DRIVER_SPEC *spec);
 const wchar_t *fsf_driver_runtime_directory(const FSF_DRIVER_SPEC *spec);

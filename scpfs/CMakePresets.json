@@ -1,6 +1,13 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "include": [
+    "../frontend/WinFspPresets.json"
+  ],
   "configurePresets": [
     {
       "name": "x64-debug",
@@ -13,35 +20,44 @@
         "CMAKE_TOOLCHAIN_FILE": "D:/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static",
         "VCPKG_MANIFEST_MODE": "ON",
-        "VCPKG_APPLOCAL_DEPS": false,
-        "WINFSP_ROOT": "C:/Program Files (x86)/WinFsp",
-        "WINFSP_SOURCE_ROOT": "D:/src/winfsp-memfs-static",
-        "WINFSP_INCLUDE_DIR": "D:/src/winfsp-memfs-static/inc",
-        "WINFSP_EXPECTED_VERSION": "2.1"
-      }
+        "VCPKG_APPLOCAL_DEPS": false
+      },
+      "inherits": "winfsp-2.2"
     },
     {
       "name": "x64-release",
       "displayName": "x64 Release (clang-cl + vcpkg)",
       "inherits": "x64-debug",
       "binaryDir": "${sourceDir}/build/x64-release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "x64-debug", "configurePreset": "x64-debug" },
-    { "name": "x64-release", "configurePreset": "x64-release" }
+    {
+      "name": "x64-debug",
+      "configurePreset": "x64-debug"
+    },
+    {
+      "name": "x64-release",
+      "configurePreset": "x64-release"
+    }
   ],
   "testPresets": [
     {
       "name": "x64-debug",
       "configurePreset": "x64-debug",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "x64-release",
       "configurePreset": "x64-release",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

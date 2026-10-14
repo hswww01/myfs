@@ -135,8 +135,12 @@ target_compile_definitions(cryptfs_resource_test PRIVATE CRYPTFS_WINFSP_STATIC=1
 
 add_executable(cryptfs_winfsp_version_test tests/cryptfs_winfsp_version_test.c)
 target_include_directories(cryptfs_winfsp_version_test SYSTEM PRIVATE "${WINFSP_INCLUDE_DIR}")
+if(NOT WINFSP_EXPECTED_VERSION MATCHES "^([0-9]+)\\.([0-9]+)$")
+	message(FATAL_ERROR "WINFSP_EXPECTED_VERSION must be major.minor, got '${WINFSP_EXPECTED_VERSION}'")
+endif()
+math(EXPR _cryptfs_winfsp_version_hex "(${CMAKE_MATCH_1} << 16) | ${CMAKE_MATCH_2}" OUTPUT_FORMAT HEXADECIMAL)
 target_compile_definitions(cryptfs_winfsp_version_test PRIVATE
-	WINFSP_STATIC CRYPTFS_EXPECTED_WINFSP_VERSION=0x00020001U)
+	WINFSP_STATIC CRYPTFS_EXPECTED_WINFSP_VERSION=${_cryptfs_winfsp_version_hex}U)
 target_link_libraries(cryptfs_winfsp_version_test PRIVATE
 	"${WINFSP_STATIC_LIBRARY}" credui netapi32 rpcrt4 secur32 shlwapi version wldap32)
 

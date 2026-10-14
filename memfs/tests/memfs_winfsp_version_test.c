@@ -1,6 +1,8 @@
 #include <Windows.h>
 #include <winfsp/winfsp.h>
 
+#include "fs_frontend_driver.h"
+
 #include <stdio.h>
 #include <wchar.h>
 
@@ -9,8 +11,8 @@
 #endif
 
 int main(void) {
-    if (wcscmp(FspSxsIdent(), L"MemfsC") != 0) {
-        fprintf(stderr, "Static runtime is not pinned to the embedded MemfsC driver.\n");
+    if (wcscmp(FspSxsIdent(), FSF_SHARED_DRIVER_IDENT) != 0) {
+        fprintf(stderr, "Static runtime is not pinned to the shared embedded FsC driver.\n");
         return 1;
     }
     UINT32 version = 0;

@@ -105,7 +105,8 @@ static void print_usage(const wchar_t* exe) {
              L"  --log-file <path>       Absolute protected service log path.\n"
              L"  --install               Install an automatic LocalSystem service and start it.\n"
              L"  --uninstall             Stop and remove only the named service.\n"
-             L"  --uninstall-private-driver  Remove only MemfsC private WinFsp driver files/service.\n"
+             L"  --uninstall-private-driver  Remove the private WinFsp+FsC driver shared by memfs,\n"
+             L"                          scpfs and cryptfs (only when none of them uses it).\n"
              L"  --stats                 Print human-readable runtime stats at mount/stop.\n"
              L"  --stats-json            Print machine-readable JSON stats at mount/stop.\n"
              L"  --gui                   Open the native configuration window.\n"
@@ -1260,15 +1261,15 @@ int wmain(int argc, wchar_t** argv) {
         error = memfs_winfsp_uninstall_embedded_driver();
 
         if (error == ERROR_SUCCESS) {
-            wprintf(L"MemfsC private WinFsp driver is removed.\n");
+            wprintf(L"The shared private WinFsp+FsC driver is removed.\n");
             return 0;
         }
         if (error == ERROR_SUCCESS_REBOOT_REQUIRED) {
-            wprintf(L"MemfsC private WinFsp driver removal is scheduled; reboot required.\n");
+            wprintf(L"The shared private WinFsp+FsC driver removal is scheduled; reboot required.\n");
             return 0;
         }
 
-        fwprintf(stderr, L"Cannot remove MemfsC private WinFsp driver: %lu\n", error);
+        fwprintf(stderr, L"Cannot remove the shared private WinFsp+FsC driver: %lu\n", error);
         return 6;
     }
 

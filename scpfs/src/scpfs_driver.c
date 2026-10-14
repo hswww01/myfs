@@ -1,15 +1,15 @@
 /*
- * Scpfs's private embedded WinFsp driver. The implementation is shared in
- * frontend/src/fs_frontend_driver.c; this file only supplies Scpfs's
- * service name, payload file names and resource identifiers.
+ * Scpfs's embedded WinFsp driver: the driver shared by all products
+ * (FSF_SHARED_DRIVER_*, implemented in frontend/src/fs_frontend_driver.c);
+ * this file only supplies Scpfs's resource identifiers.
  */
 #include "scpfs_driver.h"
 #include "scpfs_resource.h"
 #include "fs_frontend_driver.h"
 
 static const FSF_DRIVER_SPEC g_driver_spec = {
-    L"WinFsp+ScpfsC",
-    L"ScpfsC",
+    FSF_SHARED_DRIVER_SERVICE,
+    FSF_SHARED_DRIVER_RUNTIME_DIR,
 #if defined(SCPFS_WINFSP_STATIC)
     TRUE,
 #else
@@ -18,10 +18,10 @@ static const FSF_DRIVER_SPEC g_driver_spec = {
     IDR_SCPFS_WINFSP_DLL,
     IDR_SCPFS_WINFSP_SYS_X64,
     IDR_SCPFS_WINFSP_SYS_ARM64,
-    L"scpfs-winfsp-x64.sys",
-    L"scpfs-winfsp-x64.alt.sys",
-    L"scpfs-winfsp-a64.sys",
-    L"scpfs-winfsp-a64.alt.sys",
+    FSF_SHARED_DRIVER_SYS_X64,
+    FSF_SHARED_DRIVER_SYS_X64_ALT,
+    FSF_SHARED_DRIVER_SYS_ARM64,
+    FSF_SHARED_DRIVER_SYS_ARM64_ALT,
 };
 
 DWORD scpfs_winfsp_prepare_runtime(void) {

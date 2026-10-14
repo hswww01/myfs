@@ -1,0 +1,17 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "winfsp-2.2",
+      "hidden": true,
+      "description": "WinFsp 2.2B5 shared by memfs, scpfs and cryptfs: one static runtime (SxS identity FsC, built by memfs/scripts/prepare-winfsp-static.ps1 -Worktree D:/src/winfsp-fs-2.2B5 -PrivateDriverIdent FsC) and the signed drivers kept in frontend/winfsp.",
+      "cacheVariables": {
+        "WINFSP_SOURCE_ROOT": "D:/src/winfsp-fs-2.2B5",
+        "WINFSP_INCLUDE_DIR": "D:/src/winfsp-fs-2.2B5/inc",
+        "WINFSP_DRIVER_X64_SOURCE": "${sourceDir}/../frontend/winfsp/2.2.26286-beta5/winfsp-x64.sys",
+        "WINFSP_DRIVER_ARM64_SOURCE": "${sourceDir}/../frontend/winfsp/2.2.26286-beta5/winfsp-a64.sys",
+        "WINFSP_EXPECTED_VERSION": "2.2"
+      }
+    }
+  ]
+}

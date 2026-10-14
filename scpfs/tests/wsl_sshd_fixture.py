@@ -165,6 +165,10 @@ class WslSshdFixture:
         self._wsl("mkdir", "-m", "700", self.linux_sshd_root)
         self._wsl("cp", f"{linux_dir}/ssh_host_rsa_key", f"{self.linux_sshd_root}/ssh_host_rsa_key")
         self._wsl("chmod", "600", f"{self.linux_sshd_root}/ssh_host_rsa_key")
+        # sshd needs its privilege separation directory. systemd-tmpfiles
+        # normally creates it, but not when the distro's boot is stalled
+        # (e.g. by an fstab entry for an absent disk).
+        self._wsl("mkdir", "-p", "-m", "0755", "/run/sshd")
         self._wsl("sshd", "-t", "-f", f"{linux_dir}/sshd_config")
 
         self.log = self.log_file.open("wb")

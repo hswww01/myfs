@@ -1,15 +1,15 @@
 /*
- * Cryptfs's private embedded WinFsp driver. The implementation is shared in
- * frontend/src/fs_frontend_driver.c; this file only supplies Cryptfs's
- * service name, payload file names and resource identifiers.
+ * Cryptfs's embedded WinFsp driver: the driver shared by all products
+ * (FSF_SHARED_DRIVER_*, implemented in frontend/src/fs_frontend_driver.c);
+ * this file only supplies Cryptfs's resource identifiers.
  */
 #include "cryptfs_driver.h"
 #include "cryptfs_resource.h"
 #include "fs_frontend_driver.h"
 
 static const FSF_DRIVER_SPEC g_driver_spec = {
-    L"WinFsp+CryptfsC",
-    L"CryptfsC",
+    FSF_SHARED_DRIVER_SERVICE,
+    FSF_SHARED_DRIVER_RUNTIME_DIR,
 #if defined(CRYPTFS_WINFSP_STATIC)
     TRUE,
 #else
@@ -18,10 +18,10 @@ static const FSF_DRIVER_SPEC g_driver_spec = {
     IDR_CRYPTFS_WINFSP_DLL,
     IDR_CRYPTFS_WINFSP_SYS_X64,
     IDR_CRYPTFS_WINFSP_SYS_ARM64,
-    L"cryptfs-winfsp-x64.sys",
-    L"cryptfs-winfsp-x64.alt.sys",
-    L"cryptfs-winfsp-a64.sys",
-    L"cryptfs-winfsp-a64.alt.sys",
+    FSF_SHARED_DRIVER_SYS_X64,
+    FSF_SHARED_DRIVER_SYS_X64_ALT,
+    FSF_SHARED_DRIVER_SYS_ARM64,
+    FSF_SHARED_DRIVER_SYS_ARM64_ALT,
 };
 
 DWORD cryptfs_winfsp_prepare_runtime(void) {

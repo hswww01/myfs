@@ -2,9 +2,9 @@ param([Parameter(Mandatory=$true)][string]$Exe)
 # Read-only prerequisite. Never install, start, stop or upgrade a driver here.
 $ErrorActionPreference='Stop'
 $Exe=(Resolve-Path -LiteralPath $Exe).Path
-$driver=Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+MemfsC'" -ErrorAction Stop
+$driver=Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+FsC'" -ErrorAction Stop
 if ($null -eq $driver -or $driver.State -ne 'Running') {
-    Write-Output 'SKIP: the product-owned WinFsp+MemfsC driver must already be running.'
+    Write-Output 'SKIP: the product-owned WinFsp+FsC driver must already be running.'
     exit 77
 }
 if (-not ('MemfsEmbeddedDriverEvidence' -as [type])) {

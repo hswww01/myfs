@@ -1,5 +1,6 @@
 #include "memfs_winfsp.h"
 #include "memfs_driver.h"
+#include "fs_frontend_driver.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -1217,7 +1218,7 @@ NTSTATUS memfs_winfsp_create_ex(
 		*detail_error = ERROR_SUCCESS;
 
 #if defined(MEMFS_WINFSP_STATIC)
-    if (wcscmp(FspSxsIdent(), L"MemfsC") != 0)
+    if (wcscmp(FspSxsIdent(), FSF_SHARED_DRIVER_IDENT) != 0)
         return STATUS_REVISION_MISMATCH;
 #endif
 	runtime_error = memfs_winfsp_prepare_runtime();

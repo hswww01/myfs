@@ -169,3 +169,15 @@ ctest --test-dir build/private-beta5-release --output-on-failure
 - 修复内容：写句柄未关闭时由其他句柄显式设置的 LastWriteTime，在写句柄清理时不再被覆盖为当前时间（与 NTFS 一致；SFTP 服务端 utime 上传场景）。部署后在 M:\tmp 上复验该行为，并以 M: 为 TEMP 通过 scrt 原生网络测试（含上传时间戳断言）。
 - Release CTest：35 项通过；`memfs_temp_service`（8）与 `memfs_native_service_install`（37）超时。逐行跟踪确认两者卡在测试脚本的 `Get-CimInstance Win32_Service` 查询，本机该 WMI 类查询整体无响应（`sc.exe`、`Win32_SystemDriver`、`Win32_Process` 正常），重启 Windows 与重建 WmiPrvSE 后依旧；改动前的 `03905ce` 结果相同。
 - WMI 原因：WmiPrvSE 转储显示 `cimwin32!CWin32Service::LoadPropertyValuesWin2K` 对每个运行中服务调用 `ControlService(INTERROGATE)`，卡在 Windows Search（WSearch）上；SearchIndexer 的爬取线程卡死，767 个定时器线程堵在同一临界区，控制处理程序不响应（`sc interrogate WSearch` 超时，其余 146 个服务正常）。即使按名称过滤也会枚举全部服务，所以任何 `Win32_Service` 查询都会排队卡住。强制结束 SearchIndexer 并重新启动 WSearch 后，WMI 全量服务查询约 0.6 秒返回；两项随后重跑通过（约 6 秒、6.9 秒），memfs 验收完成。与 memfs 无关；WSearch 若再次卡死会重现。
+
+## 2026-10-14 晚：三个项目共享一份 WinFsp 2.2 驱动
+
+用户要求以后只使用 WinFsp 2.2，并让 memfs、scpfs、cryptfs 共享驱动和静态运行库。
+
+- 签名 SYS（与上文哈希相同）纳入 git：`frontend/winfsp/2.2.26286-beta5/winfsp-x64.sys`、`winfsp-a64.sys`。
+- 静态运行库只构建一份：`D:\src\winfsp-fs-2.2B5`，SxS 标识 `FsC`（`prepare-winfsp-static.ps1 -Worktree D:\src\winfsp-fs-2.2B5 -PrivateDriverIdent FsC`）。
+- 三个项目的 CMakePresets 均 include `frontend/WinFspPresets.json` 并继承其中的 `winfsp-2.2` 预设，不再引用 `C:\Program Files (x86)\WinFsp`（scpfs、cryptfs 之前依赖已卸载的 2.1 安装，因此无法构建）。
+- 私有内核服务改为 `WinFsp+FsC`，驱动文件 `C:\Windows\System32\drivers\fs-winfsp-x64.sys`；名称常量在 `frontend/include/fs_frontend_driver.h`。旧的 `WinFsp+MemfsC` 服务和 `memfs-winfsp-x64.sys` 已删除。
+- 同名全局控制设备导致新旧驱动不能同时加载：旧驱动停止挂起期间，`WinFsp+FsC` 启动返回 Win32 183。Windows 重启后旧驱动释放，新驱动正常启动。
+- MemfsC 正式服务同时改为块设备模式（2 GB，`--compress --mkdir tmp`），不再使用 WinFsp；新服务日志为 `C:\ProgramData\MemfsC\MemfsC-block.log`（旧日志只允许 SYSTEM 访问，安装时无法复用）。重启后服务自动挂载 M: 与 `M:\tmp`。
+- 验证：memfs Release/Debug CTest 各 36/36（含挂载、TEMP、ADS 测试）；scpfs 13/13（含 WSL 集成）；cryptfs 7/7 及挂载集成测试。scpfs 的 WSL 测试夹具现在自行创建 `/run/sshd`，不再依赖 WSL 开机流程（本机 fstab 中缺失磁盘的条目会拖住 systemd，使 tmpfiles 未执行）。

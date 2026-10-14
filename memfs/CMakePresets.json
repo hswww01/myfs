@@ -5,6 +5,9 @@
     "minor": 25,
     "patch": 0
   },
+  "include": [
+    "../frontend/WinFspPresets.json"
+  ],
   "configurePresets": [
     {
       "name": "x64-debug",
@@ -16,12 +19,9 @@
         "CMAKE_C_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
         "CMAKE_TOOLCHAIN_FILE": "D:/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows-static",
-        "WINFSP_SOURCE_ROOT": "D:/src/winfsp-memfs-2.2B5-private-092109",
-        "MEMFS_STATIC_WINFSP": "ON",
-        "WINFSP_DRIVER_X64_SOURCE": "${sourceDir}/dist/winfsp-2.2.26286-beta5/drivers/winfsp-x64.sys",
-        "WINFSP_DRIVER_ARM64_SOURCE": "${sourceDir}/dist/winfsp-2.2.26286-beta5/drivers/winfsp-a64.sys",
-        "WINFSP_EXPECTED_VERSION": "2.2"
-      }
+        "MEMFS_STATIC_WINFSP": "ON"
+      },
+      "inherits": "winfsp-2.2"
     },
     {
       "name": "x64-release",

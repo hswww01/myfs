@@ -1,7 +1,7 @@
 param([Alias("Exe")][string]$ExecutablePath)
 $ErrorActionPreference = 'Stop'
 function Test-MemfsPrivateDriver([string]$Executable) {
-    $driver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+MemfsC'"
+    $driver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+FsC'"
     if ($null -eq $driver -or $driver.State -ne 'Running') { return $false }
     if (-not ('MemfsDriverResource' -as [type])) {
         Add-Type @'
@@ -42,7 +42,7 @@ public static class MemfsDriverResource {
     if ($path.StartsWith('\??\')) { $path = $path.Substring(4) }
     if ($path.StartsWith('\SystemRoot\', [StringComparison]::OrdinalIgnoreCase)) { $path = $env:SystemRoot + $path.Substring(11) }
     $allowed = Join-Path $env:SystemRoot 'System32\drivers'
-    if ((Split-Path $path) -ine $allowed -or (Split-Path $path -Leaf) -notmatch '^memfs-winfsp-(x64|a64)(\.alt)?\.sys$') {
+    if ((Split-Path $path) -ine $allowed -or (Split-Path $path -Leaf) -notmatch '^fs-winfsp-(x64|a64)(\.alt)?\.sys$') {
         throw "Unexpected private driver path: $path"
     }
     $fileStream=[IO.File]::OpenRead($path)

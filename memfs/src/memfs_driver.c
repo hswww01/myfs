@@ -1,15 +1,15 @@
 /*
- * Memfs's private embedded WinFsp driver. The implementation is shared in
- * frontend/src/fs_frontend_driver.c; this file only supplies Memfs's
- * service name, payload file names and resource identifiers.
+ * Memfs's embedded WinFsp driver: the driver shared by all products
+ * (FSF_SHARED_DRIVER_*, implemented in frontend/src/fs_frontend_driver.c);
+ * this file only supplies Memfs's resource identifiers.
  */
 #include "memfs_driver.h"
 #include "memfs_resource.h"
 #include "fs_frontend_driver.h"
 
 static const FSF_DRIVER_SPEC g_driver_spec = {
-    L"WinFsp+MemfsC",
-    L"MemfsC",
+    FSF_SHARED_DRIVER_SERVICE,
+    FSF_SHARED_DRIVER_RUNTIME_DIR,
 #if defined(MEMFS_WINFSP_STATIC)
     TRUE,
 #else
@@ -18,10 +18,10 @@ static const FSF_DRIVER_SPEC g_driver_spec = {
     IDR_MEMFS_WINFSP_DLL,
     IDR_MEMFS_WINFSP_SYS_X64,
     IDR_MEMFS_WINFSP_SYS_ARM64,
-    L"memfs-winfsp-x64.sys",
-    L"memfs-winfsp-x64.alt.sys",
-    L"memfs-winfsp-a64.sys",
-    L"memfs-winfsp-a64.alt.sys",
+    FSF_SHARED_DRIVER_SYS_X64,
+    FSF_SHARED_DRIVER_SYS_X64_ALT,
+    FSF_SHARED_DRIVER_SYS_ARM64,
+    FSF_SHARED_DRIVER_SYS_ARM64_ALT,
 };
 
 DWORD memfs_winfsp_prepare_runtime(void) {

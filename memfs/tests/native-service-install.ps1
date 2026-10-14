@@ -157,7 +157,7 @@ if (-not $logAcl.AreAccessRulesProtected) {
 	if ($currentSnapshot -ne $driverSnapshot) {
 		throw "Native service lifecycle changed the existing WinFsp driver state."
 	}
-	$privateDriver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+MemfsC'" -ErrorAction SilentlyContinue
+	$privateDriver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+FsC'" -ErrorAction SilentlyContinue
 	if ($null -eq $privateDriver -or -not (Test-MemfsPrivateDriver $Exe)) { throw "Test changed the private driver." }
 	Write-Output "native-service-install PASS: $serviceName on $Drive"
 }

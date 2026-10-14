@@ -627,7 +627,8 @@ if(MEMFS_STATIC_WINFSP)
 		tests/memfs_winfsp_version_test.c)
 	target_include_directories(memfs_winfsp_version_test
 		SYSTEM PRIVATE
-			${WINFSP_INCLUDE_DIR})
+			${WINFSP_INCLUDE_DIR}
+			${FS_FRONTEND_SOURCE_DIR}/include)
 	target_compile_definitions(memfs_winfsp_version_test
 		PRIVATE
 			WINFSP_STATIC

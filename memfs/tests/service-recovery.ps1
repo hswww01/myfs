@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $serviceHelper = Join-Path $repoRoot "scripts\memfs-service.ps1"
 $serviceName = "MemfsC"
-$privateDriverName = "WinFsp+MemfsC"
+$privateDriverName = "WinFsp+FsC"
 
 if (-not $Exe) {
     $Exe = Join-Path $repoRoot "build\x64-release\memfs.exe"

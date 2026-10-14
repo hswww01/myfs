@@ -6,6 +6,7 @@
 
 #include "memfs_driver.h"
 #include "memfs_resource.h"
+#include "fs_frontend_driver.h"
 
 static int g_failures;
 
@@ -64,9 +65,9 @@ int wmain(void) {
                   &resource_id, &primary, &alternate) == ERROR_SUCCESS);
         CHECK(resource_id == IDR_MEMFS_WINFSP_SYS_X64);
         CHECK(primary != NULL &&
-              _wcsicmp(primary, L"memfs-winfsp-x64.sys") == 0);
+              _wcsicmp(primary, FSF_SHARED_DRIVER_SYS_X64) == 0);
         CHECK(alternate != NULL &&
-              _wcsicmp(alternate, L"memfs-winfsp-x64.alt.sys") == 0);
+              _wcsicmp(alternate, FSF_SHARED_DRIVER_SYS_X64_ALT) == 0);
 
         resource_id = 0;
         primary = NULL;
@@ -76,9 +77,9 @@ int wmain(void) {
                   &resource_id, &primary, &alternate) == ERROR_SUCCESS);
         CHECK(resource_id == IDR_MEMFS_WINFSP_SYS_ARM64);
         CHECK(primary != NULL &&
-              _wcsicmp(primary, L"memfs-winfsp-a64.sys") == 0);
+              _wcsicmp(primary, FSF_SHARED_DRIVER_SYS_ARM64) == 0);
         CHECK(alternate != NULL &&
-              _wcsicmp(alternate, L"memfs-winfsp-a64.alt.sys") == 0);
+              _wcsicmp(alternate, FSF_SHARED_DRIVER_SYS_ARM64_ALT) == 0);
 
         CHECK(memfs_driver_test_spec_for_machine(
                   IMAGE_FILE_MACHINE_I386,

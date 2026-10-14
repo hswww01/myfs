@@ -8,7 +8,9 @@
 
 ## 当前驱动与验证
 
-项目使用官方 WinFsp v2.2B5 源码提交 `14d6e0280ae15e2550c44d6dbc476be51649727f` 构建静态用户态运行库，配合同版本 Microsoft 签名 x64/ARM64 SYS，内嵌于 memfs.exe。静态运行库必须绑定 `MemfsC` SxS 标识，私有内核服务为 `WinFsp+MemfsC`，不得静默复用其他 WinFsp 安装。
+只使用 WinFsp 2.2（用户 2026-10-14 要求）。memfs、scpfs、cryptfs 共享同一份驱动和静态运行库：官方 WinFsp v2.2B5 源码提交 `14d6e0280ae15e2550c44d6dbc476be51649727f` 构建的静态用户态运行库（`D:\src\winfsp-fs-2.2B5`，由 `scripts/prepare-winfsp-static.ps1 -Worktree D:\src\winfsp-fs-2.2B5 -PrivateDriverIdent FsC` 生成），配合同版本 Microsoft 签名 x64/ARM64 SYS（纳入 git：`frontend/winfsp/2.2.26286-beta5/`）。构建配置统一来自 `frontend/WinFspPresets.json`。静态运行库绑定 `FsC` SxS 标识，私有内核服务为 `WinFsp+FsC`（驱动文件 `fs-winfsp-x64.sys`），常量定义在 `frontend/include/fs_frontend_driver.h`，不得静默复用其他 WinFsp 安装。升级 SYS 必须三个产品一起升；卸载某一产品时不要删除共享驱动。
+
+MemfsC 正式服务自 2026-10-14 起使用块设备模式（Arsenal Image Mounter，2 GB 固定容量），不再依赖 WinFsp 驱动；参数与验证见 `docs/BLOCK_DEVICE.md`。
 
 替换驱动时同时核对源码提交、SYS 版本/签名/哈希、静态运行库版本和实际使用的设备。不能只看到磁盘文件被更新就声称内核已切换。不同 Windows 环境的完整 NTFS 兼容性不能由测试通过推定。
 
