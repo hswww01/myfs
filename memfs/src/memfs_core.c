@@ -3025,7 +3025,9 @@ static MemfsResult memfs_resize_allocation(MemfsNode* node, uint64_t allocation_
 static MemfsResult memfs_account_file_size(MemfsNode* node, uint64_t old_size, uint64_t new_size) {
 	Memfs* fs = node->fs;
 
-	if (new_size == old_size)
+	/* Block backing: a file size is a virtual disk extent, not data. Only
+	 * resident pages count (checked by the block layer before each write). */
+	if (new_size == old_size || fs->block_backing)
 		return MEMFS_OK;
 
 	if (new_size > old_size) {
@@ -3211,6 +3213,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
+	fs->block_backing = options->block_backing;
 	InitializeSRWLock(&fs->lifetime_lock);
 	fs->pressure_last_scavenge_tick = 0;
 	InitializeSRWLock(&fs->auto_available_refresh_lock);
@@ -4011,6 +4014,109 @@ MemfsResult memfs_node_set_file_size(MemfsNode* node, uint64_t new_size) {
 
 	node->file_size = new_size;
 	memfs_node_set_change_time(node, memfs_now());
+	return MEMFS_OK;
+}
+
+bool memfs_block_capacity_allows(Memfs* fs, uint64_t bytes) {
+	uint64_t resident;
+
+	if (fs == NULL)
+		return false;
+	if (bytes == 0)
+		return true;
+	if (fs->capacity_auto)
+		return memfs_auto_capacity_allows(fs, bytes);
+	resident = memfs_atomic_load_u64(&fs->resident_bytes);
+	return resident <= fs->capacity && bytes <= fs->capacity - resident;
+}
+
+MemfsResult memfs_node_punch_hole(MemfsNode* node, uint64_t offset, uint64_t length) {
+	static const uint8_t zeros[MEMFS_PAGE_SIZE];
+	uint64_t end;
+	uint64_t first_page;
+	uint64_t end_page;
+	uint32_t position;
+	bool found;
+	MemfsResult result;
+
+	if (node == NULL)
+		return MEMFS_ERR_INVALID;
+	if (MEMFS_NODE_IS_DIRECTORY(node))
+		return MEMFS_ERR_IS_DIRECTORY;
+	end = offset + length;
+	if (end < offset)
+		return MEMFS_ERR_INVALID;
+	if (end > node->file_size)
+		end = node->file_size;
+	if (offset >= end)
+		return MEMFS_OK;
+
+	/* Tiny/inline storage holds data only below small_capacity; the rest is
+	 * implicitly zero. Zero-fill that part (encode drops all-zero data). */
+	if (!node->paged_storage) {
+		if (end > node->small_capacity)
+			end = node->small_capacity;
+		while (offset < end) {
+			uint64_t chunk = end - offset < MEMFS_PAGE_SIZE ? end - offset : MEMFS_PAGE_SIZE;
+
+			result = memfs_storage_write_range(node, zeros, offset, chunk);
+			if (result != MEMFS_OK)
+				return result;
+			offset += chunk;
+		}
+		return MEMFS_OK;
+	}
+
+	first_page = (offset + MEMFS_PAGE_MASK) >> MEMFS_PAGE_SHIFT;
+	end_page = end >> MEMFS_PAGE_SHIFT;
+
+	/* Partial edge pages: read-modify-write zeros; an all-zero result frees it. */
+	if (first_page > end_page) {
+		return memfs_storage_write_range(node, zeros, offset, end - offset);
+	}
+	if ((offset & MEMFS_PAGE_MASK) != 0) {
+		result = memfs_storage_write_range(node, zeros, offset, (first_page << MEMFS_PAGE_SHIFT) - offset);
+		if (result != MEMFS_OK)
+			return result;
+	}
+	if ((end & MEMFS_PAGE_MASK) != 0 && (end_page << MEMFS_PAGE_SHIFT) >= offset) {
+		result = memfs_storage_write_range(node, zeros, end_page << MEMFS_PAGE_SHIFT, end & MEMFS_PAGE_MASK);
+		if (result != MEMFS_OK)
+			return result;
+	}
+	if (first_page >= end_page)
+		return MEMFS_OK;
+
+	/* Whole pages: visit only groups that exist in the sorted group array. */
+	position = memfs_storage_group_position(node, first_page >> MEMFS_PAGE_GROUP_SHIFT, &found);
+	while (position < memfs_storage_group_count(node)) {
+		uint64_t group_index = memfs_storage_group_index_at(node, position);
+		MemfsPageGroup* group = memfs_storage_group_at(node, position);
+		uint64_t group_first = group_index << MEMFS_PAGE_GROUP_SHIFT;
+		uint32_t slot = 0;
+		uint32_t slot_end = MEMFS_PAGES_PER_GROUP;
+
+		if (group_first >= end_page)
+			break;
+		if (first_page > group_first)
+			slot = (uint32_t)(first_page - group_first);
+		if (end_page < group_first + MEMFS_PAGES_PER_GROUP)
+			slot_end = (uint32_t)(end_page - group_first);
+
+		for (; slot < slot_end && group->page_count != 0; slot++) {
+			if (!memfs_group_has(group, slot))
+				continue;
+			result = memfs_storage_replace_page(node, group, slot, NULL);
+			if (result != MEMFS_OK)
+				return result;
+		}
+
+		if (group->page_count == 0) {
+			memfs_storage_remove_group(node, group_index);
+			continue;
+		}
+		position++;
+	}
 	return MEMFS_OK;
 }
 

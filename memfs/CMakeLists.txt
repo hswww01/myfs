@@ -316,6 +316,7 @@ configure_file(
 
 add_library(memfs_core STATIC
 	src/memfs_core.c
+	src/memfs_block.c
 	src/memfs_alloc.c
 	src/memfs_vm.c
 	src/memfs_object.c)
@@ -340,6 +341,8 @@ add_executable(memfs
 	src/memfs_cli.c
 	src/memfs_winfsp.c
 	src/memfs_driver.c
+	src/memfs_devio.c
+	src/memfs_block_run.c
 	${CMAKE_CURRENT_BINARY_DIR}/memfs_resources.rc)
 
 target_include_directories(memfs
@@ -567,6 +570,10 @@ add_executable(memfs_core_test
 add_executable(memfs_storage_regression_test tests/memfs_storage_regression_test.c)
 target_link_libraries(memfs_storage_regression_test PRIVATE memfs_core)
 add_test(NAME memfs_storage_regression_test COMMAND memfs_storage_regression_test)
+add_executable(memfs_block_test tests/memfs_block_test.c)
+target_link_libraries(memfs_block_test PRIVATE memfs_core)
+add_test(NAME memfs_block_test COMMAND memfs_block_test)
+set_tests_properties(memfs_block_test PROPERTIES TIMEOUT 60)
 set_tests_properties(memfs_storage_regression_test PROPERTIES TIMEOUT 30)
 
 add_executable(memfs_alloc_zero_test
@@ -577,6 +584,7 @@ add_test(NAME memfs_alloc_zero_test COMMAND memfs_alloc_zero_test)
 set_tests_properties(memfs_alloc_zero_test PROPERTIES TIMEOUT 30)
 if(MSVC)
 	target_compile_options(memfs_storage_regression_test PRIVATE /W4 /utf-8)
+	target_compile_options(memfs_block_test PRIVATE /W4 /utf-8)
 	target_compile_options(memfs_alloc_zero_test PRIVATE /W4 /utf-8)
 endif()
 

@@ -12,6 +12,7 @@
 #include "memfs_cli.h"
 #include "memfs_driver.h"
 #include "memfs_gui.h"
+#include "memfs_block_run.h"
 
 #define MEMFS_SERVICE_NAME L"MemfsC"
 #define MEMFS_SERVICE_DEFAULT_START_TIMEOUT_MS 120000u
@@ -42,6 +43,13 @@ typedef struct MemfsRunConfig {
     bool uninstall_private_driver;
     bool stats_enabled;
     bool stats_json;
+    /* --block: serve an NTFS-formatted Arsenal Image Mounter disk instead of
+     * a WinFsp volume (full NTFS semantics, e.g. hard links). */
+    bool block_mode;
+    uint64_t disk_size;
+    const wchar_t* aim_ll_path;
+    const wchar_t* block_name;
+    uint32_t block_threads;
     uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
     /* Directories (relative to the volume root) created before mounting,
      * e.g. a %TEMP% folder on a volume that starts empty on every start. */
@@ -101,6 +109,17 @@ static void print_usage(const wchar_t* exe) {
              L"  --stats                 Print human-readable runtime stats at mount/stop.\n"
              L"  --stats-json            Print machine-readable JSON stats at mount/stop.\n"
              L"  --gui                   Open the native configuration window.\n"
+             L"\n"
+             L"Block-device mode (Arsenal Image Mounter, full NTFS incl. hard links):\n"
+             L"  --block                 Serve an NTFS-formatted virtual disk at --mount\n"
+             L"                          (drive letter). Memory follows written data;\n"
+             L"                          TRIM frees it. --size limits resident memory\n"
+             L"                          (auto: free memory). Console mode only.\n"
+             L"  --disk-size <bytes>     Virtual disk size. Default: --size, or total RAM\n"
+             L"                          with --size auto. K/M/G/T suffix.\n"
+             L"  --aim-ll <path>         aim_ll.exe; default next to memfs.exe, then PATH.\n"
+             L"  --block-name <name>     DevIoDrv object name. Default: memfs-block-<pid>.\n"
+             L"  --block-threads <n>     I/O worker threads 1..64. Default: 4.\n"
              L"  --help                  Show this help.\n"
              L"\n"
              L"Service install/uninstall examples (run from an elevated shell):\n"
@@ -215,6 +234,25 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             config->uninstall_service = true;
         } else if (_wcsicmp(argv[i], L"--uninstall-private-driver") == 0) {
             config->uninstall_private_driver = true;
+        } else if (_wcsicmp(argv[i], L"--block") == 0) {
+            config->block_mode = true;
+        } else if (_wcsicmp(argv[i], L"--disk-size") == 0 && i + 1 < argc) {
+            bool disk_auto = false;
+            if (!memfs_cli_parse_size(argv[++i], &config->disk_size, &disk_auto) || disk_auto ||
+                config->disk_size == 0) {
+                fwprintf(stderr, L"Invalid --disk-size value.\n");
+                return 2;
+            }
+        } else if (_wcsicmp(argv[i], L"--aim-ll") == 0 && i + 1 < argc) {
+            config->aim_ll_path = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--block-name") == 0 && i + 1 < argc) {
+            config->block_name = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--block-threads") == 0 && i + 1 < argc) {
+            if (!memfs_cli_parse_u32(argv[++i], &config->block_threads) ||
+                config->block_threads < 1 || config->block_threads > 64) {
+                fwprintf(stderr, L"Invalid --block-threads; use 1..64.\n");
+                return 2;
+            }
         } else if (_wcsicmp(argv[i], L"--stats") == 0) {
             config->stats_enabled = true;
         } else if (_wcsicmp(argv[i], L"--stats-json") == 0) {
@@ -273,6 +311,19 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
     if (config->service_name_set && !config->service_mode &&
         !config->install_service && !config->uninstall_service) {
         fwprintf(stderr, L"--service-name is only valid with a service command.\n");
+        return 2;
+    }
+
+    if (!config->block_mode &&
+        (config->disk_size != 0 || config->aim_ll_path != NULL || config->block_name != NULL ||
+         config->block_threads != 0)) {
+        fwprintf(stderr, L"--disk-size, --aim-ll, --block-name and --block-threads require --block.\n");
+        return 2;
+    }
+    if (config->block_mode &&
+        (config->service_mode || config->install_service || config->uninstall_service ||
+         config->uninstall_private_driver || config->initial_directory_count != 0)) {
+        fwprintf(stderr, L"--block runs in console mode and cannot be combined with service commands or --mkdir.\n");
         return 2;
     }
 
@@ -1134,6 +1185,43 @@ int wmain(int argc, wchar_t** argv) {
 
     if (g_config.service_mode) {
         return run_service(&g_config);
+    }
+
+    if (g_config.block_mode) {
+        MemfsBlockRunConfig block;
+
+        g_stop_event = CreateEventW(NULL, TRUE, FALSE, g_config.stop_event_name);
+        if (g_stop_event == NULL) {
+            fwprintf(stderr, L"CreateEvent failed: %lu\n", GetLastError());
+            memfs_cli_wipe_fixed_key(g_config.encryption_key, &g_config.have_fixed_key);
+            return 1;
+        }
+        memset(&block, 0, sizeof(block));
+        block.mount_point = g_config.mount_point;
+        block.volume_label = g_config.volume_label;
+        block.aim_ll_path = g_config.aim_ll_path;
+        block.object_name = g_config.block_name;
+        block.capacity = g_config.capacity;
+        block.capacity_auto = g_config.capacity_auto;
+        block.auto_reserve = g_config.auto_reserve;
+        block.disk_size = g_config.disk_size;
+        block.threads = g_config.block_threads;
+        block.compression_enabled = g_config.compression_enabled;
+        block.compression_level = (int)g_config.compression_level;
+        block.encryption_enabled = g_config.encryption_enabled;
+        if (g_config.have_fixed_key) {
+            block.encryption_key = g_config.encryption_key;
+            block.encryption_key_size = sizeof(g_config.encryption_key);
+        }
+        block.stats = g_config.stats_enabled;
+        block.stats_json = g_config.stats_json;
+        SetConsoleCtrlHandler(console_handler, TRUE);
+        parse_result = memfs_block_run(&block, g_stop_event);
+        SetConsoleCtrlHandler(console_handler, FALSE);
+        CloseHandle(g_stop_event);
+        g_stop_event = NULL;
+        memfs_cli_wipe_fixed_key(g_config.encryption_key, &g_config.have_fixed_key);
+        return parse_result;
     }
 
     g_stop_event = CreateEventW(NULL, TRUE, FALSE, g_config.stop_event_name);

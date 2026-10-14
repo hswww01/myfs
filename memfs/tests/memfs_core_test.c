@@ -3260,8 +3260,12 @@ static void test_allocator_unified_pool_layout(void) {
 			{2049U, 3072U, 64U * 1024U},
 			{3073U, 4096U, 64U * 1024U},
 			{MEMFS_PAGE_SIZE, 4096U, 64U * 1024U},
-			{sizeof(MemfsPage) + MEMFS_PAGE_SIZE, 8192U, 64U * 1024U},
-			{4097U, 8192U, 64U * 1024U},
+			{sizeof(MemfsPage) + MEMFS_PAGE_SIZE, 4224U, 64U * 1024U},
+			/* Encrypted full page: header + sequence + page + AEAD tag. */
+			{sizeof(MemfsPage) + 8U + MEMFS_PAGE_SIZE + 16U, 4224U, 64U * 1024U},
+			{4097U, 4224U, 64U * 1024U},
+			{4224U, 4224U, 64U * 1024U},
+			{4225U, 8192U, 64U * 1024U},
 			{8192U, 8192U, 64U * 1024U},
 		};
 		size_t i;

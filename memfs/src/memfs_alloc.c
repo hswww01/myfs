@@ -121,7 +121,11 @@ struct MemfsAllocatorState {
 
 static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
     8U, 16U, 24U, 32U, 48U, 64U, 96U, 128U, 192U, 256U,
-    384U, 512U, 768U, 1024U, 1536U, 2048U, 3072U, 4096U, 8192U
+    384U, 512U, 768U, 1024U, 1536U, 2048U, 3072U, 4096U,
+    /* A full page plus its header: encrypted (4128) and compression-attempted
+     * incompressible (4104) pages. Without it they fell into 8192 and used
+     * nearly twice their size. 15 per 64 KiB slab. */
+    4224U, 8192U
 };
 
 static INIT_ONCE g_control_allocator_once = INIT_ONCE_STATIC_INIT;

@@ -13,7 +13,7 @@ typedef long long LONG64;
 
 typedef struct MemfsAllocatorState MemfsAllocatorState;
 
-enum { MEMFS_ALLOC_CLASS_COUNT = 19 };
+enum { MEMFS_ALLOC_CLASS_COUNT = 20 };
 enum { MEMFS_ALLOC_AREA_THRESHOLD = 8192 };
 /*
  * Minimum alignment guaranteed for every non-NULL allocation returned to a

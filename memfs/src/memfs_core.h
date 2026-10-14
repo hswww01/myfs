@@ -82,6 +82,10 @@ typedef struct MemfsOptions {
 	bool encryption_enabled;
 	const uint8_t* encryption_key;
 	size_t encryption_key_size;
+	/* Block-device backing store: file sizes are virtual disk extents, so
+	 * they are not charged to the quota. Capacity applies to resident page
+	 * memory instead (memfs_block_capacity_allows). */
+	bool block_backing;
 } MemfsOptions;
 
 #define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
@@ -277,6 +281,7 @@ struct Memfs {
 	// Cross-file accounting is atomic; handle lifetime is guarded separately.
 	uint64_t capacity;
 	bool capacity_auto;
+	bool block_backing;
 	volatile LONG64 used_bytes;
 	volatile LONG64 resident_bytes;
 	volatile LONG64 pressure_last_scavenge_tick;
@@ -391,6 +396,15 @@ MemfsResult memfs_node_set_allocation_size(MemfsNode* node, uint64_t new_size);
 MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint32_t length, uint32_t* bytes_read);
 MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offset, uint32_t length, bool write_to_end,
 							 bool constrained_io, uint32_t* bytes_written);
+
+/* Frees whole pages in [offset, offset + length) and zeroes partial edge
+ * pages, without changing the file size. Only existing page groups are
+ * visited, so punching a huge sparse range is cheap. Caller serializes I/O
+ * on the node exactly as for memfs_node_write. */
+MemfsResult memfs_node_punch_hole(MemfsNode* node, uint64_t offset, uint64_t length);
+/* Block-backing volumes: may `bytes` more resident page memory be used?
+ * Fixed capacity limits resident bytes; auto capacity follows free memory. */
+bool memfs_block_capacity_allows(Memfs* fs, uint64_t bytes);
 
 MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR security, uint32_t security_size);
 
