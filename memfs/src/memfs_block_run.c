@@ -20,8 +20,7 @@ uint64_t memfs_block_default_disk_size(bool capacity_auto, uint64_t capacity) {
 	return size & ~(MIB - 1U);
 }
 
-/* Locates aim_ll.exe: explicit path, next to memfs.exe, then PATH. */
-static bool find_aim_ll(const wchar_t* configured, wchar_t* path, DWORD count) {
+bool memfs_block_find_aim_ll(const wchar_t* configured, wchar_t* path, DWORD count) {
 	wchar_t* slash;
 	DWORD length;
 
@@ -140,6 +139,43 @@ static bool valid_label(const wchar_t* label) {
 	return true;
 }
 
+/* Creates drive\path for every configured directory, nested parts too. */
+static bool create_initial_directories(const MemfsBlockRunConfig* config, const wchar_t* drive) {
+	uint32_t index;
+
+	for (index = 0; index < config->initial_directory_count; index++) {
+		wchar_t path[MAX_PATH];
+		const wchar_t* source = config->initial_directories[index];
+		size_t used;
+
+		if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%ls\\", drive) < 0)
+			return false;
+		used = wcslen(path);
+		while (*source == L'\\' || *source == L'/')
+			source++;
+		for (;;) {
+			bool end = *source == 0 || *source == L'\\' || *source == L'/';
+
+			if (end && used > 3) {
+				path[used] = 0;
+				if (!CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+					fwprintf(stderr, L"Cannot create directory %ls (Win32 %lu).\n", path, GetLastError());
+					return false;
+				}
+			}
+			if (*source == 0)
+				break;
+			if (used + 2 >= MAX_PATH)
+				return false;
+			path[used++] = end ? L'\\' : *source;
+			source++;
+			while (end && (*source == L'\\' || *source == L'/'))
+				source++;
+		}
+	}
+	return true;
+}
+
 static void print_block_stats(Memfs* fs, MemfsDevio* devio, const char* phase, bool json) {
 	MemfsRuntimeStats stats;
 	MemfsDevioStats io;
@@ -195,7 +231,7 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 	drive[0] = (wchar_t)towupper(config->mount_point[0]);
 	drive[1] = L':';
 	drive[2] = 0;
-	if (!find_aim_ll(config->aim_ll_path, aim_ll, MAX_PATH)) {
+	if (!memfs_block_find_aim_ll(config->aim_ll_path, aim_ll, MAX_PATH)) {
 		fwprintf(stderr, L"aim_ll.exe (Arsenal Image Mounter command line) was not found. "
 						 L"Use --aim-ll <path> or place it next to memfs.exe.\n");
 		return 4;
@@ -254,6 +290,9 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 			   config->volume_label, drive);
 	arguments[1023] = 0;
 	attach_output = calloc(1, 16384);
+	/* Attaching and formatting a large disk can take a while. */
+	if (config->report_progress != NULL)
+		(void)config->report_progress(config->callback_context, 120000);
 	aim_result = run_aim_ll(aim_ll, arguments, attach_output, attach_output ? 16384 : 0);
 	/* Once the device exists it must be detached on every path, even if a
 	 * later step (partitioning, formatting, drive letter) failed. */
@@ -270,6 +309,15 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 	if (!memfs_devio_wait_connected(devio, 10000)) {
 		fwprintf(stderr, L"The attached disk did not start I/O.\n");
 		exit_code = 5;
+		goto cleanup;
+	}
+
+	if (!create_initial_directories(config, drive)) {
+		exit_code = 4;
+		goto cleanup;
+	}
+	if (config->report_ready != NULL && !config->report_ready(config->callback_context)) {
+		exit_code = 6;
 		goto cleanup;
 	}
 
@@ -292,8 +340,11 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 
 				memfs_devio_get_stats(devio, &io);
 				if (io.client_closed) {
+					/* Not a requested stop: report failure so a service
+					 * restarts and brings the volume back. */
 					fwprintf(stderr, L"The disk was detached externally.\n");
 					attached = false;
+					exit_code = 8;
 				} else {
 					/* Workers failed while the disk is attached: detach it
 					 * below rather than leave a dead device behind. */
@@ -304,7 +355,7 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 			}
 		}
 	}
-	if (exit_code != 7)
+	if (exit_code != 7 && exit_code != 8)
 		exit_code = 0;
 
 cleanup:

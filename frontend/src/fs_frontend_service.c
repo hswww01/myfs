@@ -183,7 +183,8 @@ static BOOL fsf_report_locked(FSF_SERVICE *service, DWORD state, DWORD error,
 	service->status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
 	service->status.dwCurrentState = state;
 	service->status.dwControlsAccepted = state == SERVICE_RUNNING ?
-		SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0;
+		SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
+		(service->config.accept_preshutdown ? SERVICE_ACCEPT_PRESHUTDOWN : 0) : 0;
 	service->status.dwWin32ExitCode = error;
 	service->status.dwServiceSpecificExitCode = specific_error;
 	service->status.dwWaitHint = wait_hint;
@@ -200,7 +201,8 @@ static DWORD WINAPI fsf_service_control(DWORD control, DWORD event_type,
 	(void)event_type;
 	(void)event_data;
 	AcquireSRWLockExclusive(&service->state_lock);
-	if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN) {
+	if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN ||
+		control == SERVICE_CONTROL_PRESHUTDOWN) {
 		service->stop_requested = TRUE;
 		if (service->stop_event != NULL) SetEvent(service->stop_event);
 		if (service->status.dwCurrentState != SERVICE_STOPPED) {
@@ -607,7 +609,7 @@ DWORD fsf_service_install(const FSF_SERVICE_INSTALL_CONFIG *config)
 		config->display_name != NULL ? config->display_name : config->service_name,
 		SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS | DELETE,
 		SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, image,
-		NULL, NULL, NULL, NULL, NULL);
+		NULL, NULL, config->dependencies, NULL, NULL);
 	if (service == NULL) {
 		error = GetLastError();
 		if (error != ERROR_SERVICE_EXISTS) goto done;

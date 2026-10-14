@@ -29,7 +29,8 @@ memfs.exe --block --mount X: --size 8G --disk-size 64G --aim-ll D:\tools\aim_ll.
 
 | 参数 | 说明 |
 | --- | --- |
-| `--block` | 启用块设备模式（仅控制台运行，不能与服务命令或 `--mkdir` 组合） |
+| `--block` | 启用块设备模式；可在控制台运行，也可用 `--install` 安装为服务 |
+| `--mkdir <路径>` | 格式化并分配盘符后创建目录（可重复、可多级），例如给 TEMP 用的 `tmp` |
 | `--label` | 卷标，1～32 个字符，不能含空格（`aim_ll` 把格式化参数整体放在一对引号里传给 format） |
 | `--mount X:` | 盘符 |
 | `--size` | 固定值：可存储的数据上限（页数 × 4 KiB，实际内存另加 1%～3% 页头开销）；`auto`：随可用内存变化 |
@@ -42,6 +43,22 @@ memfs.exe --block --mount X: --size 8G --disk-size 64G --aim-ll D:\tools\aim_ll.
 | `--stop-event` | 命名事件，触发后正常卸载退出 |
 
 启动流程：创建内存存储 → 打开 `\\?\DevIoDrv\<名称>` 作为服务端 → `aim_ll -a -t file -o par,fix` 挂载并快速格式化 NTFS、分配盘符。停止时按设备号 `aim_ll -d -u <设备号>` 卸载（`aim_ll` 按挂载点查找设备号在卷卸下后会出错），再关闭服务端。
+
+## 以服务运行
+
+```powershell
+memfs.exe --install --block --service-name MemfsBlock --mount X: --size 8G --compress --mkdir tmp --aim-ll D:\tools\aim_ll.exe
+memfs.exe --uninstall --service-name MemfsBlock
+```
+
+- 服务以 LocalSystem 运行，开机自动（延迟）启动，盘符是全局的，提权程序也能看到。
+- 安装时把 `aim_ll` 解析为绝对路径写进服务命令行（LocalSystem 的 PATH 与安装者不同），并声明依赖 `deviodrv`、`phdskmnt` 两个驱动服务。
+- 挂载和格式化期间向 SCM 报告启动进度，盘可用（含 `--mkdir`）后才报告 RUNNING。
+- 停止时与控制台模式相同：按设备号卸盘，再关闭 DevIoDrv 服务端，从不取消挂起请求。服务接受 PRESHUTDOWN，关机时有足够时间卸盘。
+- 盘被外部卸下时服务以退出码 8 结束，SCM 故障恢复会在 1 秒后重启服务并重新挂载（实测约 2 秒恢复）。
+- 用作 TEMP 时建议固定 `--size`（`--disk-size` 不大于它），不要用 `auto`：内存不足时块设备只能返回 I/O 错误。
+
+2026-10-14 用独立服务名实测：安装、依赖、NTFS、`--mkdir`、硬链接、停止（约 260 ms，退出码 0，无残留设备）、再次启动、重启、外部卸盘后自动恢复、卸载均通过。尚未在真实关机/开机流程中验证。
 
 ## 内存与容量
 

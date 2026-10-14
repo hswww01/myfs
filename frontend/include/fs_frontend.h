@@ -75,6 +75,10 @@ typedef struct FSF_SERVICE_RUN_CONFIG {
 	PCWSTR authorized_user_sid;
 	void *app_context;
 	FSF_SERVICE_RUN_FN run;
+	/* Also stop on SERVICE_CONTROL_PRESHUTDOWN, which gives the service the
+	 * preshutdown timeout to finish instead of the few seconds SHUTDOWN
+	 * allows. For services whose stop must complete (e.g. a disk detach). */
+	BOOL accept_preshutdown;
 } FSF_SERVICE_RUN_CONFIG;
 
 /* Called by the product run callback on the SCM service-main thread. */
@@ -110,6 +114,8 @@ typedef struct FSF_SERVICE_INSTALL_CONFIG {
 	DWORD failure_reset_seconds;
 	DWORD failure_action_count;
 	const SC_ACTION *failure_actions;
+	/* Optional double-NUL-terminated list of services that must start first. */
+	PCWSTR dependencies;
 } FSF_SERVICE_INSTALL_CONFIG;
 
 /* Creates a LocalSystem automatic service, configures bounded recovery, and starts it. */

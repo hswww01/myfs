@@ -114,7 +114,8 @@ static void print_usage(const wchar_t* exe) {
              L"  --block                 Serve an NTFS-formatted virtual disk at --mount\n"
              L"                          (drive letter). Memory follows written data;\n"
              L"                          TRIM frees it. --size limits resident memory\n"
-             L"                          (auto: free memory). Console mode only.\n"
+             L"                          (auto: free memory). Works with --install /\n"
+             L"                          --service; --mkdir runs after formatting.\n"
              L"  --disk-size <bytes>     Virtual disk size. Default: --size, or total RAM\n"
              L"                          with --size auto. K/M/G/T suffix.\n"
              L"  --aim-ll <path>         aim_ll.exe; default next to memfs.exe, then PATH.\n"
@@ -320,10 +321,8 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
         fwprintf(stderr, L"--disk-size, --aim-ll, --block-name and --block-threads require --block.\n");
         return 2;
     }
-    if (config->block_mode &&
-        (config->service_mode || config->install_service || config->uninstall_service ||
-         config->uninstall_private_driver || config->initial_directory_count != 0)) {
-        fwprintf(stderr, L"--block runs in console mode and cannot be combined with service commands or --mkdir.\n");
+    if (config->block_mode && config->uninstall_private_driver) {
+        fwprintf(stderr, L"--block cannot be combined with --uninstall-private-driver.\n");
         return 2;
     }
 
@@ -529,8 +528,11 @@ static bool build_service_arguments(
     const MemfsRunConfig* config,
     PCWSTR log_file,
     PCWSTR authorized_user_sid,
+    PCWSTR aim_ll_path,
     wchar_t arguments[MEMFS_SERVICE_ARGUMENT_CAPACITY]) {
-    const wchar_t* parts[32 + 2 * MEMFS_MAX_INITIAL_DIRECTORIES];
+    const wchar_t* parts[48 + 2 * MEMFS_MAX_INITIAL_DIRECTORIES];
+    wchar_t disk_size_text[32];
+    wchar_t block_threads_text[16];
     wchar_t size_text[32];
     wchar_t threads_text[16];
     wchar_t compression_text[16];
@@ -557,11 +559,35 @@ static bool build_service_arguments(
                      L"%u", config->compression_level) < 0)
         return false;
 
+    if (_snwprintf_s(disk_size_text, _countof(disk_size_text), _TRUNCATE,
+                     L"%llu", (unsigned long long)config->disk_size) < 0 ||
+        _snwprintf_s(block_threads_text, _countof(block_threads_text), _TRUNCATE,
+                     L"%u", config->block_threads) < 0)
+        return false;
+
     arguments[0] = L'\0';
     count = 0;
     parts[count++] = L"--service";
     parts[count++] = L"--service-name";
     parts[count++] = config->service_name;
+    if (config->block_mode) {
+        /* LocalSystem's PATH differs from the installer's: pin aim_ll. */
+        parts[count++] = L"--block";
+        parts[count++] = L"--aim-ll";
+        parts[count++] = aim_ll_path;
+        if (config->disk_size != 0) {
+            parts[count++] = L"--disk-size";
+            parts[count++] = disk_size_text;
+        }
+        if (config->block_name != NULL) {
+            parts[count++] = L"--block-name";
+            parts[count++] = config->block_name;
+        }
+        if (config->block_threads != 0) {
+            parts[count++] = L"--block-threads";
+            parts[count++] = block_threads_text;
+        }
+    }
     parts[count++] = L"--mount";
     parts[count++] = config->mount_point;
     parts[count++] = L"--size";
@@ -619,12 +645,18 @@ static int install_memfs_service(const MemfsRunConfig* config) {
     wchar_t* executable = NULL;
     wchar_t* sid = NULL;
     wchar_t arguments[MEMFS_SERVICE_ARGUMENT_CAPACITY];
+    wchar_t aim_ll[MAX_PATH] = L"";
     DWORD error;
     int result = 1;
 
     if (!valid_service_name(config->service_name)) {
         fwprintf(stderr, L"Invalid service name.\n");
         return 2;
+    }
+    if (config->block_mode && !memfs_block_find_aim_ll(config->aim_ll_path, aim_ll, MAX_PATH)) {
+        fwprintf(stderr, L"aim_ll.exe (Arsenal Image Mounter command line) was not found. "
+                         L"Use --aim-ll <path> or place it next to memfs.exe.\n");
+        return 4;
     }
     log_file = config->log_file != NULL
         ? absolute_path_copy(config->log_file)
@@ -637,7 +669,7 @@ static int install_memfs_service(const MemfsRunConfig* config) {
                  GetLastError());
         goto done;
     }
-    if (!build_service_arguments(config, log_file, sid, arguments)) {
+    if (!build_service_arguments(config, log_file, sid, aim_ll, arguments)) {
         fwprintf(stderr, L"Service arguments exceed the Windows command-line limit.\n");
         goto done;
     }
@@ -646,8 +678,16 @@ static int install_memfs_service(const MemfsRunConfig* config) {
     install_config.struct_size = sizeof(install_config);
     install_config.abi_version = FS_FRONTEND_ABI_VERSION;
     install_config.service_name = config->service_name;
-    install_config.display_name = L"MemfsC volatile memory file system";
-    install_config.description = L"Mounts a volatile in-memory file system through WinFsp.";
+    if (config->block_mode) {
+        install_config.display_name = L"MemfsC volatile memory disk";
+        install_config.description =
+            L"Serves a volatile NTFS-formatted memory disk through Arsenal Image Mounter.";
+        /* The AIM miniport and DevIoDrv must be loaded before attaching. */
+        install_config.dependencies = L"deviodrv\0phdskmnt\0";
+    } else {
+        install_config.display_name = L"MemfsC volatile memory file system";
+        install_config.description = L"Mounts a volatile in-memory file system through WinFsp.";
+    }
     install_config.absolute_executable = executable;
     install_config.exact_service_arguments = arguments;
     install_config.log_path = log_file;
@@ -1066,6 +1106,46 @@ exit:
     return exit_code;
 }
 
+static void fill_block_config(const MemfsRunConfig* config, MemfsBlockRunConfig* block) {
+    memset(block, 0, sizeof(*block));
+    block->mount_point = config->mount_point;
+    block->volume_label = config->volume_label;
+    block->aim_ll_path = config->aim_ll_path;
+    block->object_name = config->block_name;
+    block->capacity = config->capacity;
+    block->capacity_auto = config->capacity_auto;
+    block->auto_reserve = config->auto_reserve;
+    block->disk_size = config->disk_size;
+    block->threads = config->block_threads;
+    block->compression_enabled = config->compression_enabled;
+    block->compression_level = (int)config->compression_level;
+    block->encryption_enabled = config->encryption_enabled;
+    if (config->have_fixed_key) {
+        block->encryption_key = config->encryption_key;
+        block->encryption_key_size = sizeof(config->encryption_key);
+    }
+    block->stats = config->stats_enabled;
+    block->stats_json = config->stats_json;
+    block->initial_directories = config->initial_directories;
+    block->initial_directory_count = config->initial_directory_count;
+}
+
+static bool block_service_progress(void* context, DWORD wait_hint_ms) {
+    DWORD error = ERROR_SUCCESS;
+    return fsf_service_report_start_progress((FSF_SERVICE*)context, wait_hint_ms, &error) != FALSE;
+}
+
+static bool block_service_ready(void* context) {
+    DWORD error = ERROR_SUCCESS;
+    FSF_SERVICE* service = (FSF_SERVICE*)context;
+
+    if (fsf_service_report_running(service, &error))
+        return true;
+    fsf_service_log(service, FSF_SERVICE_LOG_ERROR, error,
+        L"SCM rejected the RUNNING status after the block disk attached.");
+    return false;
+}
+
 static FSF_SERVICE_EXIT memfs_service_run(void* app_context, FSF_SERVICE* service) {
     MemfsRunConfig* config = (MemfsRunConfig*)app_context;
     FSF_SERVICE_EXIT result;
@@ -1074,6 +1154,27 @@ static FSF_SERVICE_EXIT memfs_service_run(void* app_context, FSF_SERVICE* servic
     memset(&result, 0, sizeof(result));
     if (config == NULL || stop_event == NULL) {
         set_service_win32_failure(&result, ERROR_INVALID_HANDLE);
+        return result;
+    }
+    if (config->block_mode) {
+        MemfsBlockRunConfig block;
+        int exit_code;
+
+        fill_block_config(config, &block);
+        block.callback_context = service;
+        block.report_progress = block_service_progress;
+        block.report_ready = block_service_ready;
+        exit_code = memfs_block_run(&block, stop_event);
+        memfs_cli_wipe_fixed_key(config->encryption_key, &config->have_fixed_key);
+        if (exit_code == 0) {
+            result.normal_stop = TRUE;
+        } else {
+            /* Non-zero: SCM failure actions restart the service. */
+            fsf_service_log(service, FSF_SERVICE_LOG_ERROR, (DWORD)exit_code,
+                L"memfs block disk stopped with an error (see exit code).");
+            result.win32_error = ERROR_SERVICE_SPECIFIC_ERROR;
+            result.service_specific_error = (DWORD)exit_code;
+        }
         return result;
     }
     (void)run_filesystem(config, stop_event, service, false, &result);
@@ -1117,6 +1218,8 @@ static int run_service(MemfsRunConfig* config) {
     service_config.authorized_user_sid = config->authorized_user_sid;
     service_config.app_context = config;
     service_config.run = memfs_service_run;
+    /* Detaching the disk must finish; SHUTDOWN alone allows a few seconds. */
+    service_config.accept_preshutdown = config->block_mode;
     error = fsf_service_run(&service_config, &service_result);
     free(log_file);
     if (error != ERROR_SUCCESS) {
@@ -1196,25 +1299,7 @@ int wmain(int argc, wchar_t** argv) {
             memfs_cli_wipe_fixed_key(g_config.encryption_key, &g_config.have_fixed_key);
             return 1;
         }
-        memset(&block, 0, sizeof(block));
-        block.mount_point = g_config.mount_point;
-        block.volume_label = g_config.volume_label;
-        block.aim_ll_path = g_config.aim_ll_path;
-        block.object_name = g_config.block_name;
-        block.capacity = g_config.capacity;
-        block.capacity_auto = g_config.capacity_auto;
-        block.auto_reserve = g_config.auto_reserve;
-        block.disk_size = g_config.disk_size;
-        block.threads = g_config.block_threads;
-        block.compression_enabled = g_config.compression_enabled;
-        block.compression_level = (int)g_config.compression_level;
-        block.encryption_enabled = g_config.encryption_enabled;
-        if (g_config.have_fixed_key) {
-            block.encryption_key = g_config.encryption_key;
-            block.encryption_key_size = sizeof(g_config.encryption_key);
-        }
-        block.stats = g_config.stats_enabled;
-        block.stats_json = g_config.stats_json;
+        fill_block_config(&g_config, &block);
         SetConsoleCtrlHandler(console_handler, TRUE);
         parse_result = memfs_block_run(&block, g_stop_event);
         SetConsoleCtrlHandler(console_handler, FALSE);
