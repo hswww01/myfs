@@ -402,9 +402,14 @@ MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offse
  * visited, so punching a huge sparse range is cheap. Caller serializes I/O
  * on the node exactly as for memfs_node_write. */
 MemfsResult memfs_node_punch_hole(MemfsNode* node, uint64_t offset, uint64_t length);
-/* Block-backing volumes: may `bytes` more resident page memory be used?
- * Fixed capacity limits resident bytes; auto capacity follows free memory. */
-bool memfs_block_capacity_allows(Memfs* fs, uint64_t bytes);
+/* Block-backing volumes: may `new_pages` more pages be stored on top of
+ * `stored_pages`? Fixed capacity limits stored data (pages x 4 KiB); auto
+ * capacity asks for each new page's worst-case memory. Overwrites of pages
+ * that already exist need no capacity. */
+bool memfs_block_capacity_allows(Memfs* fs, uint64_t stored_pages, uint64_t new_pages);
+/* Number of stored (non-zero) pages overlapping [offset, offset + length).
+ * Caller serializes against writers of the node. */
+uint64_t memfs_node_count_pages(MemfsNode* node, uint64_t offset, uint64_t length);
 
 MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR security, uint32_t security_size);
 

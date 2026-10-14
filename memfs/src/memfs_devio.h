@@ -33,7 +33,8 @@ typedef struct MemfsDevioStats {
 	uint64_t unmapped_bytes;
 	uint64_t errors;
 	bool connected;
-	bool closed;
+	bool closed;        /* no worker is serving anymore */
+	bool client_closed; /* the disk was detached by the client */
 } MemfsDevioStats;
 
 /* Opens the DevIoDrv server object and starts the exchange workers. Returns a
@@ -46,7 +47,8 @@ bool memfs_devio_path(const wchar_t* name, wchar_t* path, size_t path_count);
 /* Waits until the disk is attached (first request served), the client closed
  * or the timeout elapsed. */
 bool memfs_devio_wait_connected(MemfsDevio* devio, DWORD timeout_ms);
-/* Waits for the client to close the disk. */
+/* Waits until no worker serves anymore: the client closed the disk, the
+ * server was stopped, or every worker failed (see MemfsDevioStats). */
 bool memfs_devio_wait_closed(MemfsDevio* devio, DWORD timeout_ms);
 void memfs_devio_get_stats(MemfsDevio* devio, MemfsDevioStats* stats);
 /* Closes the server object (pending exchanges fail) and joins the workers.

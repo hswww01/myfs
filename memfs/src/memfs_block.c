@@ -12,10 +12,22 @@ typedef struct MemfsBlockStripe {
 struct MemfsBlock {
 	Memfs* fs;
 	uint64_t size;
+	/* Stored (non-zero) 4 KiB pages across all stripes; drives the capacity
+	 * check so overwrites of stored pages never need capacity. */
+	volatile LONG64 stored_pages;
 	uint32_t stripes;
 	uint32_t stripe_shift;
 	MemfsBlockStripe stripe[];
 };
+
+uint64_t memfs_block_stored_pages(const MemfsBlock* block) {
+	return block ? (uint64_t)InterlockedCompareExchange64((volatile LONG64*)&block->stored_pages, 0, 0) : 0;
+}
+
+/* Pages of the node range [offset, offset + length), counting partial ones. */
+static uint64_t memfs_block_span_pages(uint64_t offset, uint64_t length) {
+	return ((offset + length + MEMFS_PAGE_SIZE - 1U) >> MEMFS_PAGE_SHIFT) - (offset >> MEMFS_PAGE_SHIFT);
+}
 
 uint64_t memfs_block_size(const MemfsBlock* block) {
 	return block ? block->size : 0;
@@ -139,10 +151,34 @@ MemfsResult memfs_block_write(MemfsBlock* block, uint64_t offset, const void* bu
 
 	if (buffer == NULL || !memfs_block_range_ok(block, offset, length))
 		return MEMFS_ERR_INVALID;
-	/* Worst case every byte becomes a new resident page byte. Refusing up
-	 * front keeps a failed write from being half applied. */
-	if (!memfs_block_capacity_allows(block->fs, length))
-		return MEMFS_ERR_NO_SPACE;
+
+	/* Charge only pages the write would add: overwriting stored pages needs
+	 * no capacity, so a full disk keeps accepting rewrites (NTFS rewrites
+	 * its log and metadata in place). Refusing up front keeps a write that
+	 * is out of capacity from being half applied. */
+	{
+		uint64_t new_pages = 0;
+		uint64_t scan = offset;
+		uint32_t left = length;
+
+		while (left != 0) {
+			uint64_t node_offset;
+			uint64_t chunk_left;
+			MemfsBlockStripe* stripe = memfs_block_locate(block, scan, &node_offset, &chunk_left);
+			uint32_t part = (uint32_t)(chunk_left < left ? chunk_left : left);
+			uint64_t stored;
+
+			/* Exclusive: group lookups may update the node's position hint. */
+			AcquireSRWLockExclusive(&stripe->lock);
+			stored = memfs_node_count_pages(stripe->node, node_offset, part);
+			ReleaseSRWLockExclusive(&stripe->lock);
+			new_pages += memfs_block_span_pages(node_offset, part) - stored;
+			scan += part;
+			left -= part;
+		}
+		if (!memfs_block_capacity_allows(block->fs, memfs_block_stored_pages(block), new_pages))
+			return MEMFS_ERR_NO_SPACE;
+	}
 
 	while (length != 0) {
 		uint64_t node_offset;
@@ -153,7 +189,13 @@ MemfsResult memfs_block_write(MemfsBlock* block, uint64_t offset, const void* bu
 		MemfsResult result;
 
 		AcquireSRWLockExclusive(&stripe->lock);
-		result = memfs_node_write(stripe->node, in, node_offset, part, false, true, &done);
+		{
+			uint64_t before = memfs_node_count_pages(stripe->node, node_offset, part);
+
+			result = memfs_node_write(stripe->node, in, node_offset, part, false, true, &done);
+			InterlockedAdd64(&block->stored_pages,
+				(LONG64)memfs_node_count_pages(stripe->node, node_offset, part) - (LONG64)before);
+		}
 		ReleaseSRWLockExclusive(&stripe->lock);
 		if (result != MEMFS_OK)
 			return result;
@@ -165,6 +207,17 @@ MemfsResult memfs_block_write(MemfsBlock* block, uint64_t offset, const void* bu
 		length -= part;
 	}
 	return MEMFS_OK;
+}
+
+/* Punches a stripe range and keeps stored_pages in step. Stripe lock held. */
+static MemfsResult memfs_block_punch(MemfsBlock* block, MemfsBlockStripe* stripe, uint64_t node_offset,
+									 uint64_t length) {
+	uint64_t before = memfs_node_count_pages(stripe->node, node_offset, length);
+	MemfsResult result = memfs_node_punch_hole(stripe->node, node_offset, length);
+
+	InterlockedAdd64(&block->stored_pages,
+		(LONG64)memfs_node_count_pages(stripe->node, node_offset, length) - (LONG64)before);
+	return result;
 }
 
 MemfsResult memfs_block_unmap(MemfsBlock* block, uint64_t offset, uint64_t length) {
@@ -189,7 +242,7 @@ MemfsResult memfs_block_unmap(MemfsBlock* block, uint64_t offset, uint64_t lengt
 				stripe = memfs_block_locate(block, offset + ((uint64_t)i << MEMFS_BLOCK_CHUNK_SHIFT),
 											&node_offset, &chunk_left);
 				AcquireSRWLockExclusive(&stripe->lock);
-				result = memfs_node_punch_hole(stripe->node, node_offset, rounds << MEMFS_BLOCK_CHUNK_SHIFT);
+				result = memfs_block_punch(block, stripe, node_offset, rounds << MEMFS_BLOCK_CHUNK_SHIFT);
 				ReleaseSRWLockExclusive(&stripe->lock);
 				if (result != MEMFS_OK)
 					return result;
@@ -199,7 +252,7 @@ MemfsResult memfs_block_unmap(MemfsBlock* block, uint64_t offset, uint64_t lengt
 			stripe = memfs_block_locate(block, offset, &node_offset, &chunk_left);
 			part = chunk_left < length ? chunk_left : length;
 			AcquireSRWLockExclusive(&stripe->lock);
-			result = memfs_node_punch_hole(stripe->node, node_offset, part);
+			result = memfs_block_punch(block, stripe, node_offset, part);
 			ReleaseSRWLockExclusive(&stripe->lock);
 			if (result != MEMFS_OK)
 				return result;

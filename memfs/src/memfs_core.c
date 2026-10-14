@@ -4017,17 +4017,21 @@ MemfsResult memfs_node_set_file_size(MemfsNode* node, uint64_t new_size) {
 	return MEMFS_OK;
 }
 
-bool memfs_block_capacity_allows(Memfs* fs, uint64_t bytes) {
-	uint64_t resident;
-
+bool memfs_block_capacity_allows(Memfs* fs, uint64_t stored_pages, uint64_t new_pages) {
 	if (fs == NULL)
 		return false;
-	if (bytes == 0)
+	if (new_pages == 0)
 		return true;
+	/* Worst case per new page: a full page plus header, AEAD tag and the
+	 * allocator class it lands in (4224 bytes). */
 	if (fs->capacity_auto)
-		return memfs_auto_capacity_allows(fs, bytes);
-	resident = memfs_atomic_load_u64(&fs->resident_bytes);
-	return resident <= fs->capacity && bytes <= fs->capacity - resident;
+		return new_pages <= UINT64_MAX / (MEMFS_PAGE_SIZE + 128U) &&
+			   memfs_auto_capacity_allows(fs, new_pages * (MEMFS_PAGE_SIZE + 128U));
+	/* Fixed capacity counts stored data, not heap bytes: with a disk no larger
+	 * than the capacity the disk then fills before the capacity does, so
+	 * NTFS sees "disk full" and never a device error. */
+	return stored_pages <= fs->capacity / MEMFS_PAGE_SIZE &&
+		   new_pages <= fs->capacity / MEMFS_PAGE_SIZE - stored_pages;
 }
 
 MemfsResult memfs_node_punch_hole(MemfsNode* node, uint64_t offset, uint64_t length) {
@@ -4118,6 +4122,46 @@ MemfsResult memfs_node_punch_hole(MemfsNode* node, uint64_t offset, uint64_t len
 		position++;
 	}
 	return MEMFS_OK;
+}
+
+uint64_t memfs_node_count_pages(MemfsNode* node, uint64_t offset, uint64_t length) {
+	uint64_t end;
+	uint64_t first_page;
+	uint64_t end_page;
+	uint64_t count = 0;
+	uint32_t position;
+	bool found;
+
+	if (node == NULL || MEMFS_NODE_IS_DIRECTORY(node) || length == 0)
+		return 0;
+	end = offset + length;
+	if (end < offset || end > node->file_size)
+		end = node->file_size;
+	if (offset >= end)
+		return 0;
+	if (!node->paged_storage)
+		return node->small_page != NULL && offset < node->small_capacity ? 1U : 0U;
+
+	first_page = offset >> MEMFS_PAGE_SHIFT;
+	end_page = (end + MEMFS_PAGE_MASK) >> MEMFS_PAGE_SHIFT;
+	position = memfs_storage_group_position(node, first_page >> MEMFS_PAGE_GROUP_SHIFT, &found);
+	for (; position < memfs_storage_group_count(node); position++) {
+		uint64_t group_first = memfs_storage_group_index_at(node, position) << MEMFS_PAGE_GROUP_SHIFT;
+		const MemfsPageGroup* group = memfs_storage_group_at(node, position);
+		uint32_t slot = first_page > group_first ? (uint32_t)(first_page - group_first) : 0U;
+		uint32_t slot_end = end_page < group_first + MEMFS_PAGES_PER_GROUP
+			? (uint32_t)(end_page - group_first) : MEMFS_PAGES_PER_GROUP;
+
+		if (group_first >= end_page)
+			break;
+		if (slot == 0 && slot_end == MEMFS_PAGES_PER_GROUP) {
+			count += group->page_count;
+			continue;
+		}
+		for (; slot < slot_end; slot++)
+			count += memfs_group_has(group, slot) ? 1U : 0U;
+	}
+	return count;
 }
 
 MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint32_t length, uint32_t* bytes_read) {

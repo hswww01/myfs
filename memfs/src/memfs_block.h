@@ -10,8 +10,10 @@
  * authenticated encryption apply per page, and unmap frees pages at once.
  *
  * The Memfs instance must be created with MemfsOptions.block_backing so the
- * virtual extents are not charged to the quota; capacity then limits
- * resident page memory (fixed bytes, or free system memory in auto mode).
+ * virtual extents are not charged to the quota. A fixed capacity then limits
+ * stored data (pages x 4 KiB; heap use is 1-3% more for page headers), so a
+ * disk no larger than the capacity never runs out of it. Auto capacity
+ * follows free system memory.
  */
 
 #include <stdint.h>
@@ -32,11 +34,13 @@ MemfsResult memfs_block_create(Memfs* fs, uint64_t size, uint32_t stripes, Memfs
 void memfs_block_destroy(MemfsBlock* block);
 
 uint64_t memfs_block_size(const MemfsBlock* block);
+/* Stored (non-zero) 4 KiB pages; fixed capacity limits this times 4 KiB. */
+uint64_t memfs_block_stored_pages(const MemfsBlock* block);
 Memfs* memfs_block_fs(const MemfsBlock* block);
 
-/* Requests outside the disk return MEMFS_ERR_INVALID. Writes that would need
- * more resident memory than the capacity allows return MEMFS_ERR_NO_SPACE
- * before any data is changed. */
+/* Requests outside the disk return MEMFS_ERR_INVALID. Writes that would add
+ * more pages than the capacity allows return MEMFS_ERR_NO_SPACE before any
+ * data is changed; rewriting stored pages always fits. */
 MemfsResult memfs_block_read(MemfsBlock* block, uint64_t offset, void* buffer, uint32_t length);
 MemfsResult memfs_block_write(MemfsBlock* block, uint64_t offset, const void* buffer, uint32_t length);
 

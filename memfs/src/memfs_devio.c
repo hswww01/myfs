@@ -85,8 +85,13 @@ struct MemfsDevio {
 	MemfsBlock* block;
 	HANDLE device;
 	HANDLE connected_event;
+	/* Set when the last worker has exited. */
 	HANDLE closed_event;
 	volatile LONG stopping;
+	volatile LONG workers_alive;
+	/* The client side went away (CLOSE request or device gone), as opposed
+	 * to workers failing while the disk is still attached. */
+	volatile LONG client_closed;
 	uint32_t buffer_bytes;
 	uint32_t worker_count;
 	volatile LONG64 reads, writes, unmaps, read_bytes, written_bytes, unmapped_bytes, errors;
@@ -291,16 +296,24 @@ static DWORD WINAPI devio_worker_main(LPVOID parameter) {
 			((DevioBufferHeader*)buffer)->request_code = IMDPROXY_REQ_NULL;
 			continue;
 		}
-		if (error != ERROR_SUCCESS)
-			break; /* ERROR_DEV_NOT_EXIST: client gone; or handle closed on stop */
+		if (error != ERROR_SUCCESS) {
+			/* ERROR_DEV_NOT_EXIST: client gone; otherwise the handle was
+			 * closed on stop or the exchange failed. */
+			if (error == ERROR_DEV_NOT_EXIST)
+				InterlockedExchange(&devio->client_closed, 1);
+			break;
+		}
 
 		SetEvent(devio->connected_event);
-		if (!devio_serve(devio, buffer, size))
+		if (!devio_serve(devio, buffer, size)) {
+			InterlockedExchange(&devio->client_closed, 1);
 			break;
+		}
 	}
 
 done:
-	SetEvent(devio->closed_event);
+	if (InterlockedDecrement(&devio->workers_alive) == 0)
+		SetEvent(devio->closed_event);
 	/* Never cancel DevIoDrv requests: after the AIM disk is detached, the
 	 * driver's cancel routine dereferences a freed (NULL) queue and bugchecks
 	 * (DRIVER_IRQL_NOT_LESS_OR_EQUAL in deviodrv.sys, seen 2026-10-14). The
@@ -355,9 +368,11 @@ DWORD memfs_devio_start(MemfsBlock* block, const wchar_t* name, uint32_t threads
 	for (i = 0; i < threads; i++) {
 		devio->workers[i].devio = devio;
 		devio->workers[i].index = i;
+		InterlockedIncrement(&devio->workers_alive);
 		devio->workers[i].thread = CreateThread(NULL, 0, devio_worker_main, &devio->workers[i], 0, NULL);
 		if (devio->workers[i].thread == NULL) {
 			error = GetLastError();
+			InterlockedDecrement(&devio->workers_alive);
 			memfs_devio_stop(devio);
 			return error;
 		}
@@ -397,6 +412,7 @@ void memfs_devio_get_stats(MemfsDevio* devio, MemfsDevioStats* stats) {
 	stats->errors = (uint64_t)InterlockedCompareExchange64(&devio->errors, 0, 0);
 	stats->connected = WaitForSingleObject(devio->connected_event, 0) == WAIT_OBJECT_0;
 	stats->closed = WaitForSingleObject(devio->closed_event, 0) == WAIT_OBJECT_0;
+	stats->client_closed = InterlockedCompareExchange(&devio->client_closed, 0, 0) != 0;
 }
 
 void memfs_devio_stop(MemfsDevio* devio) {

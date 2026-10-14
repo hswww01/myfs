@@ -197,6 +197,48 @@ static void test_capacity(void) {
 	free(before);
 }
 
+/* Fixed capacity counts stored data: a disk exactly as large as the capacity
+ * can be filled completely (encrypted, so heap use exceeds the data), and
+ * rewriting stored pages on the full disk still succeeds. A disk filling up
+ * must surface as "disk full" in NTFS, never as a device error. */
+static void test_full_disk_rewrites(void) {
+	const uint64_t size = 16 * MIB;
+	Memfs* fs = create_fs(size, true, true);
+	MemfsBlock* block = NULL;
+	uint8_t* data = malloc(4 * MIB);
+	uint8_t* back = malloc(4 * MIB);
+	uint64_t offset;
+
+	CHECK(data && back);
+	CHECK(memfs_block_create(fs, size, 0, &block) == MEMFS_OK);
+	if (!data || !back || !block)
+		goto done;
+	for (offset = 0; offset < size; offset += 4 * MIB) {
+		fill_pattern(data, 4 * MIB, (uint32_t)(offset >> 20) + 1U);
+		CHECK(memfs_block_write(block, offset, data, (uint32_t)(4 * MIB)) == MEMFS_OK);
+	}
+	CHECK(memfs_block_stored_pages(block) == size / 4096U);
+	CHECK(memfs_resident_bytes(fs) > size); /* headers + AEAD tags */
+	for (offset = 0; offset < size; offset += 4 * MIB) {
+		fill_pattern(data, 4 * MIB, (uint32_t)(offset >> 20) + 100U);
+		CHECK(memfs_block_write(block, offset, data, (uint32_t)(4 * MIB)) == MEMFS_OK);
+		CHECK(memfs_block_read(block, offset, back, (uint32_t)(4 * MIB)) == MEMFS_OK &&
+			  memcmp(back, data, 4 * MIB) == 0);
+	}
+	/* Zeros free pages; their capacity is then available again. */
+	memset(data, 0, MIB);
+	CHECK(memfs_block_write(block, 0, data, (uint32_t)MIB) == MEMFS_OK);
+	CHECK(memfs_block_stored_pages(block) == (size - MIB) / 4096U);
+	CHECK(memfs_block_unmap(block, MIB, MIB) == MEMFS_OK);
+	CHECK(memfs_block_stored_pages(block) == (size - 2 * MIB) / 4096U);
+
+done:
+	memfs_block_destroy(block);
+	memfs_destroy(fs);
+	free(data);
+	free(back);
+}
+
 static void test_codecs(void) {
 	unsigned mode;
 
@@ -289,6 +331,7 @@ int main(void) {
 	test_sparse_round_trip();
 	test_unmap();
 	test_capacity();
+	test_full_disk_rewrites();
 	test_codecs();
 	test_concurrency();
 	if (failures) {

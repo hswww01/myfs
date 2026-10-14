@@ -133,7 +133,9 @@ static bool valid_label(const wchar_t* label) {
 	if (label == NULL || *label == 0 || wcslen(label) > 32)
 		return false;
 	for (p = label; *p; p++)
-		if (*p < 32 || wcschr(L"\"\\/:*?<>|", *p) != NULL)
+		/* No spaces: aim_ll passes the format options as one quoted
+		 * argument, so a label with a space cannot reach format's /v. */
+		if (*p <= 32 || wcschr(L"\"\\/:*?<>|", *p) != NULL)
 			return false;
 	return true;
 }
@@ -187,7 +189,7 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 		return 2;
 	}
 	if (!valid_label(config->volume_label)) {
-		fwprintf(stderr, L"--block needs a volume label of 1..32 characters without \\/:*?\"<>|.\n");
+		fwprintf(stderr, L"--block needs a volume label of 1..32 characters without spaces or \\/:*?\"<>|.\n");
 		return 2;
 	}
 	drive[0] = (wchar_t)towupper(config->mount_point[0]);
@@ -286,13 +288,24 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 			if (wait == WAIT_OBJECT_0)
 				break;
 			if (memfs_devio_wait_closed(devio, 0)) {
-				fwprintf(stderr, L"The disk was detached externally.\n");
-				attached = false;
+				MemfsDevioStats io;
+
+				memfs_devio_get_stats(devio, &io);
+				if (io.client_closed) {
+					fwprintf(stderr, L"The disk was detached externally.\n");
+					attached = false;
+				} else {
+					/* Workers failed while the disk is attached: detach it
+					 * below rather than leave a dead device behind. */
+					fwprintf(stderr, L"The block I/O workers stopped; detaching the disk.\n");
+					exit_code = 7;
+				}
 				break;
 			}
 		}
 	}
-	exit_code = 0;
+	if (exit_code != 7)
+		exit_code = 0;
 
 cleanup:
 	if (attached) {
