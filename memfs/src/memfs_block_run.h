@@ -14,7 +14,7 @@ typedef struct MemfsBlockRunConfig {
 	const wchar_t* object_name;     /* NULL: memfs-block-<pid> */
 	uint64_t capacity;              /* resident memory limit (fixed mode) */
 	bool capacity_auto;
-	uint64_t auto_reserve;
+	uint64_t reserve;               /* commit reserved at start (0: none) */
 	uint64_t disk_size;             /* 0: derived from capacity / RAM */
 	uint32_t threads;
 	bool compression_enabled;

@@ -282,7 +282,7 @@ static void test_reserve_survives_pressure(void) {
     m.ticks = 1000;
     memfs_test_capacity_set_hooks(&hooks);
     options.capacity_auto = true;
-    options.auto_reserve_bytes = reserve;
+    options.reserve_bytes = reserve;
     options.volume_label = L"RESERVE";
     CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
     if (fs == NULL) {

@@ -256,7 +256,7 @@ int memfs_block_run(const MemfsBlockRunConfig* config, HANDLE stop_event) {
 	memset(&options, 0, sizeof(options));
 	options.capacity = config->capacity;
 	options.capacity_auto = config->capacity_auto;
-	options.auto_reserve_bytes = config->capacity_auto ? config->auto_reserve : 0;
+	options.reserve_bytes = config->reserve;
 	options.volume_label = config->volume_label;
 	options.compression_enabled = config->compression_enabled;
 	options.compression_level = config->compression_level;

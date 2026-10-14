@@ -29,7 +29,9 @@ typedef struct MemfsRunConfig {
     const wchar_t* authorized_user_sid;
     uint64_t capacity;
     bool capacity_auto;
-    uint64_t auto_reserve;
+    /* Commit reserved at start; resolved after parsing unless --reserve. */
+    uint64_t reserve;
+    bool reserve_set;
     uint32_t thread_count;
     uint32_t compression_level;
     bool compression_enabled;
@@ -86,10 +88,10 @@ static void print_usage(const wchar_t* exe) {
              L"  --mount <path>          Drive letter or directory mount point.\n"
              L"  --size <bytes|auto>     Capacity 1..INT64_MAX; supports K/M/G suffix. Default: auto.\n"
              L"  --label <name>          Volume label. Default: MEMFS.\n"
-             L"  --reserve <bytes>       With --size auto: memory held from the start so\n"
-             L"                          this much can always be stored; the volume grows\n"
-             L"                          beyond it with free memory. K/M/G suffix; 0 off.\n"
-             L"                          Default: 1G.\n"
+             L"  --reserve <bytes>       Memory reserved (committed) at start so it can\n"
+             L"                          always be allocated later. K/M/G suffix; 0 off.\n"
+             L"                          Default: the --size capacity plus 1/16; 1G with\n"
+             L"                          --size auto (the volume grows beyond it).\n"
              L"  --mkdir <path>          Create a directory (relative to the volume root,\n"
              L"                          nested allowed) before mounting; repeatable.\n"
              L"  --threads <n>           Dispatcher threads: 0=automatic, otherwise 2..64.\n"
@@ -137,7 +139,6 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
     config->volume_label = L"MEMFS";
     config->service_name = MEMFS_SERVICE_NAME;
     config->capacity_auto = true;
-    config->auto_reserve = MEMFS_AUTO_DEFAULT_RESERVE_BYTES;
     config->compression_level = 1;
 
     for (i = 1; i < argc; i++) {
@@ -155,10 +156,11 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             config->volume_label = argv[++i];
         } else if (_wcsicmp(argv[i], L"--reserve") == 0 && i + 1 < argc) {
             bool reserve_auto = false;
+            config->reserve_set = true;
             if (wcscmp(argv[i + 1], L"0") == 0) {
-                config->auto_reserve = 0;
+                config->reserve = 0;
                 ++i;
-            } else if (!memfs_cli_parse_size(argv[++i], &config->auto_reserve, &reserve_auto) ||
+            } else if (!memfs_cli_parse_size(argv[++i], &config->reserve, &reserve_auto) ||
                        reserve_auto) {
                 fwprintf(stderr, L"Invalid --reserve value.\n");
                 return 2;
@@ -332,6 +334,12 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
         fwprintf(stderr, L"--mount is required.\n");
         return 2;
     }
+
+    /* Reserve the memory up front so it can always be allocated later:
+     * auto capacity 1 GiB, a fixed capacity all of it plus page overhead. */
+    if (!config->reserve_set)
+        config->reserve = config->capacity_auto ? MEMFS_AUTO_DEFAULT_RESERVE_BYTES
+                                                : memfs_fixed_default_reserve(config->capacity);
 
     return 0;
 }
@@ -554,7 +562,7 @@ static bool build_service_arguments(
                      L"%u", config->thread_count) < 0)
         return false;
     if (_snwprintf_s(reserve_text, _countof(reserve_text), _TRUNCATE,
-                     L"%llu", (unsigned long long)config->auto_reserve) < 0)
+                     L"%llu", (unsigned long long)config->reserve) < 0)
         return false;
     if (_snwprintf_s(compression_text, _countof(compression_text), _TRUNCATE,
                      L"%u", config->compression_level) < 0)
@@ -593,10 +601,8 @@ static bool build_service_arguments(
     parts[count++] = config->mount_point;
     parts[count++] = L"--size";
     parts[count++] = config->capacity_auto ? L"auto" : size_text;
-    if (config->capacity_auto) {
-        parts[count++] = L"--reserve";
-        parts[count++] = reserve_text;
-    }
+    parts[count++] = L"--reserve";
+    parts[count++] = reserve_text;
     parts[count++] = L"--label";
     parts[count++] = config->volume_label;
     parts[count++] = L"--threads";
@@ -908,7 +914,7 @@ static int run_filesystem(MemfsRunConfig* config,
     memset(&options, 0, sizeof(options));
     options.capacity = config->capacity;
     options.capacity_auto = config->capacity_auto;
-    options.auto_reserve_bytes = config->capacity_auto ? config->auto_reserve : 0;
+    options.reserve_bytes = config->reserve;
     options.volume_label = config->volume_label;
     options.compression_enabled = config->compression_enabled;
     options.compression_level = (int)config->compression_level;
@@ -1115,7 +1121,7 @@ static void fill_block_config(const MemfsRunConfig* config, MemfsBlockRunConfig*
     block->object_name = config->block_name;
     block->capacity = config->capacity;
     block->capacity_auto = config->capacity_auto;
-    block->auto_reserve = config->auto_reserve;
+    block->reserve = config->reserve;
     block->disk_size = config->disk_size;
     block->threads = config->block_threads;
     block->compression_enabled = config->compression_enabled;

@@ -3197,8 +3197,8 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 		memfs_allocator_free_control(fs, sizeof(*fs));
 		return MEMFS_ERR_NO_MEMORY;
 	}
-	if (options->capacity_auto && options->auto_reserve_bytes != 0 &&
-		!memfs_allocator_set_reserve(&fs->allocator, options->auto_reserve_bytes)) {
+	if (options->reserve_bytes != 0 &&
+		!memfs_allocator_set_reserve(&fs->allocator, options->reserve_bytes)) {
 		memfs_allocator_destroy(&fs->allocator);
 		memfs_allocator_free_control(fs, sizeof(*fs));
 		return MEMFS_ERR_NO_SPACE;

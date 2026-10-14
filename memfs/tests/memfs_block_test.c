@@ -1,6 +1,7 @@
 /* Block-device store: sparse striping, unmap/TRIM reclaim, resident-memory
  * capacity, compression/encryption round trips and concurrent I/O. */
 #include "memfs_block.h"
+#include "memfs_alloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +240,43 @@ done:
 	free(back);
 }
 
+/* A fixed capacity reserves its memory at start: the reserve shrinks as
+ * pages are stored and refills after they are unmapped. */
+static void test_fixed_reserve(void) {
+	const uint64_t capacity = 64 * MIB;
+	const uint64_t reserve = memfs_fixed_default_reserve(capacity);
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsBlock* block = NULL;
+	uint8_t* data = malloc(8 * MIB);
+	uint64_t start;
+
+	options.capacity = capacity;
+	options.reserve_bytes = reserve;
+	options.volume_label = L"BLOCK-RESERVE";
+	options.block_backing = true;
+	CHECK(data != NULL);
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	if (fs == NULL || data == NULL)
+		goto done;
+	start = memfs_allocator_reserve_available(&fs->allocator);
+	CHECK(start > reserve - 2 * MIB && start <= reserve);
+	CHECK(memfs_block_create(fs, capacity, 0, &block) == MEMFS_OK);
+	if (block == NULL)
+		goto done;
+	fill_pattern(data, 8 * MIB, 77);
+	CHECK(memfs_block_write(block, 0, data, (uint32_t)(8 * MIB)) == MEMFS_OK);
+	CHECK(memfs_allocator_reserve_available(&fs->allocator) < start - 7 * MIB);
+	CHECK(memfs_block_unmap(block, 0, capacity) == MEMFS_OK);
+	(void)memfs_allocator_scavenge(&fs->allocator);
+	CHECK(memfs_allocator_reserve_available(&fs->allocator) > start - 3 * MIB);
+
+done:
+	memfs_block_destroy(block);
+	memfs_destroy(fs);
+	free(data);
+}
+
 static void test_codecs(void) {
 	unsigned mode;
 
@@ -332,6 +370,7 @@ int main(void) {
 	test_unmap();
 	test_capacity();
 	test_full_disk_rewrites();
+	test_fixed_reserve();
 	test_codecs();
 	test_concurrency();
 	if (failures) {
