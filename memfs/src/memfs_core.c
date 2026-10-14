@@ -6,7 +6,14 @@
 #include <sodium.h>
 #include <zstd.h>
 
-#define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
+/* Shared temporary-directory policy. Authenticated users may create entries
+ * here, but cannot delete other users' entries or rewrite this directory's
+ * DACL. Only SYSTEM, administrators and the creator inherit file access.
+ * The internal NULL-security create path also uses this template for --mkdir
+ * bootstrap directories; ordinary WinFsp creates supply a caller-derived SD. */
+#define MEMFS_DEFAULT_SDDL \
+	L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" \
+	L"(A;OICIIO;FA;;;CO)(A;;0x1201bf;;;AU)"
 
 _Static_assert((MEMFS_COMPRESSION_CONTEXT_LANES & (MEMFS_COMPRESSION_CONTEXT_LANES - 1U)) == 0,
 	"compression context lane count must be a power of two");
@@ -22,23 +29,32 @@ _Static_assert(sizeof(MemfsStorageMeta) == 16,
 	"MemfsStorageMeta must stay in the allocator 16-byte size class");
 #endif
 
+MemfsNode* memfs_node_metadata(MemfsNode* node) {
+    return node != NULL && node->named_stream ? node->parent : node;
+}
+
 MemfsSecurity* memfs_node_get_security(MemfsNode* node) {
-	return node ? node->security : NULL;
+    node = memfs_node_metadata(node);
+    return node ? node->security : NULL;
 }
 
 uint64_t memfs_node_get_creation_time(const MemfsNode* node) {
+	node = memfs_node_metadata((MemfsNode*)node);
 	return node ? node->creation_time : 0;
 }
 
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node) {
+	node = memfs_node_metadata((MemfsNode*)node);
 	return node ? node->last_access_time : 0;
 }
 
 uint64_t memfs_node_get_last_write_time(const MemfsNode* node) {
+	node = memfs_node_metadata((MemfsNode*)node);
 	return node ? node->last_write_time : 0;
 }
 
 uint64_t memfs_node_get_change_time(const MemfsNode* node) {
+	node = memfs_node_metadata((MemfsNode*)node);
 	return node ? node->change_time : 0;
 }
 
@@ -63,21 +79,25 @@ uint64_t memfs_node_index_number(const MemfsNode* node) {
 }
 
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
+	node = memfs_node_metadata(node);
 	if (node)
 		node->creation_time = value;
 }
 
 void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value) {
+	node = memfs_node_metadata(node);
 	if (node)
 		node->last_access_time = value;
 }
 
 void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value) {
+	node = memfs_node_metadata(node);
 	if (node)
 		node->last_write_time = value;
 }
 
 void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
+	node = memfs_node_metadata(node);
 	if (node)
 		node->change_time = value;
 }
@@ -2320,11 +2340,13 @@ static MemfsResult memfs_storage_write_range(MemfsNode* node, const uint8_t* buf
 }
 static void memfs_node_free(MemfsNode* node) {
 	Memfs* fs;
+	MemfsNode* stream_owner;
 
 	if (node == NULL)
 		return;
 
 	fs = node->fs;
+	stream_owner = node->named_stream ? node->parent : NULL;
 
 	if (MEMFS_NODE_IS_DIRECTORY(node)) {
 		memfs_dir_destroy(node->dir);
@@ -2334,10 +2356,13 @@ static void memfs_node_free(MemfsNode* node) {
 	}
 
 	memfs_atomic_sub_clamped(&fs->used_bytes, node->file_size);
-	memfs_security_release(node->security);
+	if (!node->named_stream)
+		memfs_security_release(node->security);
 
 	memfs_object_free_name(fs, node->name);
 	memfs_object_free_node(fs, node);
+	if (stream_owner != NULL && !fs->destroying)
+		memfs_node_close(stream_owner);
 }
 static void memfs_dir_remove(MemfsNode* node);
 
@@ -2386,14 +2411,28 @@ static void memfs_destroy_namespace_tree(MemfsNode* root) {
 }
 
 static MemfsResult memfs_security_create(MemfsAllocator* allocator, PSECURITY_DESCRIPTOR security, MemfsSecurity** out_security) {
-	uint32_t size;
+	DWORD size, revision;
+	SECURITY_DESCRIPTOR_CONTROL control;
 	MemfsSecurity* shared;
 
-	if (allocator == NULL || security == NULL || out_security == NULL)
+	if (out_security != NULL)
+		*out_security = NULL;
+	if (allocator == NULL || security == NULL || out_security == NULL ||
+		!IsValidSecurityDescriptor(security) ||
+		!GetSecurityDescriptorControl(security, &control, &revision))
 		return MEMFS_ERR_INVALID;
 
-	size = GetSecurityDescriptorLength(security);
-	if (size == 0)
+	/* An absolute SD contains borrowed pointers. Never memcpy those into
+	 * persistent node storage: normalize to one self-contained allocation. */
+	if (control & SE_SELF_RELATIVE) {
+		size = GetSecurityDescriptorLength(security);
+	} else {
+		size = 0;
+		if (MakeSelfRelativeSD(security, NULL, &size) ||
+			GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+			return MEMFS_ERR_INVALID;
+	}
+	if (size < sizeof(SECURITY_DESCRIPTOR_RELATIVE))
 		return MEMFS_ERR_INVALID;
 
 	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SECURITY))
@@ -2406,7 +2445,12 @@ static MemfsResult memfs_security_create(MemfsAllocator* allocator, PSECURITY_DE
 	shared->ref_count = 1;
 	shared->size = size;
 	shared->owner = allocator;
-	memcpy(shared->data, security, size);
+	if (control & SE_SELF_RELATIVE) {
+		memcpy(shared->data, security, size);
+	} else if (!MakeSelfRelativeSD(security, shared->data, &size)) {
+		memfs_allocator_free(allocator, shared, sizeof(*shared) + shared->size);
+		return MEMFS_ERR_INVALID;
+	}
 
 	*out_security = shared;
 	return MEMFS_OK;
@@ -2430,9 +2474,12 @@ static void memfs_security_release(MemfsSecurity* security) {
 }
 
 static bool memfs_security_equal(const MemfsSecurity* shared, PSECURITY_DESCRIPTOR security) {
-	uint32_t size;
+	DWORD size, revision;
+	SECURITY_DESCRIPTOR_CONTROL control;
 
-	if (shared == NULL || security == NULL)
+	if (shared == NULL || security == NULL || !IsValidSecurityDescriptor(security) ||
+		!GetSecurityDescriptorControl(security, &control, &revision) ||
+		!(control & SE_SELF_RELATIVE))
 		return false;
 
 	size = GetSecurityDescriptorLength(security);
@@ -3311,6 +3358,16 @@ void memfs_destroy(Memfs* fs) {
 	if (fs == NULL)
 		return;
 
+    /* Quiescent teardown: streams can pin both linked and orphan owners.
+     * Drain the index before freeing owners, and suppress pin releases while
+     * destroying so orphan order never dereferences an already-freed owner. */
+    fs->destroying = true;
+    for (unsigned i = 0; i < 64; ++i) {
+        while ((node = fs->stream_buckets[i]) != NULL) {
+            fs->stream_buckets[i] = node->tree_left;
+            memfs_node_free(node);
+        }
+    }
 	node = fs->root;
 	fs->root = NULL;
 	memfs_destroy_namespace_tree(node);
@@ -3482,6 +3539,39 @@ static MemfsResult memfs_lookup_path_span(Memfs* fs,
 	return MEMFS_OK;
 }
 
+static MemfsResult memfs_stream_path_parts(Memfs* fs, const wchar_t* path,
+    MemfsNode** owner, wchar_t name[MEMFS_MAX_NAME + 1], bool* named) {
+    const wchar_t* colon = path != NULL ? wcschr(path, L':') : NULL;
+    const wchar_t* end;
+    const wchar_t* type;
+    size_t chars;
+    *owner = NULL;
+    name[0] = L'\0';
+    *named = false;
+    if (colon == NULL || wcschr(colon, L'\\') != NULL || wcschr(colon, L'/') != NULL)
+        return MEMFS_ERR_INVALID;
+    type = wcschr(colon + 1, L':');
+    if (type != NULL && _wcsicmp(type, L":$DATA") != 0)
+        return MEMFS_ERR_INVALID;
+    end = type != NULL ? type : path + wcslen(path);
+    chars = (size_t)(end - colon - 1);
+    if (chars > MEMFS_MAX_NAME || (chars == 0 && type == NULL))
+        return MEMFS_ERR_INVALID;
+    memcpy(name, colon + 1, chars * sizeof(wchar_t));
+    name[chars] = L'\0';
+    *named = chars != 0;
+    return memfs_lookup_path_span(fs, path, colon, owner);
+}
+
+MemfsResult memfs_lookup_stream_parent(Memfs* fs, const wchar_t* path,
+    MemfsNode** owner, wchar_t name[MEMFS_MAX_NAME + 1]) {
+    bool named;
+    MemfsResult result;
+    if (owner == NULL || name == NULL) return MEMFS_ERR_INVALID;
+    result = memfs_stream_path_parts(fs, path, owner, name, &named);
+    return result != MEMFS_OK ? result : named ? MEMFS_OK : MEMFS_ERR_INVALID;
+}
+
 MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_node) {
 	const wchar_t* end;
 
@@ -3490,6 +3580,15 @@ MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_no
 	if (fs == NULL || path == NULL || out_node == NULL || path[0] != L'\\')
 		return MEMFS_ERR_INVALID;
 
+    if (wcschr(path, L':') != NULL) {
+        MemfsNode* owner;
+        wchar_t name[MEMFS_MAX_NAME + 1];
+        bool named;
+        MemfsResult result = memfs_stream_path_parts(fs, path, &owner, name, &named);
+        if (result != MEMFS_OK) return result;
+        *out_node = named ? memfs_stream_lookup(owner, name) : owner;
+        return *out_node != NULL ? MEMFS_OK : MEMFS_ERR_NOT_FOUND;
+    }
 	end = path + wcslen(path);
 	return memfs_lookup_path_span(fs, path, end, out_node);
 }
@@ -3557,7 +3656,7 @@ static bool memfs_component_name_valid(const wchar_t* name) {
 	while (name[length] != L'\0') {
 		if (length >= MEMFS_MAX_NAME)
 			return false;
-		if (name[length] == L'\\' || name[length] == L'/')
+		if (name[length] == L'\\' || name[length] == L'/' || name[length] == L':')
 			return false;
 		length++;
 	}
@@ -3651,6 +3750,122 @@ static void memfs_node_retire_unlinked(MemfsNode* node) {
 		memfs_node_free(node);
 }
 
+static unsigned memfs_stream_bucket(MemfsNode* owner) {
+    return (unsigned)(memfs_mix64((uint64_t)(uintptr_t)owner) & 63U);
+}
+
+MemfsNode* memfs_stream_first(MemfsNode* owner) {
+    MemfsNode* node;
+    owner = memfs_node_metadata(owner);
+    if (owner == NULL) return NULL;
+    for (node = owner->fs->stream_buckets[memfs_stream_bucket(owner)];
+         node != NULL; node = node->tree_left)
+        if (node->parent == owner) return node;
+    return NULL;
+}
+
+MemfsNode* memfs_stream_next(MemfsNode* stream) {
+    MemfsNode* node;
+    if (stream == NULL || !stream->named_stream || stream->deleted) return NULL;
+    for (node = stream->tree_left; node != NULL; node = node->tree_left)
+        if (node->parent == stream->parent) return node;
+    return NULL;
+}
+
+MemfsNode* memfs_stream_lookup(MemfsNode* owner, const wchar_t* name) {
+    if (owner == NULL || name == NULL || owner->deleted) return NULL;
+    for (MemfsNode* node = memfs_stream_first(owner); node; node = memfs_stream_next(node))
+        if (memfs_name_compare(node->name, name) == 0) return node;
+    return NULL;
+}
+
+static bool memfs_stream_name_valid(const wchar_t* name) {
+    size_t size = name != NULL ? wcslen(name) : 0;
+    if (size == 0 || size > MEMFS_MAX_NAME) return false;
+    for (size_t i = 0; i < size; ++i)
+        if (name[i] == L':' || name[i] == L'\\' || name[i] == L'/') return false;
+    return true;
+}
+
+MemfsResult memfs_stream_create(MemfsNode* owner, const wchar_t* name,
+    uint64_t allocation_size, MemfsNode** out_node) {
+    MemfsNode* node;
+    MemfsResult result;
+    if (out_node != NULL) *out_node = NULL;
+    if (owner == NULL || owner->named_stream || owner->deleted ||
+        out_node == NULL || !memfs_stream_name_valid(name)) return MEMFS_ERR_INVALID;
+    if (memfs_stream_lookup(owner, name)) return MEMFS_ERR_EXISTS;
+    result = memfs_node_alloc(owner->fs, owner, name, false, FILE_ATTRIBUTE_NORMAL, NULL, &node);
+    if (result != MEMFS_OK) return result;
+    result = memfs_resize_allocation(node, allocation_size);
+    if (result != MEMFS_OK) { memfs_node_free(node); return result; }
+    /* A stream shares the CURRENT base SD, not a retained obsolete copy. */
+    memfs_security_release(node->security);
+    node->security = NULL;
+    node->named_stream = true;
+    node->stream_active_opens = 1;
+    node->parent = owner;
+    node->open_count = 1;
+    memfs_node_open(owner);
+    unsigned bucket = memfs_stream_bucket(owner);
+    node->tree_left = owner->fs->stream_buckets[bucket];
+    owner->fs->stream_buckets[bucket] = node;
+    memfs_node_set_change_time(owner, memfs_now());
+    *out_node = node;
+    return MEMFS_OK;
+}
+
+static void memfs_stream_unlink(MemfsNode* node) {
+    MemfsNode* owner = node->parent;
+    MemfsNode** cursor = &node->fs->stream_buckets[memfs_stream_bucket(owner)];
+    while (*cursor != NULL && *cursor != node) cursor = &(*cursor)->tree_left;
+    if (*cursor != node) return;
+    *cursor = node->tree_left;
+    node->tree_left = node->tree_right = node->tree_parent = NULL;
+    memfs_node_set_change_time(owner, memfs_now());
+    memfs_node_retire_unlinked(node);
+}
+
+void memfs_stream_unlink_all(MemfsNode* owner, bool only_closed) {
+    MemfsNode* node;
+    if (owner == NULL || owner->named_stream) return;
+    node = memfs_stream_first(owner);
+    while (node != NULL) {
+        MemfsNode* next = memfs_stream_next(node);
+        bool remove = true;
+        if (only_closed) {
+            AcquireSRWLockShared(&owner->fs->lifetime_lock);
+            /* Close can be delayed after the final user handle closes.
+             * FINE + owner I/O guard serializes this with stream Cleanup.
+             * Core-only callers still use open_count without a frontend. */
+            remove = node->open_count == 0 ||
+                InterlockedCompareExchange(&node->stream_active_opens, 0, 0) == 0;
+            ReleaseSRWLockShared(&owner->fs->lifetime_lock);
+        }
+        if (remove) memfs_stream_unlink(node);
+        node = next;
+    }
+}
+
+MemfsResult memfs_stream_rename(MemfsNode* node, MemfsNode* owner,
+    const wchar_t* name, bool replace) {
+    MemfsNode* existing;
+    wchar_t* copy;
+    if (node == NULL || !node->named_stream || node->deleted || owner == NULL ||
+        owner != node->parent || owner->deleted || !memfs_stream_name_valid(name))
+        return MEMFS_ERR_INVALID;
+    existing = memfs_stream_lookup(owner, name);
+    if (existing != NULL && existing != node && !replace) return MEMFS_ERR_EXISTS;
+    copy = memfs_object_dup_name(node->fs, name);
+    if (copy == NULL) return MEMFS_ERR_NO_MEMORY;
+    if (existing != NULL && existing != node) memfs_stream_unlink(existing);
+    memfs_object_free_name(node->fs, node->name);
+    node->name = copy;
+    node->name_hash = memfs_name_hash(copy);
+    memfs_node_set_change_time(owner, memfs_now());
+    return MEMFS_OK;
+}
+
 bool memfs_node_is_directory(const MemfsNode* node) {
 	return MEMFS_NODE_IS_DIRECTORY(node);
 }
@@ -3670,9 +3885,14 @@ MemfsResult memfs_node_unlink(MemfsNode* node) {
 		return MEMFS_ERR_ACCESS;
 	if (node->deleted)
 		return MEMFS_OK;
+	if (node->named_stream) {
+		memfs_stream_unlink(node);
+		return MEMFS_OK;
+	}
 	if (MEMFS_NODE_IS_DIRECTORY(node) && node->dir->child_count)
 		return MEMFS_ERR_NOT_EMPTY;
 
+	memfs_stream_unlink_all(node, false);
 	parent = node->parent;
 	memfs_dir_remove(node);
 	memfs_node_set_change_time(node, memfs_now());
@@ -3687,7 +3907,7 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 	MemfsNode* old_parent;
 	wchar_t* new_name_copy;
 
-	if (node == NULL || node->fs == NULL || !MEMFS_NODE_IS_DIRECTORY(new_parent) ||
+	if (node == NULL || node->fs == NULL || node->named_stream || !MEMFS_NODE_IS_DIRECTORY(new_parent) ||
 		new_parent->fs != node->fs || node->deleted || new_parent->deleted ||
 		!memfs_component_name_valid(new_name)) {
 		return MEMFS_ERR_INVALID;
@@ -3717,6 +3937,7 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 	if (existing && existing != node) {
 		MemfsNode* existing_parent = existing->parent;
 
+		memfs_stream_unlink_all(existing, false);
 		memfs_dir_remove(existing);
 		memfs_touch_directory(existing_parent);
 		memfs_node_retire_unlinked(existing);
@@ -3901,7 +4122,7 @@ MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offse
 	memfs_node_set_last_write_time(node, memfs_now());
 	memfs_node_set_change_time(node, memfs_node_get_last_write_time(node));
 	/* NORMAL is only valid alone. */
-	node->attributes = (node->attributes & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_ARCHIVE;
+	memfs_node_metadata(node)->attributes = (memfs_node_metadata(node)->attributes & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_ARCHIVE;
 	return MEMFS_OK;
 }
 
@@ -3910,7 +4131,9 @@ MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR se
 	MemfsSecurity* old;
 	MemfsResult result;
 
-	if (node == NULL || security == NULL || security_size == 0) {
+	node = memfs_node_metadata(node);
+	if (node == NULL || security == NULL || security_size == 0 ||
+		!IsValidSecurityDescriptor(security)) {
 		return MEMFS_ERR_INVALID;
 	}
 

@@ -1,8 +1,10 @@
 param(
     [string]$WinFspRepo = "D:\src\winfsp",
-    [string]$Worktree = "D:\src\winfsp-memfs-static",
+    [string]$Worktree = "D:\src\winfsp-memfs-2.2B5-private-092109",
     [string]$DriverPath = "",
-    [string[]]$Configurations = @("Debug", "Release")
+    [string[]]$Configurations = @("Debug", "Release"),
+    [ValidatePattern('^[A-Za-z0-9_]{1,32}$')][string]$PrivateDriverIdent = "MemfsC",
+    [Alias("RecreateWorktree")][switch]$ReplaceWorktree
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,10 +66,15 @@ if (-not (Test-Path (Join-Path $WinFspRepo ".git"))) {
 }
 
 if (-not $DriverPath) {
-    $DriverPath = Find-WinFspDriver
+    $DriverPath = Join-Path $PSScriptRoot '..\dist\winfsp-2.2.26286-beta5\drivers\winfsp-x64.sys'
 }
 $DriverPath = (Resolve-Path $DriverPath).Path
 
+$signature = Get-AuthenticodeSignature -FilePath $DriverPath
+if ($signature.Status -ne 'Valid' -or
+    $signature.SignerCertificate.Subject -notmatch 'CN=Microsoft Windows Hardware Compatibility Publisher') {
+    throw "Expected an authentic Microsoft-signed WinFsp driver: $DriverPath"
+}
 $version = (Get-Item $DriverPath).VersionInfo.FileVersion
 if ($version -notmatch '^([0-9]+)\.([0-9]+)\..*\.([0-9a-fA-F]{7,40})$') {
     throw "Cannot derive WinFsp source commit from driver FileVersion '$version'."
@@ -113,6 +120,9 @@ if (Test-Path -LiteralPath $Worktree) {
         throw "Refusing to remove unregistered directory at Worktree path: $Worktree"
     }
 
+    if (-not $ReplaceWorktree) {
+        throw "Worktree already exists; choose a new path or explicitly pass -ReplaceWorktree after preserving changes: $Worktree"
+    }
     & git -C $WinFspRepo worktree remove --force $Worktree
     if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $Worktree)) {
         throw "Git could not safely remove registered worktree: $Worktree"
@@ -148,6 +158,25 @@ if ($util -notmatch 'WINFSP_STATIC_VERSION') {
     $util = $util.Replace($pattern, $block)
     [IO.File]::WriteAllText($utilPath, $util, [Text.UTF8Encoding]::new($false))
 }
+
+# A static EXE has no .sxs DLL sidecar. Pin ALL driver/device/version
+# selection to the product-owned signed embedded driver, never the global
+# best-guess service enumeration (which can pick an old installed WinFsp).
+$sxsPath = Join-Path $Worktree "src\dll\sxs.c"
+$sxs = [IO.File]::ReadAllText($sxsPath)
+$needle = "static BOOL WINAPI FspSxsIdentInitialize(`n    PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)`n{"
+$normalized = $sxs.Replace("`r`n", "`n")
+if (-not $normalized.Contains($needle)) { throw 'Cannot locate SxS initializer.' }
+$replacement = $needle + "`n#if defined(WINFSP_STATIC) /* MEMFS_STATIC_PRIVATE_DRIVER */`n    lstrcpyW(FspSxsIdentBuf, L`"+$PrivateDriverIdent`");`n    return TRUE;`n#endif`n"
+$normalized = $normalized.Replace($needle, $replacement)
+[IO.File]::WriteAllText($sxsPath, $normalized, [Text.UTF8Encoding]::new($false))
+
+# MSVC accepts the prototype-scope fuse_args tags, but clang-cl correctly
+# treats them as different C types in the internal FUSE3 shim.
+$fusePath = Join-Path $Worktree "inc\fuse3\fuse_common.h"
+$fuse = [IO.File]::ReadAllText($fusePath)
+$fuse = $fuse.Replace('struct fuse3_session;', "struct fuse_args;`nstruct fuse3_session;")
+[IO.File]::WriteAllText($fusePath, $fuse, [Text.UTF8Encoding]::new($false))
 
 $vsDir = Join-Path $Worktree "build\VStudio"
 $srcProject = Join-Path $vsDir "winfsp_dll.vcxproj"
@@ -195,12 +224,17 @@ if (-not $msbuild -or -not (Test-Path $msbuild)) {
     throw "MSBuild not found."
 }
 
-foreach ($configuration in $Configurations) {
-    & $msbuild $dstProject /m /p:Configuration=$configuration /p:Platform=x64 /v:minimal
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinFsp static build failed: $configuration|x64"
+# Upstream MSVC builds use 32-bit DWORD/UINT32 interchangeably in output
+# parameters. Retain that diagnostic as a warning in third-party code, as
+# MSVC does, rather than modifying the upstream security/IO implementation.
+$savedCl = $env:CL
+try {
+    $env:CL = ($savedCl + ' /clang:-Wno-error=incompatible-pointer-types').Trim()
+    foreach ($configuration in $Configurations) {
+        & $msbuild $dstProject /m /p:Configuration=$configuration /p:Platform=x64 /p:PlatformToolset=ClangCL /v:minimal
+        if ($LASTEXITCODE -ne 0) { throw "WinFsp static build failed: $configuration|x64" }
     }
-}
+} finally { $env:CL = $savedCl }
 
 $arch = "x64"
 

@@ -212,6 +212,8 @@ static void test_volume_reports(void) {
     CHECK(params.MaxComponentLength == MEMFS_MAX_NAME);
     CHECK(!params.CaseSensitiveSearch && params.CasePreservedNames);
     CHECK(params.SectorSize == MEMFS_ALLOCATION_UNIT);
+    CHECK(params.PersistentAcls);
+    CHECK(wcscmp(params.FileSystemName, L"NTFS") == 0);
 
     CHECK(memfs_create(capacity, L"FIXED", &store) == MEMFS_OK);
     if (store == NULL)

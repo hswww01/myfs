@@ -14,19 +14,24 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $Drive = $Drive.TrimEnd('\')
 if ($Drive -notmatch '^[A-Za-z]:$') { throw "Drive must be a drive-letter root such as W:." }
+# Coordinate test mounts across separate CTest/build invocations.
+$testMutex = [Threading.Mutex]::new($false, ('Local\MemfsTestDrive-' + $Drive.Substring(0,1).ToUpperInvariant()))
+$ownsTestMutex = $false
+try {
+    try { $ownsTestMutex = $testMutex.WaitOne(60000) }
+    catch [Threading.AbandonedMutexException] { $ownsTestMutex = $true }
+    if (-not $ownsTestMutex) { throw 'Timed out waiting for the private test drive mutex.' }
 $driveName = $Drive.Substring(0, 1)
 if (Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue) {
 	throw "Refusing to use occupied drive $Drive."
 }
 
-$winfspDriverServices = @(Get-CimInstance Win32_SystemDriver | Where-Object {
-	$_.Name -like "WinFsp+*" -and $_.PathName -match '(?i)\\WinFsp\\SxS\\'
-})
-$officialDriver = $winfspDriverServices | Where-Object { $_.State -eq "Running" } | Select-Object -First 1
-if ($null -eq $officialDriver) {
-	Write-Output "SKIP: requires an already-running official WinFsp kernel driver; this test never installs or changes a driver."
-	exit 77
+. (Join-Path $PSScriptRoot 'private-driver-preflight.ps1')
+if (-not (Test-MemfsPrivateDriver $Exe)) {
+    Write-Output 'SKIP: a matching private driver must already be running; no driver installation in this test.'
+    exit 77
 }
+$winfspDriverServices = @(Get-CimInstance Win32_SystemDriver | Where-Object { $_.Name -like 'WinFsp+*' })
 $driverSnapshot = (@($winfspDriverServices | Sort-Object Name | ForEach-Object {
 	"$($_.Name)|$($_.State)|$($_.PathName)"
 }) -join "`n")
@@ -144,7 +149,7 @@ if (-not $logAcl.AreAccessRulesProtected) {
 	if ($null -ne $service) { throw "Native uninstall did not remove $serviceName." }
 
 	$currentDrivers = @(Get-CimInstance Win32_SystemDriver | Where-Object {
-		$_.Name -like "WinFsp+*" -and $_.PathName -match '(?i)\\WinFsp\\SxS\\'
+		$_.Name -like "WinFsp+*"
 	})
 	$currentSnapshot = (@($currentDrivers | Sort-Object Name | ForEach-Object {
 		"$($_.Name)|$($_.State)|$($_.PathName)"
@@ -153,7 +158,7 @@ if (-not $logAcl.AreAccessRulesProtected) {
 		throw "Native service lifecycle changed the existing WinFsp driver state."
 	}
 	$privateDriver = Get-CimInstance Win32_SystemDriver -Filter "Name='WinFsp+MemfsC'" -ErrorAction SilentlyContinue
-	if ($null -ne $privateDriver) { throw "Test unexpectedly created the MemfsC private WinFsp driver service." }
+	if ($null -eq $privateDriver -or -not (Test-MemfsPrivateDriver $Exe)) { throw "Test changed the private driver." }
 	Write-Output "native-service-install PASS: $serviceName on $Drive"
 }
 finally {
@@ -162,4 +167,9 @@ finally {
 		try { Invoke-Memfs $uninstallArgs | Out-Null }
 		catch { Write-Warning "Could not safely remove isolated test service ${serviceName}: $_" }
 	}
+}
+
+} finally {
+    if ($ownsTestMutex) { $testMutex.ReleaseMutex() }
+    $testMutex.Dispose()
 }

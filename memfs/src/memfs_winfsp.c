@@ -34,6 +34,7 @@ static BOOL CALLBACK memfs_node_io_stripes_initialize(
 }
 
 static SRWLOCK* memfs_node_io_stripe(MemfsNode* node) {
+	node = memfs_node_metadata(node);
 	if (node == NULL ||
 		!InitOnceExecuteOnce(&g_memfs_node_io_stripes_once,
 			memfs_node_io_stripes_initialize, NULL, NULL))
@@ -200,14 +201,15 @@ static uint32_t memfs_normalize_attributes(MemfsNode* node, uint32_t attributes)
 static void memfs_fill_file_info(MemfsNode* node, FSP_FSCTL_FILE_INFO* file_info) {
 	memset(file_info, 0, sizeof(*file_info));
 
-	file_info->FileAttributes = node->attributes;
+	file_info->FileAttributes = memfs_node_metadata(node)->attributes;
+    if (node->named_stream) file_info->FileAttributes &= ~FILE_ATTRIBUTE_DIRECTORY;
 	file_info->AllocationSize = memfs_align_allocation(node->allocation_size);
 	file_info->FileSize = node->file_size;
 	file_info->CreationTime = memfs_node_get_creation_time(node);
 	file_info->LastAccessTime = memfs_node_get_last_access_time(node);
 	file_info->LastWriteTime = memfs_node_get_last_write_time(node);
 	file_info->ChangeTime = memfs_node_get_change_time(node);
-	file_info->IndexNumber = memfs_node_index_number(node);
+	file_info->IndexNumber = memfs_node_index_number(memfs_node_metadata(node));
 }
 
 static void memfs_fill_volume_info(Memfs* fs, FSP_FSCTL_VOLUME_INFO* volume_info) {
@@ -337,10 +339,42 @@ static NTSTATUS fs_GetSecurityByName(FSP_FILE_SYSTEM* file_system, PWSTR file_na
 	if (result != MEMFS_OK)
 		return memfs_status(result);
 
-	if (file_attributes)
-		*file_attributes = node->attributes;
+	if (file_attributes) {
+        *file_attributes = memfs_node_metadata(node)->attributes;
+        if (node->named_stream) *file_attributes &= ~FILE_ATTRIBUTE_DIRECTORY;
+    }
 
 	return memfs_copy_security(node, security_descriptor, security_descriptor_size);
+}
+
+/* WinFsp 2.1 creates an NT4-style descriptor before calling Create. Rebuild
+ * from the ORIGINAL caller descriptor/token, not that already-merged result:
+ * automatic inheritance must distinguish explicit ACEs from inherited ACEs.
+ * Keep all Windows owner/privilege validation enabled. */
+static NTSTATUS memfs_create_inherited_security(MemfsNode* parent, bool directory,
+	PSECURITY_DESCRIPTOR* descriptor) {
+	FSP_FILE_SYSTEM_OPERATION_CONTEXT* context = FspFileSystemGetOperationContext();
+	FSP_FSCTL_TRANSACT_REQ* request = context != NULL ? context->Request : NULL;
+	PSECURITY_DESCRIPTOR creator = NULL;
+
+	*descriptor = NULL;
+	if (request == NULL || request->Kind != FspFsctlTransactCreateKind ||
+		request->Size < sizeof(*request))
+		return STATUS_INVALID_PARAMETER;
+	if (request->Req.Create.SecurityDescriptor.Offset != 0) {
+		SIZE_T offset = request->Req.Create.SecurityDescriptor.Offset;
+		SIZE_T size = request->Req.Create.SecurityDescriptor.Size;
+		if (offset + size > request->Size - sizeof(*request) || size == 0)
+			return STATUS_INVALID_SECURITY_DESCR;
+		creator = (PSECURITY_DESCRIPTOR)(request->Buffer + offset);
+	}
+	if (!CreatePrivateObjectSecurityEx(memfs_node_get_security(parent)->data,
+		creator, descriptor, NULL, directory,
+		SEF_DACL_AUTO_INHERIT | SEF_SACL_AUTO_INHERIT,
+		FSP_FSCTL_TRANSACT_REQ_TOKEN_HANDLE(request->Req.Create.AccessToken),
+		FspGetFileGenericMapping()))
+		return FspNtStatusFromWin32(GetLastError());
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS fs_Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 create_options, UINT32 granted_access,
@@ -356,14 +390,36 @@ static NTSTATUS fs_Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 
 
 	(void)granted_access;
 
+    if (wcschr(file_name, L':') != NULL) {
+        result = memfs_lookup_stream_parent(instance->store, file_name, &parent, name);
+        if (result != MEMFS_OK) return memfs_status(result);
+        if (create_options & FILE_DIRECTORY_FILE) return STATUS_NOT_A_DIRECTORY;
+        io_stripe = memfs_node_io_enter(parent, TRUE);
+        if (io_stripe == NULL) return STATUS_INTERNAL_ERROR;
+        result = memfs_stream_create(parent, name, allocation_size, &node);
+        if (result == MEMFS_OK) {
+            *file_context = node;
+            memfs_fill_file_info(node, file_info);
+        }
+        memfs_node_io_leave(io_stripe, TRUE);
+        return memfs_status(result);
+    }
 	result = memfs_get_destination(instance->store, file_name, &parent, name);
 	if (result != MEMFS_OK)
 		return memfs_status(result);
 
 	directory = 0 != (create_options & FILE_DIRECTORY_FILE);
 
-	result = memfs_node_create(instance->store, parent, name, directory, file_attributes, security_descriptor,
-							   directory ? 0 : allocation_size, &node);
+	{
+		PSECURITY_DESCRIPTOR inherited = NULL;
+		NTSTATUS status = memfs_create_inherited_security(parent, directory, &inherited);
+		(void)security_descriptor; /* the old-style WinFsp merge is intentionally not reused */
+		if (!NT_SUCCESS(status))
+			return status;
+		result = memfs_node_create(instance->store, parent, name, directory,
+			file_attributes, inherited, directory ? 0 : allocation_size, &node);
+		DestroyPrivateObjectSecurity(&inherited);
+	}
 	if (result != MEMFS_OK)
 		return memfs_status(result);
 
@@ -408,6 +464,8 @@ static NTSTATUS fs_Open(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 cr
 		*file_context = NULL;
 		return STATUS_INTERNAL_ERROR;
 	}
+	if (node->named_stream)
+		InterlockedIncrement(&node->stream_active_opens);
 	memfs_fill_file_info(node, file_info);
 	memfs_node_io_leave(io_stripe, FALSE);
 	return STATUS_SUCCESS;
@@ -440,14 +498,19 @@ static NTSTATUS fs_Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, U
 	if (result != MEMFS_OK)
 		goto done;
 
-	if (replace_file_attributes)
-		node->attributes = file_attributes;
-	else
-		node->attributes |= file_attributes;
-
-	/* Normalize after adding ARCHIVE so NORMAL never survives beside it. */
-	node->attributes = memfs_normalize_attributes(node,
-		node->attributes | FILE_ATTRIBUTE_ARCHIVE);
+    if (!node->named_stream) {
+        /* Match NTFS and WinFsp's overwrite contract: closed streams go
+         * immediately; open streams remain enumerable but delete-pending.
+         * WinFsp rejects new opens and sends FspCleanupDelete on their final
+         * cleanup. Removing them now loses enumeration and changes error 5
+         * to error 2 while the old handle is still alive. */
+        memfs_stream_unlink_all(node, true);
+        if (replace_file_attributes) node->attributes = file_attributes;
+        else node->attributes |= file_attributes;
+    }
+    MemfsNode* metadata = memfs_node_metadata(node);
+    metadata->attributes = memfs_normalize_attributes(metadata,
+        metadata->attributes | FILE_ATTRIBUTE_ARCHIVE);
 	memfs_node_set_change_time(node, memfs_now());
 
 	memfs_fill_file_info(node, file_info);
@@ -470,11 +533,19 @@ static VOID fs_Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR f
 	if (io_stripe == NULL)
 		return;
 
+	/* Cleanup is synchronous with the last handle, Close may be delayed.
+	 * PostCleanupWhenModifiedOnly is disabled so read-only opens count too. */
+	if (node->named_stream &&
+		InterlockedCompareExchange(&node->stream_active_opens, 0, 0) > 0)
+		InterlockedDecrement(&node->stream_active_opens);
 	now = memfs_now();
 
-	if (flags & FspCleanupSetArchiveBit)
-		node->attributes = memfs_normalize_attributes(node,
-			node->attributes | FILE_ATTRIBUTE_ARCHIVE);
+    if (flags & FspCleanupSetArchiveBit) {
+        MemfsNode* metadata = memfs_node_metadata(node);
+        if (!memfs_node_is_directory(metadata))
+            metadata->attributes = memfs_normalize_attributes(metadata,
+                metadata->attributes | FILE_ATTRIBUTE_ARCHIVE);
+    }
 	if (flags & FspCleanupSetLastAccessTime)
 		memfs_node_set_last_access_time(node, now);
 	if (flags & FspCleanupSetLastWriteTime)
@@ -619,7 +690,7 @@ static NTSTATUS fs_GetFileInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context, UINT32 file_attributes,
 								UINT64 creation_time, UINT64 last_access_time, UINT64 last_write_time,
 								UINT64 change_time, FSP_FSCTL_FILE_INFO* file_info) {
-	MemfsNode* node = file_context;
+	MemfsNode* node = memfs_node_metadata(file_context);
 
 	SRWLOCK* io_stripe;
 	if (node == NULL)
@@ -645,7 +716,7 @@ static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context
 	if (change_time)
 		memfs_node_set_change_time(node, change_time);
 
-	memfs_fill_file_info(node, file_info);
+	memfs_fill_file_info(file_context, file_info);
 	memfs_node_io_leave(io_stripe, TRUE);
 	return STATUS_SUCCESS;
 }
@@ -705,6 +776,12 @@ static NTSTATUS fs_Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWST
 
 	(void)file_name;
 
+    if (node->named_stream) {
+        result = memfs_lookup_stream_parent(instance->store, new_file_name, &new_parent, new_name);
+        if (result != MEMFS_OK) return memfs_status(result);
+        return memfs_status(memfs_stream_rename(node, new_parent, new_name, !!replace_if_exists));
+    }
+    if (wcschr(new_file_name, L':') != NULL) return STATUS_INVALID_PARAMETER;
 	result = memfs_get_destination(instance->store, new_file_name, &new_parent, new_name);
 	if (result != MEMFS_OK)
 		return memfs_status(result);
@@ -739,6 +816,23 @@ static NTSTATUS fs_SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 	 * replacing/freeing a descriptor so those borrowed snapshots stay alive.
 	 * Do not recursively acquire it inside GetSecurityByName. */
 	AcquireSRWLockExclusive(&file_system->OpGuardLock);
+	/* WinFsp 2.1 SET_SECURITY does not carry a caller token. Its helper
+	 * rejects OWNER updates with ERROR_INVALID_OWNER even when unchanged.
+	 * Treat only an identical owner as a no-op; never skip owner validation
+	 * for a different SID or impersonate the filesystem's SYSTEM account. */
+	if (security_information & OWNER_SECURITY_INFORMATION) {
+		PSID old_owner = NULL, requested_owner = NULL;
+		BOOL defaulted;
+		if (GetSecurityDescriptorOwner(memfs_node_get_security(node)->data,
+				&old_owner, &defaulted) &&
+			GetSecurityDescriptorOwner(modification_descriptor, &requested_owner, &defaulted) &&
+			old_owner != NULL && requested_owner != NULL && EqualSid(old_owner, requested_owner))
+			security_information &= ~OWNER_SECURITY_INFORMATION;
+	}
+	if (security_information == 0) {
+		ReleaseSRWLockExclusive(&file_system->OpGuardLock);
+		return STATUS_SUCCESS;
+	}
 	status = FspSetSecurityDescriptor(memfs_node_get_security(node)->data, security_information,
 									  modification_descriptor, &new_descriptor);
 	if (!NT_SUCCESS(status)) {
@@ -891,6 +985,87 @@ NTSTATUS memfs_winfsp_test_get_dir_info_by_name(
 }
 #endif
 
+/* The default create dispatcher caches its own pre-Create (NT4-style) SD
+ * in the kernel response. Replace that snapshot with the descriptor actually
+ * stored by Create; otherwise immediate queries/access checks see stale ACLs.
+ * FINE holds the namespace lock across this operation, including the copy. */
+static NTSTATUS memfs_op_create(FSP_FILE_SYSTEM* file_system,
+	FSP_FSCTL_TRANSACT_REQ* request, FSP_FSCTL_TRANSACT_RSP* response) {
+	NTSTATUS status = FspFileSystemOpCreate(file_system, request, response);
+	MemfsNode* node;
+	MemfsSecurity* security;
+	SIZE_T name_end, offset;
+
+	if (status != STATUS_SUCCESS || request->Req.Create.NamedStream ||
+        response->IoStatus.Information != FILE_CREATED)
+		return status;
+	node = (MemfsNode*)(UINT_PTR)response->Rsp.Create.Opened.UserContext;
+	if (node == NULL)
+		return status;
+	security = memfs_node_get_security(node);
+	name_end = (SIZE_T)response->Rsp.Create.Opened.FileName.Offset +
+		response->Rsp.Create.Opened.FileName.Size;
+	offset = FSP_FSCTL_DEFAULT_ALIGN_UP(name_end);
+	response->Rsp.Create.Opened.HasSecurityDescriptor = 0;
+	response->Rsp.Create.Opened.SecurityDescriptor.Offset = 0;
+	response->Rsp.Create.Opened.SecurityDescriptor.Size = 0;
+	response->Size = (UINT16)(sizeof(*response) + name_end);
+	if (offset + security->size <= FSP_FSCTL_TRANSACT_RSP_BUFFER_SIZEMAX) {
+		memcpy(response->Buffer + offset, security->data, security->size);
+		response->Rsp.Create.Opened.HasSecurityDescriptor = 1;
+		response->Rsp.Create.Opened.SecurityDescriptor.Offset = (UINT16)offset;
+		response->Rsp.Create.Opened.SecurityDescriptor.Size = (UINT16)security->size;
+		response->Size = (UINT16)(sizeof(*response) + offset + security->size);
+	}
+	return status;
+}
+
+static BOOLEAN memfs_add_stream_info(MemfsNode* node, const wchar_t* name,
+    PVOID buffer, ULONG length, PULONG transferred) {
+    union { UINT64 alignment; BYTE data[sizeof(FSP_FSCTL_STREAM_INFO) + MEMFS_MAX_NAME * sizeof(WCHAR)]; } storage;
+    FSP_FSCTL_STREAM_INFO* info = (FSP_FSCTL_STREAM_INFO*)storage.data;
+    size_t chars = wcslen(name);
+    if (chars > MEMFS_MAX_NAME) return FALSE;
+    memset(info, 0, sizeof(*info));
+    info->Size = (UINT16)(sizeof(*info) + chars * sizeof(WCHAR));
+    info->StreamSize = node->file_size;
+    info->StreamAllocationSize = memfs_align_allocation(node->allocation_size);
+    memcpy(info->StreamNameBuf, name, chars * sizeof(WCHAR));
+    return FspFileSystemAddStreamInfo(info, buffer, length, transferred);
+}
+
+static NTSTATUS fs_GetStreamInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context,
+    PVOID buffer, ULONG length, PULONG transferred) {
+    MemfsNode* owner = memfs_node_metadata(file_context);
+    SRWLOCK* stripe;
+    NTSTATUS status = STATUS_SUCCESS;
+    if (owner == NULL || transferred == NULL) return STATUS_INVALID_PARAMETER;
+    *transferred = 0;
+    AcquireSRWLockShared(&file_system->OpGuardLock);
+    stripe = memfs_node_io_enter(owner, FALSE);
+    if (stripe == NULL) {
+        ReleaseSRWLockShared(&file_system->OpGuardLock);
+        return STATUS_INTERNAL_ERROR;
+    }
+    if (!memfs_node_is_directory(owner) &&
+        !memfs_add_stream_info(owner, L"", buffer, length, transferred)) {
+        status = STATUS_BUFFER_OVERFLOW;
+        goto done;
+    }
+    for (MemfsNode* stream = memfs_stream_first(owner); stream; stream = memfs_stream_next(stream)) {
+        if (!memfs_add_stream_info(stream, stream->name, buffer, length, transferred)) {
+            /* Never return a silently truncated list as complete. */
+            status = STATUS_BUFFER_OVERFLOW;
+            goto done;
+        }
+    }
+    FspFileSystemAddStreamInfo(NULL, buffer, length, transferred);
+done:
+    memfs_node_io_leave(stripe, FALSE);
+    ReleaseSRWLockShared(&file_system->OpGuardLock);
+    return status;
+}
+
 static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.GetVolumeInfo = fs_GetVolumeInfo,
 	.SetVolumeLabel = fs_SetVolumeLabel,
@@ -908,6 +1083,7 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.SetFileSize = fs_SetFileSize,
 	.CanDelete = fs_CanDelete,
 	.Rename = fs_Rename,
+	.GetStreamInfo = fs_GetStreamInfo,
 	.GetSecurity = fs_GetSecurity,
 	.SetSecurity = fs_SetSecurity,
 	.ReadDirectory = fs_ReadDirectory,
@@ -976,13 +1152,19 @@ static void memfs_winfsp_init_volume_params(FSP_FSCTL_VOLUME_PARAMS* volume_para
 	volume_params->CasePreservedNames = 1;
 	volume_params->UnicodeOnDisk = 1;
 	volume_params->PersistentAcls = 1;
-	volume_params->PostCleanupWhenModifiedOnly = 1;
+	volume_params->NamedStreams = 1;
+	/* Stream overwrite must observe completed user handles, not delayed
+	 * Close references. Even unmodified read handles therefore need Cleanup. */
+	volume_params->PostCleanupWhenModifiedOnly = 0;
 	volume_params->PassQueryDirectoryFileName = 1;
 	volume_params->PassQueryDirectoryPattern = 1;
 	volume_params->PostDispositionWhenNecessaryOnly = 1;
 	volume_params->AllowOpenInKernelMode = 1;
 	volume_params->SupportsPosixUnlinkRename = 0;
-	wcscpy_s(volume_params->FileSystemName, _countof(volume_params->FileSystemName), L"MEMFS-C");
+	/* Windows elevation/application compatibility checks require the exact
+	 * name NTFS (WinFsp FAQ). This does not advertise unsupported NTFS
+	 * features: capability flags above remain authoritative. */
+	wcscpy_s(volume_params->FileSystemName, _countof(volume_params->FileSystemName), L"NTFS");
 }
 
 #if defined(MEMFS_WINFSP_TESTING)
@@ -1011,6 +1193,10 @@ NTSTATUS memfs_winfsp_create_ex(
 	if (detail_error)
 		*detail_error = ERROR_SUCCESS;
 
+#if defined(MEMFS_WINFSP_STATIC)
+    if (wcscmp(FspSxsIdent(), L"MemfsC") != 0)
+        return STATUS_REVISION_MISMATCH;
+#endif
 	runtime_error = memfs_winfsp_prepare_runtime();
 	if (runtime_error != ERROR_SUCCESS) {
 		if (detail_error)
@@ -1062,6 +1248,7 @@ NTSTATUS memfs_winfsp_create_ex(
 	}
 
 	FspFileSystemSetOperationGuardStrategy(instance->file_system, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
+	FspFileSystemSetOperation(instance->file_system, FspFsctlTransactCreateKind, memfs_op_create);
 
 	*out_instance = instance;
 	return STATUS_SUCCESS;
@@ -1076,6 +1263,20 @@ NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point) {
 	if (instance == NULL || instance->frontend == NULL || mount_point == NULL)
 		return STATUS_INVALID_PARAMETER;
 
+    /* Plain X: uses only a DOS-device link in WinFsp. A Mount Manager
+     * registration is required for GetFinalPathNameByHandle / Python
+     * realpath and volume-GUID discovery (otherwise ERROR_UNRECOGNIZED_VOLUME).
+     * Mount Manager drive registration requires elevation; do not silently
+     * fall back to a superficially usable but incompatible DOS-only mount. */
+    if (((mount_point[0] >= L'A' && mount_point[0] <= L'Z') ||
+         (mount_point[0] >= L'a' && mount_point[0] <= L'z')) &&
+        mount_point[1] == L':' &&
+        (mount_point[2] == L'\0' ||
+         (mount_point[2] == L'\\' && mount_point[3] == L'\0'))) {
+        wchar_t managed[] = L"\\\\.\\X:";
+        managed[4] = mount_point[0];
+        return fsf_winfsp_mount(instance->frontend, managed);
+    }
 	return fsf_winfsp_mount(instance->frontend, mount_point);
 }
 

@@ -1,10 +1,7 @@
-#include <Windows.h>
-#include <winfsp/winfsp.h>
+#include "memfs_winfsp.h"
 
 #include <stdio.h>
 #include <string.h>
-
-#include "memfs_winfsp.h"
 
 int wmain(void) {
     MemfsOptions options;

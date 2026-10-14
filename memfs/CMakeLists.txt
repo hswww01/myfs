@@ -205,6 +205,15 @@ if(MEMFS_STATIC_WINFSP)
 		endif()
 	endif()
 
+    if(WINFSP_SOURCE_ROOT)
+        find_package(Git REQUIRED)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${WINFSP_SOURCE_ROOT}" rev-list -n 1 HEAD
+            RESULT_VARIABLE _winfsp_git_result OUTPUT_VARIABLE _winfsp_source_commit
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT _winfsp_git_result EQUAL 0)
+            message(FATAL_ERROR "Cannot verify exact WinFsp source commit")
+        endif()
+    endif()
 	set(_winfsp_expected_version "")
 	if(WINFSP_EXPECTED_VERSION)
 		if(_winfsp_source_version AND
@@ -229,6 +238,15 @@ if(MEMFS_STATIC_WINFSP)
 	_memfs_read_driver_version("${WINFSP_DRIVER_ARM64}"
 		_winfsp_driver_arm64_full _winfsp_driver_arm64_version)
 
+    string(REGEX MATCH "\\.([0-9a-fA-F]+)$" _winfsp_commit_match "${_winfsp_driver_x64_full}")
+    set(_winfsp_driver_commit "${CMAKE_MATCH_1}")
+    if(NOT _winfsp_driver_commit OR NOT _winfsp_source_commit MATCHES "^${_winfsp_driver_commit}")
+        message(FATAL_ERROR "WinFsp source/SYS commit mismatch: source=${_winfsp_source_commit}, SYS=${_winfsp_driver_x64_full}")
+    endif()
+    file(READ "${WINFSP_SOURCE_ROOT}/src/dll/sxs.c" _winfsp_sxs_source)
+    if(NOT _winfsp_sxs_source MATCHES "MEMFS_STATIC_PRIVATE_DRIVER")
+        message(FATAL_ERROR "Prepare a product-bound static runtime with scripts/prepare-winfsp-static.ps1")
+    endif()
 	foreach(_driver_version IN ITEMS
 		"${_winfsp_driver_x64_version}"
 		"${_winfsp_driver_arm64_version}")
@@ -282,6 +300,12 @@ if(NOT EXISTS "${FS_FRONTEND_SOURCE_DIR}/CMakeLists.txt")
 	message(FATAL_ERROR "Shared fs_frontend source tree not found: ${FS_FRONTEND_SOURCE_DIR}")
 endif()
 add_subdirectory("${FS_FRONTEND_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fs_frontend")
+# Static WinFsp's service/version/security objects use these Windows import
+# libraries; propagate them to every frontend consumer, including driver tests.
+if(MEMFS_STATIC_WINFSP)
+    target_link_libraries(fs_frontend PUBLIC credui netapi32 rpcrt4 secur32 shlwapi version wldap32)
+endif()
+
 
 file(TO_CMAKE_PATH "${WINFSP_DRIVER_X64}" WINFSP_DRIVER_X64_RC)
 file(TO_CMAKE_PATH "${WINFSP_DRIVER_ARM64}" WINFSP_DRIVER_ARM64_RC)
@@ -429,6 +453,88 @@ else()
 endif()
 
 enable_testing()
+
+add_test(NAME memfs_private_driver_evidence
+    COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+        -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/require-private-driver.ps1"
+        -Exe "$<TARGET_FILE:memfs>")
+set_tests_properties(memfs_private_driver_evidence PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+
+
+# ACL storage and real Win32 temporary-directory contracts. Each mounted test
+# owns a fresh drive and uses a private stop event; never reuse a live volume.
+# Configurable drive letters allow independent build trees to test concurrently.
+set(MEMFS_TEMP_TEST_DRIVE "T:" CACHE STRING "Temporary compatibility test drive")
+set(MEMFS_TEMP_SERVICE_TEST_DRIVE "U:" CACHE STRING "LocalSystem compatibility test drive")
+set(MEMFS_ADS_TEST_DRIVE "V:" CACHE STRING "NTFS differential test drive")
+set(MEMFS_INSTALL_TEST_DRIVE "W:" CACHE STRING "Native service lifecycle test drive")
+add_executable(memfs_stream_test tests/memfs_stream_test.c)
+target_link_libraries(memfs_stream_test PRIVATE memfs_core)
+add_test(NAME memfs_stream_test COMMAND memfs_stream_test)
+set_tests_properties(memfs_stream_test PROPERTIES TIMEOUT 30)
+add_executable(memfs_security_test tests/memfs_security_test.c)
+target_link_libraries(memfs_security_test PRIVATE memfs_core)
+add_test(NAME memfs_security_test COMMAND memfs_security_test)
+add_executable(memfs_temp_probe tests/memfs_temp_probe.c)
+target_link_libraries(memfs_temp_probe PRIVATE advapi32 shell32 ole32 uuid urlmon)
+add_library(memfs_temp_dll SHARED tests/fixtures/memfs_temp_dll.c)
+add_test(NAME memfs_ads_ntfs_reference
+    COMMAND memfs_temp_probe --ads-only "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(memfs_ads_ntfs_reference PROPERTIES TIMEOUT 60)
+
+if(MSVC)
+    target_compile_options(memfs_security_test PRIVATE /W4 /utf-8)
+    target_compile_options(memfs_temp_probe PRIVATE /W4 /utf-8)
+endif()
+foreach(mode plain compressed encrypted)
+    set(_temp_flags)
+    if(mode STREQUAL "compressed")
+        list(APPEND _temp_flags -Compress)
+    elseif(mode STREQUAL "encrypted")
+        list(APPEND _temp_flags -Compress -Encrypt)
+    endif()
+    add_test(NAME memfs_temp_${mode}
+        COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+            -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/temp-compatibility.ps1"
+            -Exe "$<TARGET_FILE:memfs>" -Probe "$<TARGET_FILE:memfs_temp_probe>"
+            -Dll "$<TARGET_FILE:memfs_temp_dll>" -Drive "${MEMFS_TEMP_TEST_DRIVE}" ${_temp_flags})
+    set_tests_properties(memfs_temp_${mode} PROPERTIES
+        TIMEOUT 120 RESOURCE_LOCK memfs_temp_drive SKIP_RETURN_CODE 77)
+endforeach()
+
+
+add_test(NAME memfs_temp_service
+    COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+        -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/temp-service-compatibility.ps1"
+        -Exe "$<TARGET_FILE:memfs>" -Probe "$<TARGET_FILE:memfs_temp_probe>"
+        -Dll "$<TARGET_FILE:memfs_temp_dll>" -Drive "${MEMFS_TEMP_SERVICE_TEST_DRIVE}")
+set_tests_properties(memfs_temp_service PROPERTIES
+    TIMEOUT 180 RESOURCE_LOCK memfs_temp_service SKIP_RETURN_CODE 77)
+
+# This is a compatibility contract, not a claim of complete NTFS equality.
+# The script prints/records exact known signed-driver differences. Any NEW
+# result is a failure; omitting --allow-known-winfsp-limits is strict mode.
+find_program(MEMFS_DIFF_PYTHON NAMES python.exe python)
+if(MEMFS_DIFF_PYTHON)
+    foreach(mode plain compressed encrypted)
+        set(_ads_flags)
+        if(NOT mode STREQUAL "plain")
+            list(APPEND _ads_flags --compress)
+        endif()
+        if(mode STREQUAL "encrypted")
+            list(APPEND _ads_flags --encrypt)
+        endif()
+        add_test(NAME memfs_ads_differential_${mode}
+            COMMAND "${MEMFS_DIFF_PYTHON}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/ntfs_ads_differential.py"
+                --exe "$<TARGET_FILE:memfs>" --drive "${MEMFS_ADS_TEST_DRIVE}"
+                --reference "${CMAKE_CURRENT_BINARY_DIR}"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/ads-differential-${mode}.json"
+                --rounds 128 --allow-known-winfsp-limits ${_ads_flags})
+        set_tests_properties(memfs_ads_differential_${mode} PROPERTIES
+            TIMEOUT 120 RESOURCE_LOCK memfs_ads_diff_drive SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
 
 # Exercise the real production capacity cache with deterministic OS/clock
 # providers. NDEBUG deliberately keeps the Release path enabled in both presets.
@@ -718,7 +824,7 @@ if(MEMFS_STATIC_WINFSP)
 			-ExecutionPolicy Bypass
 			-File "${CMAKE_CURRENT_SOURCE_DIR}/tests/native-service-install.ps1"
 			-Exe "$<TARGET_FILE:memfs>"
-			-Drive "W:")
+			-Drive "${MEMFS_INSTALL_TEST_DRIVE}")
 	set_tests_properties(memfs_native_service_install PROPERTIES
 		SKIP_RETURN_CODE 77
 		TIMEOUT 240)

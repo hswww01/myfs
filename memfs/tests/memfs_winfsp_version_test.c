@@ -2,12 +2,17 @@
 #include <winfsp/winfsp.h>
 
 #include <stdio.h>
+#include <wchar.h>
 
 #ifndef MEMFS_EXPECTED_WINFSP_VERSION
 #error MEMFS_EXPECTED_WINFSP_VERSION must be defined
 #endif
 
 int main(void) {
+    if (wcscmp(FspSxsIdent(), L"MemfsC") != 0) {
+        fprintf(stderr, "Static runtime is not pinned to the embedded MemfsC driver.\n");
+        return 1;
+    }
     UINT32 version = 0;
     NTSTATUS status = FspVersion(&version);
 

@@ -2,6 +2,12 @@
 
 基于原生 WinFsp API、使用 C17 编写的高性能易失性 Windows 内存文件系统。
 
+## 当前 WinFsp 版本与维护约定
+
+2026-10-14 已升级到 WinFsp 2026 Beta5（`2.2.26286.14d6e02`），使用匹配源码编译的静态运行库和 EXE 内嵌的官方签名 SYS；运行时固定到私有驱动 `WinFsp+MemfsC`，不再依赖已卸载的旧 MSI/Launcher。新服务已通过 Debug/Release 37 项回归及正式卷 734 项原生检查。
+
+**经用户授权重启 MemfsC 时，默认允许清空内存卷，不再备份或恢复卷内文件；保留 `--mkdir tmp`。** 不自动重启 Windows，不强制结束其他应用。旧 SYS 映像仍有内核残留，需在后续正常系统重启后复查；详细版本、验收及这一未完成的清理边界见 [WinFsp 2.2 升级记录](docs/WINFSP_2_2_UPGRADE.md)。下文早期构建/官方驱动复用说明是历史流程，当前输入以 CMakePresets 和该升级记录为准。
+
 ## 功能
 
 - 纯 C17、CMake、Ninja、clang-cl 和 vcpkg。
@@ -14,10 +20,19 @@
 - 可选的逐页 Zstd 压缩。
 - 可选的逐页认证加密：支持硬件加速时使用 AES-256-GCM，否则回退到 XChaCha20-Poly1305。
 - 支持 Windows 文件属性、时间戳、ACL 和安全描述符。
+- 支持 Zone.Identifier 与命名数据流（ADS），保留 NTFS 双向复制的下载来源标记。
 - 使用 WinFsp FINE 操作保护，不同文件可并发执行 I/O。
 - 全局容量和驻留内存统计支持线程安全并发访问。
 
-文件系统中的全部内容都是易失数据。卸载或终止进程后，文件都会丢失。
+文件系统中的全部内容都是易失数据。卸载或终止进程后，文件都会丢失。本项目当前运维约定：用户已授权服务重启时清空内存卷，不恢复旧卷文件；启动时由 --mkdir tmp 创建新的临时目录。
+
+## Windows 临时目录兼容性
+
+支持调用者令牌驱动的 ACL 自动继承、共享临时目录默认权限，以及 `Zone.Identifier` 等命名 `$DATA` 流。文件系统报告名称为 `NTFS`；裸盘符挂载通过 Windows Mount Manager 注册，修复 `GetFinalPathNameByHandle` / Python `Path.resolve` 的 WinError 1005。该盘符模式需要提升权限或 LocalSystem。
+
+ADS 共享所属对象的权限、时间戳和文件 ID，但使用独立的长度与压缩/加密存储。普通节点仍保持 128 字节。已执行真实 NTFS 差分、Windows Zone COM、双向带 Zone 复制、EXE/DLL、SQLite WAL、并发与实际服务测试，并于 2026-10-14 部署和重启 `MemfsC`。
+
+当前使用从官方 v2.2B5 / 14d6e02 源码构建的静态 WinFsp 2.2，内嵌同版本 Microsoft 签名 SYS，固定使用私有驱动 WinFsp+MemfsC；不依赖 WinFsp MSI、Launcher 或 DLL。Debug/Release 均通过 37 项 CTest，正式 M: 通过 734 项原生检查。四项已知 ADS 差异、所有权转移及重解析点边界仍保留。旧驱动的安装/服务注册已卸载，但内核模块检查仍看到旧映像残留，应在后续正常重启 Windows 后复查。详见 [驱动升级与验收](docs/WINFSP_2_2_UPGRADE.md)；历史功能设计见 [临时目录兼容性说明](docs/TEMP_COMPATIBILITY.md)。**停止服务仍会丢失内存卷数据，已打开的旧句柄无法跨重启保留。**
 
 ## 文件名比较规则
 
@@ -28,17 +43,17 @@
 ## 依赖
 
 - Windows 10/11 x64，或在 Windows x64 仿真下运行 x64 用户态程序的 Windows 11 ARM64。32 位 Windows 和 Windows 10 ARM64 不支持。
-- WinFsp Git 源码位于 `D:\src\winfsp`。`scripts\prepare-winfsp-static.ps1` 会根据已安装的签名驱动确定准确源码提交，并准备 `D:\src\winfsp-memfs-static`。
+- WinFsp Git 源码位于 `D:\src\winfsp`。`scripts\prepare-winfsp-static.ps1` 默认根据已下载的 Beta5 签名驱动确定准确源码提交，预设固定相同版本的源码与 x64/ARM64 SYS；无需先安装 WinFsp MSI。
 - Visual Studio C/C++ 构建工具。
 - 编译器：LLVM/clang-cl。
 - CMake 和 Ninja。
 - 提供的 presets 使用位于 `D:\vcpkg` 的 vcpkg。
 
-vcpkg manifest 会安装 `zstd` 和 `libsodium`。首次构建前运行 `scripts\prepare-winfsp-static.ps1`。该脚本读取已安装签名 WinFsp 驱动的 FileVersion，解析对应 Git 提交，创建 `D:\src\winfsp-memfs-static`，应用最小静态用户态支持，并从完全匹配的源码版本构建 Debug/Release 静态库。之后 presets 会链接该匹配的静态运行库，所以运行 `memfs.exe` 不需要 `winfsp-x64.dll`。
+vcpkg manifest 会安装 `zstd` 和 `libsodium`。首次构建前运行 `scripts\prepare-winfsp-static.ps1`。该脚本读取已下载签名 SYS 的 FileVersion，解析确切 Git 提交，创建独立工作树，并构建 Debug/Release 静态库。现有工作树不会自动丢弃；常规增量构建不必重复运行准备脚本。之后 presets 会链接该匹配的静态运行库，所以运行 `memfs.exe` 不需要 `winfsp-x64.dll`。
 
 匹配版本的签名 WinFsp 内核驱动（`winfsp-x64.sys` 和 `winfsp-a64.sys`）会嵌入单个 x64 `memfs.exe`。CMake 要求两个 SYS 来自同一个已签名 WinFsp 版本，并与静态链接的 x64 用户态运行库匹配。构建还会检查每个 SYS 的 PE 架构（`AMD64` / `ARM64`）、Microsoft Windows Hardware Compatibility Publisher Authenticode 签名有效性，以及两个驱动是否由同一签名者签署。
 
-运行时，memfs 使用 `IsWow64Process2` 判断 Windows 原生架构：AMD64 主机使用 x64 SYS；在 x64 仿真下运行 x64 EXE 的 Windows 11 ARM64 主机则使用 ARM64 SYS。内核驱动不会经仿真运行。CTest 也会调用静态库中的 `FspVersion()`，解析嵌入 SYS 的 PE 头，重新检查驱动来源，并解析构建后 PE 的普通导入和延迟导入表；因此，WinFsp 输入过期/不匹配或重新引入 `winfsp*.dll` 依赖都会导致验证失败。若没有兼容的官方 WinFsp 驱动，提升权限运行的 memfs 进程会安装并启动匹配的嵌入签名备用驱动，再重试 `FspFileSystemCreate`。
+运行时，memfs 使用 `IsWow64Process2` 判断 Windows 原生架构：AMD64 主机使用 x64 SYS；在 x64 仿真下运行 x64 EXE 的 Windows 11 ARM64 主机则使用 ARM64 SYS。内核驱动不会经仿真运行。CTest 也会调用静态库中的 `FspVersion()`，解析嵌入 SYS 的 PE 头，重新检查驱动来源，并解析构建后 PE 的普通导入和延迟导入表；因此，WinFsp 输入过期/不匹配或重新引入 `winfsp*.dll` 依赖都会导致验证失败。静态运行库绑定产品自己的 WinFsp+MemfsC 服务及设备；不存在该私有驱动时，由提升权限的 memfs 从内嵌资源提取、注册并启动签名 SYS，再重试创建卷，不会静默复用其他 WinFsp 安装。
 
 ## 构建
 

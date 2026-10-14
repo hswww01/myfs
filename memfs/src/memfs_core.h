@@ -181,6 +181,7 @@ _Static_assert(sizeof(MemfsPageGroupEntry) == 16,
 	"MemfsPageGroupEntry must stay in the allocator 16-byte size class");
 #endif
 
+MemfsNode* memfs_node_metadata(MemfsNode* node);
 MemfsSecurity* memfs_node_get_security(MemfsNode* node);
 uint64_t memfs_node_get_creation_time(const MemfsNode* node);
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node);
@@ -221,7 +222,12 @@ struct MemfsNode {
 	uint64_t file_size;
 	uint64_t allocation_size;
 
-	MemfsSecurity* security;
+	union {
+		MemfsSecurity* security;
+		/* ADS shares the owner's ACL. Use the otherwise unused slot to
+		 * distinguish live FILE_OBJECTs from delayed Close references. */
+		volatile LONG stream_active_opens;
+	};
 	uint64_t creation_time;
 	uint64_t last_access_time;
 	uint64_t last_write_time;
@@ -234,7 +240,8 @@ struct MemfsNode {
 	uint8_t small_inline : 1;
 	uint8_t deleted : 1;
 	uint8_t paged_storage : 1;
-	uint8_t reserved_flags : 5;
+	uint8_t named_stream : 1;
+	uint8_t reserved_flags : 4;
 	int8_t compression_score;
 };
 
@@ -249,6 +256,13 @@ struct Memfs {
 	MemfsAllocator allocator;
 
 	MemfsNode* root;
+
+	/* ADS nodes are indexed by their stable owner pointer, not the path.
+	 * No per-file size increase: ordinary nodes remain 128 bytes. Stream
+	 * parent pins its owner; tree_left is the bucket link until unlink.
+	 * Namespace/stream index access requires the external namespace guard. */
+	MemfsNode* stream_buckets[64];
+	bool destroying;
 
 	// 仅保存已经从 namespace 移除但仍被 open handle 引用的节点。
 	// orphan 节点复用 tree_left/tree_right 作为 prev/next。
@@ -348,6 +362,19 @@ MemfsNode* memfs_dir_next(MemfsNode* node);
 
 MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name, bool directory, uint32_t attributes,
 							  PSECURITY_DESCRIPTOR security, uint64_t allocation_size, MemfsNode** out_node);
+
+/* Named data streams share owner metadata/ACL, but have independent storage.
+ * Callers serialize namespace operations; Close remains independently safe. */
+MemfsResult memfs_lookup_stream_parent(Memfs* fs, const wchar_t* path,
+    MemfsNode** owner, wchar_t name[MEMFS_MAX_NAME + 1]);
+MemfsNode* memfs_stream_first(MemfsNode* owner);
+MemfsNode* memfs_stream_next(MemfsNode* stream);
+MemfsNode* memfs_stream_lookup(MemfsNode* owner, const wchar_t* name);
+MemfsResult memfs_stream_create(MemfsNode* owner, const wchar_t* name,
+    uint64_t allocation_size, MemfsNode** out_node);
+MemfsResult memfs_stream_rename(MemfsNode* node, MemfsNode* owner,
+    const wchar_t* name, bool replace);
+void memfs_stream_unlink_all(MemfsNode* owner, bool only_closed);
 
 // Retaining requires a live handle or an externally guarded namespace lookup.
 // Release/unlink/replace coordinate lifetime internally; destroy requires quiescence.
