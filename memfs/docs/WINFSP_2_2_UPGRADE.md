@@ -160,3 +160,11 @@ ctest --test-dir build/private-beta5-release --output-on-failure
 最终安装的 EXE 与 `build/private-beta5-release/memfs.exe` 的 SHA-256 相同。附加独立复核报告 `build/winfsp22-upgrade-final/UPGRADE_VERIFICATION.json` 记录安装产物、四组构建验收、实际 CMake 源码/静态库输入及内核已加载模块路径。
 
 旧官方服务在 SCM/CIM 中已删除，但注册表仍保留 `DeleteFlag=1`、`Start=4` 的待清理项。旧驱动专属控制设备 `WinFsp.Disk+20251221T124141Z` 已不能打开（Win32 2），新 `WinFsp.Disk+MemfsC` 可打开；模块枚举仍能看到旧 SYS，故不能宣称旧映像已经完全从内核移除。MSI 日志还记录了延迟到重启的文件清理。当前 memfs 已使用新版驱动，不必为其功能生效立即重启；为了彻底清理旧组件，应在用户正常重启 Windows 后复核。本次不自行重启 Windows。
+
+## 2026-10-14 下午更新部署（LastWriteTime 修复）
+
+- 部署源码：`9da5bd8`（含 `55f8296` 的 LastWriteTime 修复；块设备模式需显式参数启用，正式服务参数未变）。
+- 本机时间 2026-10-14 16:03:52 停止 MemfsC、替换 `C:\Windows\System32\memfs.exe` 并启动，M: 卷按授权清空，`M:\tmp` 由 `--mkdir tmp` 重建。旧 EXE（a7fc36…）备份于 `D:\tmp\memfs-deploy\memfs-a7fc36.exe`。
+- 新 EXE SHA256：`DC4127C6CD26062650E8223B1F34F10D201E5012FBD9DE294565891B3DCC56C7`。
+- 修复内容：写句柄未关闭时由其他句柄显式设置的 LastWriteTime，在写句柄清理时不再被覆盖为当前时间（与 NTFS 一致；SFTP 服务端 utime 上传场景）。部署后在 M:\tmp 上复验该行为，并以 M: 为 TEMP 通过 scrt 原生网络测试（含上传时间戳断言）。
+- Release CTest：35 项通过；`memfs_temp_service`（8）与 `memfs_native_service_install`（37）超时。逐行跟踪确认两者卡在测试脚本的 `Get-CimInstance Win32_Service` 查询，本机该 WMI 类查询整体无响应（`sc.exe`、`Win32_SystemDriver`、`Win32_Process` 正常），重启 Windows 与重建 WmiPrvSE 后依旧；改动前的 `03905ce` 结果相同。该 WMI 问题尚未定位，两项需在 WMI 恢复后重跑。
